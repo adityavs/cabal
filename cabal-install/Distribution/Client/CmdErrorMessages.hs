@@ -7,6 +7,9 @@ module Distribution.Client.CmdErrorMessages (
     module Distribution.Client.TargetSelector,
   ) where
 
+import Distribution.Client.Compat.Prelude
+import Prelude ()
+
 import Distribution.Client.ProjectOrchestration
 import Distribution.Client.TargetSelector
          ( ComponentKindFilter, componentKind, showTargetSelector )
@@ -15,13 +18,14 @@ import Distribution.Package
          ( packageId, PackageName, packageName )
 import Distribution.Types.ComponentName
          ( showComponentName )
+import Distribution.Types.LibraryName
+         ( LibraryName(..) )
 import Distribution.Solver.Types.OptionalStanza
          ( OptionalStanza(..) )
-import Distribution.Text
+import Distribution.Deprecated.Text
          ( display )
 
-import Data.Maybe (isNothing)
-import Data.List (sortBy, groupBy, nub)
+import qualified Data.List.NonEmpty as NE
 import Data.Function (on)
 
 
@@ -75,8 +79,8 @@ renderListSemiAnd (x:xs) = x ++ "; " ++ renderListSemiAnd xs
 -- >   | (pkgname, components) <- sortGroupOn packageName allcomponents ]
 --
 sortGroupOn :: Ord b => (a -> b) -> [a] -> [(b, [a])]
-sortGroupOn key = map (\xs@(x:_) -> (key x, xs))
-                . groupBy ((==) `on` key)
+sortGroupOn key = map (\(x:|xs) -> (key x, x:xs))
+                . NE.groupBy ((==) `on` key)
                 . sortBy  (compare `on` key)
 
 
@@ -165,8 +169,8 @@ targetSelectorFilter  TargetComponent{}              = Nothing
 targetSelectorFilter  TargetComponentUnknown{}       = Nothing
 
 renderComponentName :: PackageName -> ComponentName -> String
-renderComponentName pkgname CLibName     = "library " ++ display pkgname
-renderComponentName _ (CSubLibName name) = "library " ++ display name
+renderComponentName pkgname (CLibName LMainLibName) = "library " ++ display pkgname
+renderComponentName _ (CLibName (LSubLibName name)) = "library " ++ display name
 renderComponentName _ (CFLibName   name) = "foreign library " ++ display name
 renderComponentName _ (CExeName    name) = "executable " ++ display name
 renderComponentName _ (CTestName   name) = "test suite " ++ display name
@@ -196,6 +200,12 @@ renderTargetProblemCommon verb (TargetNotInProject pkgname) =
     "Cannot " ++ verb ++ " the package " ++ display pkgname ++ ", it is not "
  ++ "in this project (either directly or indirectly). If you want to add it "
  ++ "to the project then edit the cabal.project file."
+
+renderTargetProblemCommon verb (TargetAvailableInIndex pkgname) =
+    "Cannot " ++ verb ++ " the package " ++ display pkgname ++ ", it is not "
+ ++ "in this project (either directly or indirectly), but it is in the current "
+ ++ "package index. If you want to add it to the project then edit the "
+ ++ "cabal.project file."
 
 renderTargetProblemCommon verb (TargetComponentNotProjectLocal pkgid cname _) =
     "Cannot " ++ verb ++ " the " ++ showComponentName cname ++ " because the "
@@ -231,7 +241,7 @@ renderTargetProblemCommon verb (TargetOptionalStanzaDisabledBySolver pkgid cname
     "Cannot " ++ verb ++ " the " ++ showComponentName cname ++ " because the "
  ++ "solver did not find a plan that included the " ++ compkinds
  ++ " for " ++ display pkgid ++ ". It is probably worth trying again with "
- ++ compkinds ++ "explicitly enabled in the configuration in the "
+ ++ compkinds ++ " explicitly enabled in the configuration in the "
  ++ "cabal.project{.local} file. This will ask the solver to find a plan with "
  ++ "the " ++ compkinds ++ " available. It will either fail with an "
  ++ "explanation or find a different plan that uses different versions of some "
@@ -297,6 +307,8 @@ renderTargetProblemNoneEnabled verb targetSelector targets =
          ++ plural (listPlural targets') " is " " are "
          ++ "not available because the solver did not find a plan that "
          ++ "included the " ++ renderOptionalStanza Plural stanza
+         ++ ". Force the solver to enable this for all packages by adding the "
+         ++ "line 'tests: True' to the 'cabal.project.local' file."
         (TargetNotBuildable, _) ->
             renderListCommaAnd
               [ "the " ++ showComponentName availableTargetComponentName

@@ -2,20 +2,21 @@
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE Trustworthy #-}
 
 #ifdef MIN_VERSION_base
+#define MINVER_base_411 MIN_VERSION_base(4,11,0)
 #define MINVER_base_48 MIN_VERSION_base(4,8,0)
 #define MINVER_base_47 MIN_VERSION_base(4,7,0)
-#define MINVER_base_46 MIN_VERSION_base(4,6,0)
 #else
+#define MINVER_base_411 (__GLASGOW_HASKELL__ >= 804)
 #define MINVER_base_48 (__GLASGOW_HASKELL__ >= 710)
 #define MINVER_base_47 (__GLASGOW_HASKELL__ >= 708)
-#define MINVER_base_46 (__GLASGOW_HASKELL__ >= 706)
 #endif
 
 -- | This module does two things:
 --
--- * Acts as a compatiblity layer, like @base-compat@.
+-- * Acts as a compatibility layer, like @base-compat@.
 --
 -- * Provides commonly used imports.
 module Distribution.Compat.Prelude (
@@ -33,18 +34,22 @@ module Distribution.Compat.Prelude (
     -- * Common type-classes
     Semigroup (..),
     gmappend, gmempty,
-    Typeable,
+    Typeable, TypeRep, typeRep,
     Data,
     Generic,
     NFData (..), genericRnf,
     Binary (..),
+    Structured,
     Alternative (..),
     MonadPlus (..),
     IsString (..),
 
     -- * Some types
-    IO, NoCallStackIO,
     Map,
+    Set,
+    Identity (..),
+    Proxy (..),
+    Void,
 
     -- * Data.Maybe
     catMaybes, mapMaybe,
@@ -59,12 +64,17 @@ module Distribution.Compat.Prelude (
     sort, sortBy,
     nub, nubBy,
 
+    -- * Data.List.NonEmpty
+    NonEmpty((:|)), foldl1, foldr1,
+    head, tail, last, init,
+
     -- * Data.Foldable
     Foldable, foldMap, foldr,
     null, length,
     find, foldl',
     traverse_, for_,
     any, all,
+    toList,
 
     -- * Data.Traversable
     Traversable, traverse, sequenceA,
@@ -84,6 +94,9 @@ module Distribution.Compat.Prelude (
     chr, ord,
     toLower, toUpper,
 
+    -- * Data.Void
+    absurd, vacuous,
+
     -- * Data.Word & Data.Int
     Word,
     Word8, Word16, Word32, Word64,
@@ -91,11 +104,21 @@ module Distribution.Compat.Prelude (
 
     -- * Text.PrettyPrint
     (<<>>),
-    ) where
 
+    -- * Text.Read
+    readMaybe,
+    ) where
 -- We also could hide few partial function
 import Prelude                       as BasePrelude hiding
-  ( IO, mapM, mapM_, sequence, null, length, foldr, any, all
+  ( mapM, mapM_, sequence, null, length, foldr, any, all, head, tail, last, init
+  -- partial functions
+  , read
+  , foldr1, foldl1
+#if MINVER_base_411
+  -- As of base 4.11.0.0 Prelude exports part of Semigroup(..).
+  -- Hide this so we instead rely on Distribution.Compat.Semigroup.
+  , Semigroup(..)
+#endif
 #if MINVER_base_48
   , Word
   -- We hide them, as we import only some members
@@ -107,24 +130,29 @@ import Prelude                       as BasePrelude hiding
 #if !MINVER_base_48
 import Control.Applicative           (Applicative (..), (<$), (<$>))
 import Distribution.Compat.Semigroup (Monoid (..))
+import Data.Foldable                 (toList)
 #else
-import Data.Foldable                 (length, null)
+import Data.Foldable                 (length, null, Foldable(toList))
 #endif
 
 import Data.Foldable                 (Foldable (foldMap, foldr), find, foldl', for_, traverse_, any, all)
 import Data.Traversable              (Traversable (traverse, sequenceA), for)
+import qualified Data.Foldable
 
 import Control.Applicative           (Alternative (..))
 import Control.DeepSeq               (NFData (..))
 import Data.Data                     (Data)
-import Data.Typeable                 (Typeable)
+import Distribution.Compat.Typeable  (Typeable, TypeRep, typeRep)
 import Distribution.Compat.Binary    (Binary (..))
 import Distribution.Compat.Semigroup (Semigroup (..), gmappend, gmempty)
 import GHC.Generics                  (Generic, Rep(..),
                                       V1, U1(U1), K1(unK1), M1(unM1),
                                       (:*:)((:*:)), (:+:)(L1,R1))
 
+import Data.Functor.Identity         (Identity (..))
 import Data.Map                      (Map)
+import Data.Proxy                    (Proxy (..))
+import Data.Set                      (Set)
 
 import Control.Arrow                 (first)
 import Control.Monad                 hiding (mapM)
@@ -132,18 +160,17 @@ import Data.Char
 import Data.List                     (intercalate, intersperse, isPrefixOf,
                                       isSuffixOf, nub, nubBy, sort, sortBy,
                                       unfoldr)
+import Data.List.NonEmpty            (NonEmpty((:|)), head, tail, init, last)
 import Data.Maybe
 import Data.String                   (IsString (..))
 import Data.Int
 import Data.Word
+import Data.Void                     (Void, absurd, vacuous)
+import Text.Read                     (readMaybe)
 
 import qualified Text.PrettyPrint as Disp
 
-import qualified Prelude as OrigPrelude
-import Distribution.Compat.Stack
-
-type IO a = WithCallStack (OrigPrelude.IO a)
-type NoCallStackIO a = OrigPrelude.IO a
+import Distribution.Utils.Structured (Structured)
 
 -- | New name for 'Text.PrettyPrint.<>'
 (<<>>) :: Disp.Doc -> Disp.Doc -> Disp.Doc
@@ -204,3 +231,28 @@ instance (GNFData a, GNFData b) => GNFData (a :+: b) where
   grnf (L1 x) = grnf x
   grnf (R1 x) = grnf x
   {-# INLINEABLE grnf #-}
+
+
+-- TODO: if we want foldr1/foldl1 to work on more than NonEmpty, we
+-- can define a local typeclass 'Foldable1', e.g.
+--
+-- @
+-- class Foldable f => Foldable1 f
+--
+-- instance Foldable1 NonEmpty
+--
+-- foldr1 :: Foldable1 t => (a -> a -> a) -> t a -> a
+-- foldr1 = Data.Foldable.foldr1
+--
+-- foldl1 :: Foldable1 t => (a -> a -> a) -> t a -> a
+-- foldl1 = Data.Foldable.foldl1
+-- @
+--
+
+{-# INLINE foldr1 #-}
+foldr1 :: (a -> a -> a) -> NonEmpty a -> a
+foldr1 = Data.Foldable.foldr1
+
+{-# INLINE foldl1 #-}
+foldl1 :: (a -> a -> a) -> NonEmpty a -> a
+foldl1 = Data.Foldable.foldl1

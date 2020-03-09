@@ -1,8 +1,11 @@
-{-# LANGUAGE CPP, BangPatterns, RecordWildCards, NamedFieldPuns,
-             ScopedTypeVariables #-}
-{-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE NoMonoLocalBinds #-}
-{-# LANGUAGE ConstraintKinds #-}
+{-# LANGUAGE BangPatterns        #-}
+{-# LANGUAGE CPP                 #-}
+{-# LANGUAGE ConstraintKinds     #-}
+{-# LANGUAGE NamedFieldPuns      #-}
+{-# LANGUAGE NoMonoLocalBinds    #-}
+{-# LANGUAGE RecordWildCards     #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TypeFamilies        #-}
 
 -- |
 --
@@ -35,9 +38,8 @@ module Distribution.Client.ProjectBuilding (
     BuildFailureReason(..),
   ) where
 
-#if !MIN_VERSION_base(4,8,0)
-import Control.Applicative ((<$>))
-#endif
+import Distribution.Client.Compat.Prelude
+import Prelude ()
 
 import           Distribution.Client.PackageHash (renderPackageHashInputs)
 import           Distribution.Client.RebuildMonad
@@ -60,54 +62,52 @@ import           Distribution.Client.JobControl
 import           Distribution.Client.FetchUtils
 import           Distribution.Client.GlobalFlags (RepoContext)
 import qualified Distribution.Client.Tar as Tar
-import           Distribution.Client.Setup (filterConfigureFlags)
+import           Distribution.Client.Setup
+                   ( filterConfigureFlags, filterHaddockArgs
+                   , filterHaddockFlags, filterTestFlags )
 import           Distribution.Client.SourceFiles
 import           Distribution.Client.SrcDist (allPackageSourceFiles)
-import           Distribution.Client.Utils (removeExistingFile)
+import           Distribution.Client.Utils
+                   ( ProgressPhase(..), progressMessage, removeExistingFile )
 
-import           Distribution.Package hiding (InstalledPackageId, installedPackageId)
+import           Distribution.Compat.Lens
+import           Distribution.Package
 import qualified Distribution.PackageDescription as PD
 import           Distribution.InstalledPackageInfo (InstalledPackageInfo)
 import qualified Distribution.InstalledPackageInfo as Installed
 import           Distribution.Simple.BuildPaths (haddockDirName)
 import qualified Distribution.Simple.InstallDirs as InstallDirs
 import           Distribution.Types.BuildType
+import           Distribution.Types.PackageDescription.Lens (componentModules)
 import           Distribution.Simple.Program
 import qualified Distribution.Simple.Setup as Cabal
 import           Distribution.Simple.Command (CommandUI)
 import qualified Distribution.Simple.Register as Cabal
-import           Distribution.Simple.LocalBuildInfo (ComponentName)
+import           Distribution.Simple.LocalBuildInfo
+                   ( ComponentName(..), LibraryName(..) )
 import           Distribution.Simple.Compiler
                    ( Compiler, compilerId, PackageDB(..) )
 
-import           Distribution.Simple.Utils hiding (matchFileGlob)
+import           Distribution.Simple.Utils
 import           Distribution.Version
 import           Distribution.Verbosity
-import           Distribution.Text
-import           Distribution.ParseUtils ( showPWarning )
+import           Distribution.Pretty
 import           Distribution.Compat.Graph (IsNode(..))
 
-import           Data.Map (Map)
+import qualified Data.List.NonEmpty as NE
 import qualified Data.Map as Map
-import           Data.Set (Set)
 import qualified Data.Set as Set
+import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
-import           Data.List (isPrefixOf)
 
-import           Control.Monad
-import           Control.Exception
-import           Data.Maybe
+import Control.Exception (Exception (..), Handler (..), SomeAsyncException, SomeException, assert, catches, handle, throwIO)
+import Data.Function     (on)
+import System.Directory  (canonicalizePath, createDirectoryIfMissing, doesDirectoryExist, doesFileExist, removeFile, renameDirectory)
+import System.FilePath   (dropDrive, makeRelative, normalise, takeDirectory, (<.>), (</>))
+import System.IO         (IOMode (AppendMode), withFile)
 
-import           System.FilePath
-import           System.IO
-import           System.Directory
+import Distribution.Compat.Directory (listDirectory)
 
-#if !MIN_VERSION_directory(1,2,5)
-listDirectory :: FilePath -> IO [FilePath]
-listDirectory path =
-  (filter f) <$> (getDirectoryContents path)
-  where f filename = filename /= "." && filename /= ".."
-#endif
 
 ------------------------------------------------------------------------------
 -- * Overall building strategy.
@@ -203,6 +203,11 @@ rebuildTargetsDryRun distDirLayout@DistDirLayout{..} shared =
           -- artifacts under the shared dist directory.
           dryRunLocalPkg pkg depsBuildStatus srcdir
 
+        Just (RemoteSourceRepoPackage _repo srcdir) ->
+          -- At this point, source repos are essentially the same as local
+          -- dirs, since we've already download them.
+          dryRunLocalPkg pkg depsBuildStatus srcdir
+
         -- The three tarball cases are handled the same as each other,
         -- though depending on the build style.
         Just (LocalTarballPackage    tarball) ->
@@ -222,7 +227,8 @@ rebuildTargetsDryRun distDirLayout@DistDirLayout{..} shared =
       case elabBuildStyle pkg of
         BuildAndInstall  -> return (BuildStatusUnpack tarball)
         BuildInplaceOnly -> do
-          -- TODO: [nice to have] use a proper file monitor rather than this dir exists test
+          -- TODO: [nice to have] use a proper file monitor rather
+          -- than this dir exists test
           exists <- doesDirectoryExist srcdir
           if exists
             then dryRunLocalPkg pkg depsBuildStatus srcdir
@@ -249,14 +255,15 @@ rebuildTargetsDryRun distDirLayout@DistDirLayout{..} shared =
             return (BuildStatusUpToDate buildResult)
       where
         packageFileMonitor =
-          newPackageFileMonitor distDirLayout (elabDistDirParams shared pkg)
+          newPackageFileMonitor shared distDirLayout
+          (elabDistDirParams shared pkg)
 
 
 -- | A specialised traversal over the packages in an install plan.
 --
 -- The packages are visited in dependency order, starting with packages with no
 -- dependencies. The result for each package is accumulated into a 'Map' and
--- returned as the final result. In addition, when visting a package, the
+-- returned as the final result. In addition, when visiting a package, the
 -- visiting function is passed the results for all the immediate package
 -- dependencies. This can be used to propagate information from dependencies.
 --
@@ -279,7 +286,7 @@ foldMInstallPlanDepOrder visit =
       -- we go in the right order so the results map has entries for all deps
       let depresults :: [b]
           depresults =
-            map (\ipkgid -> let Just result = Map.lookup ipkgid results
+            map (\ipkgid -> let result = Map.findWithDefault (error "foldMInstallPlanDepOrder") ipkgid results
                               in result)
                 (InstallPlan.depends pkg)
       result <- visit pkg depresults
@@ -297,7 +304,7 @@ improveInstallPlanWithUpToDatePackages pkgsBuildStatus =
         Just BuildStatusUpToDate {} -> True
         Just _                      -> False
         Nothing -> error $ "improveInstallPlanWithUpToDatePackages: "
-                        ++ display (packageId pkg) ++ " not in status map"
+                        ++ prettyShow (packageId pkg) ++ " not in status map"
 
 
 -----------------------------
@@ -328,11 +335,20 @@ data PackageFileMonitor = PackageFileMonitor {
 --
 type BuildResultMisc = (DocsResult, TestsResult)
 
-newPackageFileMonitor :: DistDirLayout -> DistDirParams -> PackageFileMonitor
-newPackageFileMonitor DistDirLayout{distPackageCacheFile} dparams =
+newPackageFileMonitor :: ElaboratedSharedConfig
+                      -> DistDirLayout
+                      -> DistDirParams
+                      -> PackageFileMonitor
+newPackageFileMonitor shared
+                      DistDirLayout{distPackageCacheFile}
+                      dparams =
     PackageFileMonitor {
       pkgFileMonitorConfig =
-        newFileMonitor (distPackageCacheFile dparams "config"),
+        FileMonitor {
+          fileMonitorCacheFile = distPackageCacheFile dparams "config",
+          fileMonitorKeyValid = (==) `on` normaliseConfiguredPackage shared,
+          fileMonitorCheckIfOnlyValueChanged = False
+        },
 
       pkgFileMonitorBuild =
         FileMonitor {
@@ -366,11 +382,12 @@ packageFileMonitorKeyValues elab =
     --
     elab_config =
         elab {
-            elabBuildTargets  = [],
-            elabTestTargets   = [],
+            elabBuildTargets   = [],
+            elabTestTargets    = [],
             elabBenchTargets   = [],
-            elabReplTarget    = Nothing,
-            elabBuildHaddocks = False
+            elabReplTarget     = Nothing,
+            elabHaddockTargets = [],
+            elabBuildHaddocks  = False
         }
 
     -- The second part is the value used to guard the build step. So this is
@@ -389,7 +406,8 @@ checkPackageFileMonitorChanged :: PackageFileMonitor
                                -> IO (Either BuildStatusRebuild BuildResult)
 checkPackageFileMonitorChanged PackageFileMonitor{..}
                                pkg srcdir depsBuildStatus = do
-    --TODO: [nice to have] some debug-level message about file changes, like rerunIfChanged
+    --TODO: [nice to have] some debug-level message about file
+    --changes, like rerunIfChanged
     configChanged <- checkFileMonitorChanged
                        pkgFileMonitorConfig srcdir pkgconfig
     case configChanged of
@@ -563,7 +581,7 @@ rebuildTargets verbosity
 
     createDirectoryIfMissingVerbose verbosity True distBuildRootDirectory
     createDirectoryIfMissingVerbose verbosity True distTempDirectory
-    mapM_ (createPackageDBIfMissing verbosity compiler progdb) packageDBsToUse
+    traverse_ (createPackageDBIfMissing verbosity compiler progdb) packageDBsToUse
 
     -- Before traversing the install plan, pre-emptively find all packages that
     -- will need to be downloaded and start downloading them.
@@ -578,7 +596,7 @@ rebuildTargets verbosity
         handle (\(e :: BuildFailure) -> return (Left e)) $ fmap Right $
 
         let uid = installedUnitId pkg
-            Just pkgBuildStatus = Map.lookup uid pkgsBuildStatus in
+            pkgBuildStatus = Map.findWithDefault (error "rebuildTargets") uid pkgsBuildStatus in
 
         rebuildTarget
           verbosity
@@ -664,7 +682,8 @@ rebuildTarget verbosity
     unpackTarballPhase tarball =
         withTarballLocalDirectory
           verbosity distDirLayout tarball
-          (packageId pkg) (elabDistDirParams sharedPackageConfig pkg) (elabBuildStyle pkg)
+          (packageId pkg) (elabDistDirParams sharedPackageConfig pkg)
+          (elabBuildStyle pkg)
           (elabPkgDescriptionOverride pkg) $
 
           case elabBuildStyle pkg of
@@ -682,14 +701,15 @@ rebuildTarget verbosity
 
           buildInplace buildStatus srcdir builddir
       where
-        builddir = distBuildDirectory (elabDistDirParams sharedPackageConfig pkg)
+        builddir = distBuildDirectory
+                   (elabDistDirParams sharedPackageConfig pkg)
 
     buildAndInstall srcdir builddir =
         buildAndInstallUnpackedPackage
           verbosity distDirLayout storeDirLayout
           buildSettings registerLock cacheLock
           sharedPackageConfig
-          rpkg
+          plan rpkg
           srcdir builddir'
       where
         builddir' = makeRelative srcdir builddir
@@ -736,7 +756,7 @@ asyncDownloadPackages verbosity withRepoCtx installPlan pkgsBuildStatus body
       | InstallPlan.Configured elab
          <- InstallPlan.reverseTopologicalOrder installPlan
       , let uid = installedUnitId elab
-            Just pkgBuildStatus = Map.lookup uid pkgsBuildStatus
+            pkgBuildStatus = Map.findWithDefault (error "asyncDownloadPackages") uid pkgsBuildStatus
       , BuildStatusDownload <- [pkgBuildStatus]
       ]
 
@@ -801,7 +821,7 @@ withTarballLocalDirectory verbosity distDirLayout@DistDirLayout{..}
           withTempDirectory verbosity tmpdir "src"   $ \unpackdir -> do
             unpackPackageTarball verbosity tarball unpackdir
                                  pkgid pkgTextOverride
-            let srcdir   = unpackdir </> display pkgid
+            let srcdir   = unpackdir </> prettyShow pkgid
                 builddir = srcdir </> "dist"
             buildPkg srcdir builddir
 
@@ -812,7 +832,8 @@ withTarballLocalDirectory verbosity distDirLayout@DistDirLayout{..}
           let srcrootdir = distUnpackedSrcRootDirectory
               srcdir     = distUnpackedSrcDirectory pkgid
               builddir   = distBuildDirectory dparams
-          -- TODO: [nice to have] use a proper file monitor rather than this dir exists test
+          -- TODO: [nice to have] use a proper file monitor rather
+          -- than this dir exists test
           exists <- doesDirectoryExist srcdir
           unless exists $ do
             createDirectoryIfMissingVerbose verbosity True srcrootdir
@@ -839,21 +860,22 @@ unpackPackageTarball verbosity tarball parentdir pkgid pkgTextOverride =
       --
       exists <- doesFileExist cabalFile
       unless exists $
-        die' verbosity $ "Package .cabal file not found in the tarball: " ++ cabalFile
+        die' verbosity $
+        "Package .cabal file not found in the tarball: " ++ cabalFile
 
       -- Overwrite the .cabal with the one from the index, when appropriate
       --
       case pkgTextOverride of
         Nothing     -> return ()
         Just pkgtxt -> do
-          info verbosity $ "Updating " ++ display pkgname <.> "cabal"
+          info verbosity $ "Updating " ++ prettyShow pkgname <.> "cabal"
                         ++ " with the latest revision from the index."
           writeFileAtomic cabalFile pkgtxt
 
   where
     cabalFile = parentdir </> pkgsubdir
-                          </> display pkgname <.> "cabal"
-    pkgsubdir = display pkgid
+                          </> prettyShow pkgname <.> "cabal"
+    pkgsubdir = prettyShow pkgid
     pkgname   = packageName pkgid
 
 
@@ -865,7 +887,8 @@ unpackPackageTarball verbosity tarball parentdir pkgid pkgTextOverride =
 -- system, though we'll still need to keep this hack for older packages.
 --
 moveTarballShippedDistDirectory :: Verbosity -> DistDirLayout
-                                -> FilePath -> PackageId -> DistDirParams -> IO ()
+                                -> FilePath -> PackageId -> DistDirParams
+                                -> IO ()
 moveTarballShippedDistDirectory verbosity DistDirLayout{distBuildDirectory}
                                 parentdir pkgid dparams = do
     distDirExists <- doesDirectoryExist tarballDistDir
@@ -875,7 +898,7 @@ moveTarballShippedDistDirectory verbosity DistDirLayout{distBuildDirectory}
       --TODO: [nice to have] or perhaps better to copy, and use a file monitor
       renameDirectory tarballDistDir targetDistDir
   where
-    tarballDistDir = parentdir </> display pkgid </> "dist"
+    tarballDistDir = parentdir </> prettyShow pkgid </> "dist"
     targetDistDir  = distBuildDirectory dparams
 
 
@@ -884,11 +907,12 @@ buildAndInstallUnpackedPackage :: Verbosity
                                -> StoreDirLayout
                                -> BuildTimeSettings -> Lock -> Lock
                                -> ElaboratedSharedConfig
+                               -> ElaboratedInstallPlan
                                -> ElaboratedReadyPackage
                                -> FilePath -> FilePath
                                -> IO BuildResult
 buildAndInstallUnpackedPackage verbosity
-                               DistDirLayout{distTempDirectory}
+                               distDirLayout@DistDirLayout{distTempDirectory}
                                storeDirLayout@StoreDirLayout {
                                  storePackageDBStack
                                }
@@ -902,67 +926,85 @@ buildAndInstallUnpackedPackage verbosity
                                  pkgConfigCompiler      = compiler,
                                  pkgConfigCompilerProgs = progdb
                                }
-                               rpkg@(ReadyPackage pkg)
+                               plan rpkg@(ReadyPackage pkg)
                                srcdir builddir = do
 
-    createDirectoryIfMissingVerbose verbosity True builddir
+    createDirectoryIfMissingVerbose verbosity True (srcdir </> builddir)
     initLogFile
 
-    --TODO: [code cleanup] deal consistently with talking to older Setup.hs versions, much like
-    --      we do for ghc, with a proper options type and rendering step
-    --      which will also let us call directly into the lib, rather than always
-    --      going via the lib's command line interface, which would also allow
-    --      passing data like installed packages, compiler, and program db for a
-    --      quicker configure.
+    --TODO: [code cleanup] deal consistently with talking to older
+    --      Setup.hs versions, much like we do for ghc, with a proper
+    --      options type and rendering step which will also let us
+    --      call directly into the lib, rather than always going via
+    --      the lib's command line interface, which would also allow
+    --      passing data like installed packages, compiler, and
+    --      program db for a quicker configure.
 
     --TODO: [required feature] docs and tests
     --TODO: [required feature] sudo re-exec
 
-    let dispname = case elabPkgOrComp pkg of
-            ElabPackage _ -> display pkgid
-                ++ " (all, legacy fallback)"
-            ElabComponent comp -> display pkgid
-                ++ " (" ++ maybe "custom" display (compComponentName comp) ++ ")"
-
     -- Configure phase
-    when isParallelBuild $
-      notice verbosity $ "Configuring " ++ dispname ++ "..."
+    noticeProgress ProgressStarting
+
     annotateFailure mlogFile ConfigureFailed $
       setup' configureCommand configureFlags configureArgs
 
     -- Build phase
-    when isParallelBuild $
-      notice verbosity $ "Building " ++ dispname ++ "..."
+    noticeProgress ProgressBuilding
+
     annotateFailure mlogFile BuildFailed $
       setup buildCommand buildFlags
 
+    -- Haddock phase
+    whenHaddock $ do
+      noticeProgress ProgressHaddock
+      annotateFailureNoLog HaddocksFailed $
+        setup haddockCommand haddockFlags
+
     -- Install phase
+    noticeProgress ProgressInstalling
     annotateFailure mlogFile InstallFailed $ do
 
       let copyPkgFiles tmpDir = do
-            setup Cabal.copyCommand (copyFlags tmpDir)
+            let tmpDirNormalised = normalise tmpDir
+            setup Cabal.copyCommand (copyFlags tmpDirNormalised)
             -- Note that the copy command has put the files into
             -- @$tmpDir/$prefix@ so we need to return this dir so
             -- the store knows which dir will be the final store entry.
-            let prefix   = dropDrive (InstallDirs.prefix (elabInstallDirs pkg))
-                entryDir = tmpDir </> prefix
+            let prefix   = normalise $
+                           dropDrive (InstallDirs.prefix (elabInstallDirs pkg))
+                entryDir = tmpDirNormalised </> prefix
+
+            -- if there weren't anything to build, it might be that directory is not created
+            -- the @setup Cabal.copyCommand@ above might do nothing.
+            -- https://github.com/haskell/cabal/issues/4130
+            createDirectoryIfMissingVerbose verbosity True entryDir
+
             LBS.writeFile
               (entryDir </> "cabal-hash.txt")
               (renderPackageHashInputs (packageHashInputs pkgshared pkg))
 
-            -- Ensure that there are no files in `tmpDir`, that are not in `entryDir`
-            -- While this breaks the prefix-relocatable property of the lirbaries
-            -- it is necessary on macOS to stay under the load command limit of the
-            -- macOS mach-o linker. See also @PackageHash.hashedInstalledPackageIdVeryShort@.
-            otherFiles <- filter (not . isPrefixOf entryDir) <$> listFilesRecursive tmpDir 
-            -- here's where we could keep track of the installed files ourselves
-            -- if we wanted to by making a manifest of the files in the tmp dir
+            -- Ensure that there are no files in `tmpDir`, that are
+            -- not in `entryDir`. While this breaks the
+            -- prefix-relocatable property of the libraries, it is
+            -- necessary on macOS to stay under the load command limit
+            -- of the macOS mach-o linker. See also
+            -- @PackageHash.hashedInstalledPackageIdVeryShort@.
+            --
+            -- We also normalise paths to ensure that there are no
+            -- different representations for the same path. Like / and
+            -- \\ on windows under msys.
+            otherFiles <- filter (not . isPrefixOf entryDir) <$>
+                          listFilesRecursive tmpDirNormalised
+            -- Here's where we could keep track of the installed files
+            -- ourselves if we wanted to by making a manifest of the
+            -- files in the tmp dir.
             return (entryDir, otherFiles)
             where
               listFilesRecursive :: FilePath -> IO [FilePath]
               listFilesRecursive path = do
                 files <- fmap (path </>) <$> (listDirectory path)
-                allFiles <- forM files $ \file -> do
+                allFiles <- for files $ \file -> do
                   isDir <- doesDirectoryExist file
                   if isDir
                     then listFilesRecursive file
@@ -972,7 +1014,8 @@ buildAndInstallUnpackedPackage verbosity
           registerPkg
             | not (elabRequiresRegistration pkg) =
               debug verbosity $
-                "registerPkg: elab does NOT require registration for " ++ display uid
+                "registerPkg: elab does NOT require registration for "
+                ++ prettyShow uid
             | otherwise = do
             -- We register ourselves rather than via Setup.hs. We need to
             -- grab and modify the InstalledPackageInfo. We decide what
@@ -1001,13 +1044,16 @@ buildAndInstallUnpackedPackage verbosity
     -- final location ourselves, perhaps we ought to do some sanity checks on
     -- the image dir first.
 
-    -- TODO: [required eventually] note that for nix-style installations it is not necessary to do
-    -- the 'withWin32SelfUpgrade' dance, but it would be necessary for a
+    -- TODO: [required eventually] note that for nix-style
+    -- installations it is not necessary to do the
+    -- 'withWin32SelfUpgrade' dance, but it would be necessary for a
     -- shared bin dir.
 
     --TODO: [required feature] docs and test phases
     let docsResult  = DocsNotTried
         testsResult = TestsNotTried
+
+    noticeProgress ProgressCompleted
 
     return BuildResult {
        buildResultDocs    = docsResult,
@@ -1020,16 +1066,33 @@ buildAndInstallUnpackedPackage verbosity
     uid    = installedUnitId rpkg
     compid = compilerId compiler
 
+    dispname = case elabPkgOrComp pkg of
+        ElabPackage _ -> prettyShow pkgid
+            ++ " (all, legacy fallback)"
+        ElabComponent comp -> prettyShow pkgid
+            ++ " (" ++ maybe "custom" prettyShow (compComponentName comp) ++ ")"
+
+    noticeProgress phase = when isParallelBuild $
+        progressMessage verbosity phase dispname
+
     isParallelBuild = buildSettingNumJobs >= 2
+
+    whenHaddock action
+      | hasValidHaddockTargets pkg = action
+      | otherwise                  = return ()
 
     configureCommand = Cabal.configureCommand defaultProgramDb
     configureFlags v = flip filterConfigureFlags v $
                        setupHsConfigureFlags rpkg pkgshared
                                              verbosity builddir
-    configureArgs    = setupHsConfigureArgs pkg
+    configureArgs _  = setupHsConfigureArgs pkg
 
     buildCommand     = Cabal.buildCommand defaultProgramDb
     buildFlags   _   = setupHsBuildFlags pkg pkgshared verbosity builddir
+
+    haddockCommand   = Cabal.haddockCommand
+    haddockFlags _   = setupHsHaddockFlags pkg pkgshared
+                                           verbosity builddir
 
     generateInstalledPackageInfo :: IO InstalledPackageInfo
     generateInstalledPackageInfo =
@@ -1044,18 +1107,23 @@ buildAndInstallUnpackedPackage verbosity
     copyFlags destdir _ = setupHsCopyFlags pkg pkgshared verbosity
                                            builddir destdir
 
-    scriptOptions = setupHsScriptOptions rpkg pkgshared srcdir builddir
+    scriptOptions = setupHsScriptOptions rpkg plan pkgshared
+                                         distDirLayout srcdir builddir
                                          isParallelBuild cacheLock
 
     setup :: CommandUI flags -> (Version -> flags) -> IO ()
-    setup cmd flags = setup' cmd flags []
+    setup cmd flags = setup' cmd flags (const [])
 
-    setup' :: CommandUI flags -> (Version -> flags) -> [String] -> IO ()
+    setup' :: CommandUI flags -> (Version -> flags) -> (Version -> [String])
+           -> IO ()
     setup' cmd flags args =
       withLogging $ \mLogFileHandle ->
         setupWrapper
           verbosity
-          scriptOptions { useLoggingHandle = mLogFileHandle }
+          scriptOptions
+            { useLoggingHandle     = mLogFileHandle
+            , useExtraEnvOverrides = dataDirsEnvironmentForPlan
+                                     distDirLayout plan }
           (Just (elabPkgDescription pkg))
           cmd flags args
 
@@ -1077,6 +1145,27 @@ buildAndInstallUnpackedPackage verbosity
       case mlogFile of
         Nothing      -> action Nothing
         Just logFile -> withFile logFile AppendMode (action . Just)
+
+
+hasValidHaddockTargets :: ElaboratedConfiguredPackage -> Bool
+hasValidHaddockTargets ElaboratedConfiguredPackage{..}
+  | not elabBuildHaddocks = False
+  | otherwise             = any componentHasHaddocks components
+  where
+    components = elabBuildTargets ++ elabTestTargets ++ elabBenchTargets
+              ++ maybeToList elabReplTarget ++ elabHaddockTargets
+
+    componentHasHaddocks :: ComponentTarget -> Bool
+    componentHasHaddocks (ComponentTarget name _) =
+      case name of
+        CLibName LMainLibName    ->                           hasHaddocks
+        CLibName (LSubLibName _) -> elabHaddockInternal    && hasHaddocks
+        CFLibName              _ -> elabHaddockForeignLibs && hasHaddocks
+        CExeName               _ -> elabHaddockExecutables && hasHaddocks
+        CTestName              _ -> elabHaddockTestSuites  && hasHaddocks
+        CBenchName             _ -> elabHaddockBenchmarks  && hasHaddocks
+      where
+        hasHaddocks = not (null (elabPkgDescription ^. componentModules name))
 
 
 buildInplaceUnpackedPackage :: Verbosity
@@ -1105,10 +1194,12 @@ buildInplaceUnpackedPackage verbosity
                             buildStatus
                             srcdir builddir = do
 
-        --TODO: [code cleanup] there is duplication between the distdirlayout and the builddir here
-        --      builddir is not enough, we also need the per-package cachedir
+        --TODO: [code cleanup] there is duplication between the
+        --      distdirlayout and the builddir here builddir is not
+        --      enough, we also need the per-package cachedir
         createDirectoryIfMissingVerbose verbosity True builddir
-        createDirectoryIfMissingVerbose verbosity True (distPackageCacheDirectory dparams)
+        createDirectoryIfMissingVerbose verbosity True
+          (distPackageCacheDirectory dparams)
 
         -- Configure phase
         --
@@ -1202,12 +1293,13 @@ buildInplaceUnpackedPackage verbosity
         -- Haddock phase
         whenHaddock $
           annotateFailureNoLog HaddocksFailed $ do
-            setup haddockCommand haddockFlags []
+            setup haddockCommand haddockFlags haddockArgs
             let haddockTarget = elabHaddockForHackage pkg
             when (haddockTarget == Cabal.ForHackage) $ do
               let dest = distDirectory </> name <.> "tar.gz"
                   name = haddockDirName haddockTarget (elabPkgDescription pkg)
-                  docDir = distBuildDirectory distDirLayout dparams </> "doc" </> "html"
+                  docDir = distBuildDirectory distDirLayout dparams
+                           </> "doc" </> "html"
               Tar.createTarGzFile dest docDir name
               notice verbosity $ "Documentation tarball created: " ++ dest
 
@@ -1223,7 +1315,7 @@ buildInplaceUnpackedPackage verbosity
 
     isParallelBuild = buildSettingNumJobs >= 2
 
-    packageFileMonitor = newPackageFileMonitor distDirLayout dparams
+    packageFileMonitor = newPackageFileMonitor pkgshared distDirLayout dparams
 
     whenReConfigure action = case buildStatus of
       BuildStatusConfigure _ -> action
@@ -1249,60 +1341,67 @@ buildInplaceUnpackedPackage verbosity
       | otherwise                     = action
 
     whenHaddock action
-      | elabBuildHaddocks pkg = action
-      | otherwise            = return ()
+      | hasValidHaddockTargets pkg = action
+      | otherwise                  = return ()
 
     whenReRegister  action
       = case buildStatus of
           -- We registered the package already
-          BuildStatusBuild (Just _) _     -> info verbosity "whenReRegister: previously registered"
+          BuildStatusBuild (Just _) _     ->
+            info verbosity "whenReRegister: previously registered"
           -- There is nothing to register
-          _ | null (elabBuildTargets pkg) -> info verbosity "whenReRegister: nothing to register"
+          _ | null (elabBuildTargets pkg) ->
+              info verbosity "whenReRegister: nothing to register"
             | otherwise                   -> action
 
     configureCommand = Cabal.configureCommand defaultProgramDb
     configureFlags v = flip filterConfigureFlags v $
                        setupHsConfigureFlags rpkg pkgshared
                                              verbosity builddir
-    configureArgs    = setupHsConfigureArgs pkg
+    configureArgs _  = setupHsConfigureArgs pkg
 
     buildCommand     = Cabal.buildCommand defaultProgramDb
     buildFlags   _   = setupHsBuildFlags pkg pkgshared
                                          verbosity builddir
-    buildArgs        = setupHsBuildArgs  pkg
+    buildArgs     _  = setupHsBuildArgs  pkg
 
     testCommand      = Cabal.testCommand -- defaultProgramDb
-    testFlags    _   = setupHsTestFlags pkg pkgshared
+    testFlags      v = flip filterTestFlags v $
+                       setupHsTestFlags pkg pkgshared
                                          verbosity builddir
-    testArgs         = setupHsTestArgs  pkg
+    testArgs      _  = setupHsTestArgs  pkg
 
     benchCommand     = Cabal.benchmarkCommand
     benchFlags    _  = setupHsBenchFlags pkg pkgshared
                                           verbosity builddir
-    benchArgs        = setupHsBenchArgs  pkg
+    benchArgs     _  = setupHsBenchArgs  pkg
 
     replCommand      = Cabal.replCommand defaultProgramDb
     replFlags _      = setupHsReplFlags pkg pkgshared
                                         verbosity builddir
-    replArgs         = setupHsReplArgs  pkg
+    replArgs _       = setupHsReplArgs  pkg
 
     haddockCommand   = Cabal.haddockCommand
-    haddockFlags _   = setupHsHaddockFlags pkg pkgshared
+    haddockFlags v   = flip filterHaddockFlags v $
+                       setupHsHaddockFlags pkg pkgshared
                                            verbosity builddir
+    haddockArgs    v = flip filterHaddockArgs v $
+                       setupHsHaddockArgs pkg
 
-    scriptOptions    = setupHsScriptOptions rpkg pkgshared
-                                            srcdir builddir
+    scriptOptions    = setupHsScriptOptions rpkg plan pkgshared
+                                            distDirLayout srcdir builddir
                                             isParallelBuild cacheLock
 
     setupInteractive :: CommandUI flags
-                     -> (Version -> flags) -> [String] -> IO ()
+                     -> (Version -> flags) -> (Version -> [String]) -> IO ()
     setupInteractive cmd flags args =
       setupWrapper verbosity
                    scriptOptions { isInteractive = True }
                    (Just (elabPkgDescription pkg))
                    cmd flags args
 
-    setup :: CommandUI flags -> (Version -> flags) -> [String] -> IO ()
+    setup :: CommandUI flags -> (Version -> flags) -> (Version -> [String])
+          -> IO ()
     setup cmd flags args =
       setupWrapper verbosity
                    scriptOptions
@@ -1317,7 +1416,7 @@ buildInplaceUnpackedPackage verbosity
                                 pkg pkgshared
                                 verbosity builddir
                                 pkgConfDest
-        setup Cabal.registerCommand registerFlags []
+        setup Cabal.registerCommand registerFlags (const [])
 
 withTempInstalledPackageInfoFile :: Verbosity -> FilePath
                                   -> (FilePath -> IO ())
@@ -1332,19 +1431,20 @@ withTempInstalledPackageInfoFile verbosity tempdir action =
 
       readPkgConf "." pkgConfDest
   where
-    pkgConfParseFailed :: Installed.PError -> IO a
+    pkgConfParseFailed :: String -> IO a
     pkgConfParseFailed perror =
-      die' verbosity $ "Couldn't parse the output of 'setup register --gen-pkg-config':"
-            ++ show perror
+      die' verbosity $
+      "Couldn't parse the output of 'setup register --gen-pkg-config':"
+      ++ show perror
 
     readPkgConf pkgConfDir pkgConfFile = do
-      (warns, ipkg) <- withUTF8FileContents (pkgConfDir </> pkgConfFile) $ \pkgConfStr ->
-        case Installed.parseInstalledPackageInfo pkgConfStr of
-          Installed.ParseFailed perror -> pkgConfParseFailed perror
-          Installed.ParseOk warns ipkg -> return (warns, ipkg)
+      pkgConfStr <- BS.readFile (pkgConfDir </> pkgConfFile)
+      (warns, ipkg) <- case Installed.parseInstalledPackageInfo pkgConfStr of
+        Left perrors -> pkgConfParseFailed $ unlines $ NE.toList perrors
+        Right (warns, ipkg) -> return (warns, ipkg)
 
       unless (null warns) $
-        warn verbosity $ unlines (map (showPWarning pkgConfFile) warns)
+        warn verbosity $ unlines warns
 
       return ipkg
 
@@ -1377,4 +1477,3 @@ annotateFailure mlogFile annotate action =
   where
     handler :: Exception e => e -> IO a
     handler = throwIO . BuildFailure mlogFile . annotate . toException
-

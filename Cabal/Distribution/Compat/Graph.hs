@@ -1,9 +1,10 @@
-{-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE CPP #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE BangPatterns         #-}
+{-# LANGUAGE CPP                  #-}
+{-# LANGUAGE DeriveDataTypeable   #-}
+{-# LANGUAGE FlexibleContexts     #-}
+{-# LANGUAGE ScopedTypeVariables  #-}
+{-# LANGUAGE TypeFamilies         #-}
 {-# LANGUAGE UndecidableInstances #-}
-{-# LANGUAGE BangPatterns #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Compat.Graph
@@ -83,31 +84,21 @@ module Distribution.Compat.Graph (
     nodeValue,
 ) where
 
--- For bootstrapping GHC
-#ifdef MIN_VERSION_containers
-#if MIN_VERSION_containers(0,5,0)
-#define HAVE_containers_050
-#endif
-#endif
-
+import Distribution.Compat.Prelude hiding (empty, lookup, null, toList)
 import Prelude ()
+
+import Data.Array                    ((!))
+import Data.Either                   (partitionEithers)
+import Data.Graph                    (SCC (..))
+import Distribution.Utils.Structured (Structure (..), Structured (..))
+
+import qualified Data.Array                  as Array
+import qualified Data.Foldable               as Foldable
+import qualified Data.Graph                  as G
+import qualified Data.Map.Strict             as Map
+import qualified Data.Set                    as Set
+import qualified Data.Tree                   as Tree
 import qualified Distribution.Compat.Prelude as Prelude
-import Distribution.Compat.Prelude hiding (lookup, null, empty)
-
-import Data.Graph (SCC(..))
-import qualified Data.Graph as G
-
-#ifdef HAVE_containers_050
-import qualified Data.Map.Strict as Map
-#else
-import qualified Data.Map as Map
-#endif
-import qualified Data.Set as Set
-import qualified Data.Array as Array
-import Data.Array ((!))
-import qualified Data.Tree as Tree
-import Data.Either (partitionEithers)
-import qualified Data.Foldable as Foldable
 
 -- | A graph of nodes @a@.  The nodes are expected to have instance
 -- of class 'IsNode'.
@@ -140,6 +131,9 @@ instance (IsNode a, Binary a, Show (Key a)) => Binary (Graph a) where
     put x = put (toList x)
     get = fmap fromDistinctList get
 
+instance Structured a => Structured (Graph a) where
+    structure p = Nominal (typeRep p) 0 "Graph" [structure (Proxy :: Proxy a)]
+
 instance (Eq (Key a), Eq a) => Eq (Graph a) where
     g1 == g2 = graphMap g1 == graphMap g2
 
@@ -148,11 +142,9 @@ instance Foldable.Foldable Graph where
     foldr f z = Foldable.foldr f z . graphMap
     foldl f z = Foldable.foldl f z . graphMap
     foldMap f = Foldable.foldMap f . graphMap
-#ifdef MIN_VERSION_base
-#if MIN_VERSION_base(4,6,0)
     foldl' f z = Foldable.foldl' f z . graphMap
     foldr' f z = Foldable.foldr' f z . graphMap
-#endif
+#ifdef MIN_VERSION_base
 #if MIN_VERSION_base(4,8,0)
     length = Foldable.length . graphMap
     null   = Foldable.null   . graphMap
@@ -182,7 +174,7 @@ instance (NFData a, NFData (Key a)) => NFData (Graph a) where
 -- type @'Key' a@; given a node we can determine its key ('nodeKey')
 -- and the keys of its neighbors ('nodeNeighbors').
 class Ord (Key a) => IsNode a where
-    type Key a :: *
+    type Key a
     nodeKey :: a -> Key a
     nodeNeighbors :: a -> [Key a]
 

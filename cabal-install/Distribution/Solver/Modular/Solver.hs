@@ -6,6 +6,7 @@
 module Distribution.Solver.Modular.Solver
     ( SolverConfig(..)
     , solve
+    , PruneAfterFirstSuccess(..)
     ) where
 
 import Data.Map as M
@@ -35,6 +36,7 @@ import qualified Distribution.Solver.Modular.Preference as P
 import Distribution.Solver.Modular.Validate
 import Distribution.Solver.Modular.Linking
 import Distribution.Solver.Modular.PSQ (PSQ)
+import Distribution.Solver.Modular.RetryLog
 import Distribution.Solver.Modular.Tree
 import qualified Distribution.Solver.Modular.PSQ as PSQ
 
@@ -43,7 +45,7 @@ import Distribution.Simple.Setup (BooleanFlag(..))
 #ifdef DEBUG_TRACETREE
 import qualified Distribution.Solver.Modular.ConflictSet as CS
 import qualified Distribution.Solver.Modular.WeightedPSQ as W
-import qualified Distribution.Text as T
+import qualified Distribution.Deprecated.Text as T
 
 import Debug.Trace.Tree (gtraceJson)
 import Debug.Trace.Tree.Simple
@@ -53,19 +55,27 @@ import Debug.Trace.Tree.Assoc (Assoc(..))
 
 -- | Various options for the modular solver.
 data SolverConfig = SolverConfig {
-  reorderGoals          :: ReorderGoals,
-  countConflicts        :: CountConflicts,
-  independentGoals      :: IndependentGoals,
-  avoidReinstalls       :: AvoidReinstalls,
-  shadowPkgs            :: ShadowPkgs,
-  strongFlags           :: StrongFlags,
-  allowBootLibInstalls  :: AllowBootLibInstalls,
-  maxBackjumps          :: Maybe Int,
-  enableBackjumping     :: EnableBackjumping,
-  solveExecutables      :: SolveExecutables,
-  goalOrder             :: Maybe (Variable QPN -> Variable QPN -> Ordering),
-  solverVerbosity       :: Verbosity
+  reorderGoals           :: ReorderGoals,
+  countConflicts         :: CountConflicts,
+  fineGrainedConflicts   :: FineGrainedConflicts,
+  minimizeConflictSet    :: MinimizeConflictSet,
+  independentGoals       :: IndependentGoals,
+  avoidReinstalls        :: AvoidReinstalls,
+  shadowPkgs             :: ShadowPkgs,
+  strongFlags            :: StrongFlags,
+  allowBootLibInstalls   :: AllowBootLibInstalls,
+  onlyConstrained        :: OnlyConstrained,
+  maxBackjumps           :: Maybe Int,
+  enableBackjumping      :: EnableBackjumping,
+  solveExecutables       :: SolveExecutables,
+  goalOrder              :: Maybe (Variable QPN -> Variable QPN -> Ordering),
+  solverVerbosity        :: Verbosity,
+  pruneAfterFirstSuccess :: PruneAfterFirstSuccess
 }
+
+-- | Whether to remove all choices after the first successful choice at each
+-- level in the search tree.
+newtype PruneAfterFirstSuccess = PruneAfterFirstSuccess Bool
 
 -- | Run all solver phases.
 --
@@ -83,7 +93,7 @@ solve :: SolverConfig                         -- ^ solver parameters
       -> (PN -> PackagePreferences)           -- ^ preferences
       -> Map PN [LabeledPackageConstraint]    -- ^ global constraints
       -> Set PN                               -- ^ global goals
-      -> Log Message (Assignment, RevDepMap)
+      -> RetryLog Message SolverFailure (Assignment, RevDepMap)
 solve sc cinfo idx pkgConfigDB userPrefs userConstraints userGoals =
   explorePhase     $
   detectCycles     $
@@ -93,19 +103,26 @@ solve sc cinfo idx pkgConfigDB userPrefs userConstraints userGoals =
   prunePhase       $
   buildPhase
   where
-    explorePhase     = backjumpAndExplore (enableBackjumping sc) (countConflicts sc)
+    explorePhase     = backjumpAndExplore (maxBackjumps sc)
+                                          (enableBackjumping sc)
+                                          (fineGrainedConflicts sc)
+                                          (countConflicts sc)
+                                          idx
     detectCycles     = traceTree "cycles.json" id . detectCyclesPhase
     heuristicsPhase  =
       let heuristicsTree = traceTree "heuristics.json" id
-      in case goalOrder sc of
-           Nothing -> goalChoiceHeuristics .
-                      heuristicsTree .
-                      P.deferSetupChoices .
-                      P.deferWeakFlagChoices .
-                      P.preferBaseGoalChoice
-           Just order -> P.firstGoal .
-                         heuristicsTree .
-                         P.sortGoals order
+          sortGoals = case goalOrder sc of
+                        Nothing -> goalChoiceHeuristics .
+                                   heuristicsTree .
+                                   P.deferSetupChoices .
+                                   P.deferWeakFlagChoices .
+                                   P.preferBaseGoalChoice
+                        Just order -> P.firstGoal .
+                                   heuristicsTree .
+                                   P.sortGoals order
+          PruneAfterFirstSuccess prune = pruneAfterFirstSuccess sc
+      in sortGoals .
+         (if prune then P.pruneAfterFirstSuccess else id)
     preferencesPhase = P.preferLinked .
                        P.preferPackagePreferences userPrefs
     validationPhase  = traceTree "validated.json" id .
@@ -117,9 +134,19 @@ solve sc cinfo idx pkgConfigDB userPrefs userConstraints userGoals =
     prunePhase       = (if asBool (avoidReinstalls sc) then P.avoidReinstalls (const True) else id) .
                        (if asBool (allowBootLibInstalls sc)
                         then id
-                        else P.requireInstalled (`elem` nonInstallable))
+                        else P.requireInstalled (`elem` nonInstallable)) .
+                       (case onlyConstrained sc of
+                          OnlyConstrainedAll ->
+                            P.onlyConstrained pkgIsExplicit
+                          OnlyConstrainedNone ->
+                            id)
     buildPhase       = traceTree "build.json" id
                      $ buildTree idx (independentGoals sc) (S.toList userGoals)
+
+    allExplicit = M.keysSet userConstraints `S.union` userGoals
+
+    pkgIsExplicit :: PN -> Bool
+    pkgIsExplicit pn = S.member pn allExplicit
 
     -- packages that can never be installed or upgraded
     -- If you change this enumeration, make sure to update the list in

@@ -39,7 +39,7 @@ cd travis
 # Setup SSH key we will use to push to binaries repository.
 # umask to get the permissions to be 600 (not 400, because the deploy
 # script in .travis.yml is going to clobber this private key)
-(umask 177 && cp id_rsa $HOME/.ssh/id_rsa)
+(umask 177 && tr A-Za-z N-ZA-Mn-za-m < id_rsa.rot13 > $HOME/.ssh/id_rsa)
 
 # Setup SSH keys
 ssh-keyscan github.com >> $HOME/.ssh/known_hosts
@@ -65,27 +65,38 @@ mkdir cabal-install
 cp -R $TRAVIS_BUILD_DIR/Cabal/tests                                  Cabal
 cp -R $TRAVIS_BUILD_DIR/cabal-install/tests                          cabal-install
 # Copy in credentials so we can delete branch when done
-cp $TRAVIS_BUILD_DIR/travis/id_rsa .
+cp $TRAVIS_BUILD_DIR/travis/id_rsa.rot13 .
 # Install all of the necessary files for testing
 cp $TRAVIS_BUILD_DIR/travis-install.sh .
 cp $TRAVIS_BUILD_DIR/travis-common.sh .
-# The binaries to test (statically linked, of course!)
-cp ${CABAL_BDIR}/c/unit-tests/build/unit-tests/unit-tests                         Cabal
-cp ${CABAL_BDIR}/c/check-tests/build/check-tests/check-tests                 Cabal
-cp ${CABAL_BDIR}/c/parser-tests/build/parser-tests/parser-tests                 Cabal
-cp ${CABAL_BDIR}/c/parser-hackage-tests/build/parser-hackage-tests/parser-hackage-tests Cabal
+
+cp ${CABAL_BDIR}/t/unit-tests/build/unit-tests/unit-tests          Cabal
+cp ${CABAL_BDIR}/t/check-tests/build/check-tests/check-tests       Cabal
+cp ${CABAL_BDIR}/t/parser-tests/build/parser-tests/parser-tests    Cabal
+cp ${CABAL_BDIR}/t/hackage-tests/build/hackage-tests/hackage-tests Cabal
+BINARIES="Cabal/unit-tests Cabal/check-tests Cabal/parser-tests Cabal/hackage-tests"
 if [ "x$CABAL_LIB_ONLY" != "xYES" ]; then
-    cp ${CABAL_INSTALL_BDIR}/build/cabal/cabal                       cabal-install
+    cp ${CABAL_INSTALL_EXE}                       cabal-install
+    BINARIES="cabal-install/cabal $BINARIES"
 fi
+
+# The binaries to test (statically linked, of course!)
+tar czf binaries.tgz $BINARIES
+rm $BINARIES # Don't check me in!
+
+# Upload to S3
+S3_URL=$(curl -X POST "https://s3-bouncer.herokuapp.com/put")
+travis_retry curl "$S3_URL" --upload-file binaries.tgz
+rm binaries.tgz # Don't check me in!
+echo "$S3_URL" | xargs basename | cut -d '?' -f 1 > s3-object.txt
 
 # Add, commit, push
 git add .
 # The JSON in the commit message is used by the webhook listening
 # on the downstream repo to figure out who to communicate the
 # status update back to
-git commit -m '{"origin":"'$ORIGIN'",
+git commit -m '{"url":"'$URL'",
 
-"url":"'$URL'",
 "account":"'$ACCOUNT'",
 "repo":"'$REPO'",
 "commit": "'$COMMIT'",

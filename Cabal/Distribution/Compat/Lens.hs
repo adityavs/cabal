@@ -21,6 +21,7 @@ module Distribution.Compat.Lens (
     -- * Getter
     view,
     use,
+    getting,
     -- * Setter
     set,
     over,
@@ -50,7 +51,6 @@ import Prelude()
 import Distribution.Compat.Prelude
 
 import Control.Applicative (Const (..))
-import Data.Functor.Identity (Identity (..))
 import Control.Monad.State.Class (MonadState (..), gets, modify)
 
 import qualified Distribution.Compat.DList as DList
@@ -71,7 +71,7 @@ type Traversal' s a = Traversal s s a a
 
 type Getting r s a = LensLike (Const r) s s a a
 
-type AGetter s   a   = LensLike (Const a)     s s a a  -- this doens't exist in 'lens'
+type AGetter s   a   = LensLike (Const a)     s s a a  -- this doesn't exist in 'lens'
 type ASetter s t a b = LensLike Identity      s t a b
 type ALens   s t a b = LensLike (Pretext a b) s t a b
 
@@ -88,6 +88,14 @@ view l s = getConst (l Const s)
 use :: MonadState s m => Getting a s a -> m a
 use l = gets (view l)
 {-# INLINE use #-}
+
+-- | @since 2.4
+--
+-- >>> (3 :: Int) ^. getting (+2) . getting show
+-- "5"
+getting :: (s -> a) -> Getting r s a
+getting k f = Const . getConst . f . k
+{-# INLINE getting #-}
 
 -------------------------------------------------------------------------------
 -- Setter
@@ -119,6 +127,7 @@ toSetOf l s = getConst (l (\x -> Const (Set.singleton x)) s)
 aview :: ALens s t a b -> s -> a
 aview l = pretextPos  . l pretextSell
 {-# INLINE aview #-}
+
 {-
 lens :: (s -> a) -> (s -> a -> s) -> Lens' s a
 lens sa sbt afb s = sbt s <$> afb (sa s)
@@ -230,7 +239,7 @@ instance Functor (Pretext a b) where
 --
 -- First start a repl
 --
--- > cabal new-repl Cabal:parser-hackage-tests -fparsec-struct-diff
+-- > cabal new-repl Cabal:hackage-tests
 --
 -- Because @--extra-package@ isn't yet implemented, we use a test-suite
 -- with @generics-sop@ dependency.

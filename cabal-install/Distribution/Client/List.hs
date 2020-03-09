@@ -40,7 +40,7 @@ import Distribution.Version
          ( Version, mkVersion, versionNumbers, VersionRange, withinRange, anyVersion
          , intersectVersionRanges, simplifyVersionRange )
 import Distribution.Verbosity (Verbosity)
-import Distribution.Text
+import Distribution.Deprecated.Text
          ( Text(disp), display )
 
 import qualified Distribution.SPDX as SPDX
@@ -76,6 +76,9 @@ import Control.Exception
 import Text.PrettyPrint as Disp
 import System.Directory
          ( doesDirectoryExist )
+
+import Distribution.Utils.ShortText (ShortText)
+import qualified Distribution.Utils.ShortText as ShortText
 
 
 -- | Return a list of packages matching given search strings.
@@ -231,9 +234,9 @@ info verbosity packageDBs repoCtxt comp progdb
 
         selectedInstalledPkgs = InstalledPackageIndex.lookupDependency
                                 installedPkgIndex
-                                (Dependency name verConstraint)
+                                name verConstraint
         selectedSourcePkgs    = PackageIndex.lookupDependency sourcePkgIndex
-                                (Dependency name verConstraint)
+                                name verConstraint
         selectedSourcePkg'    = latestWithPref pref selectedSourcePkgs
 
                          -- display a specific package version if the user
@@ -277,15 +280,15 @@ data PackageDisplayInfo = PackageDisplayInfo {
     installedVersions :: [Version],
     sourceVersions    :: [Version],
     preferredVersions :: VersionRange,
-    homepage          :: String,
-    bugReports        :: String,
-    sourceRepo        :: String,
-    synopsis          :: String,
-    description       :: String,
-    category          :: String,
+    homepage          :: ShortText,
+    bugReports        :: ShortText,
+    sourceRepo        :: String, -- TODO
+    synopsis          :: ShortText,
+    description       :: ShortText,
+    category          :: ShortText,
     license           :: Either SPDX.License License,
-    author            :: String,
-    maintainer        :: String,
+    author            :: ShortText,
+    maintainer        :: ShortText,
     dependencies      :: [ExtDependency],
     flags             :: [Flag],
     hasLib            :: Bool,
@@ -307,7 +310,7 @@ showPackageSummaryInfo pkginfo =
      char '*' <+> disp (pkgName pkginfo)
      $+$
      (nest 4 $ vcat [
-       maybeShow (synopsis pkginfo) "Synopsis:" reflowParagraphs
+       maybeShowST (synopsis pkginfo) "Synopsis:" reflowParagraphs
      , text "Default available version:" <+>
        case selectedSourcePkg pkginfo of
          Nothing  -> text "[ Not available from any configured repository ]"
@@ -318,13 +321,14 @@ showPackageSummaryInfo pkginfo =
              | otherwise      -> text "[ Unknown ]"
          versions             -> dispTopVersions 4
                                    (preferredVersions pkginfo) versions
-     , maybeShow (homepage pkginfo) "Homepage:" text
+     , maybeShowST (homepage pkginfo) "Homepage:" text
      , text "License: " <+> either pretty pretty (license pkginfo)
      ])
      $+$ text ""
   where
-    maybeShow [] _ _ = empty
-    maybeShow l  s f = text s <+> (f l)
+    maybeShowST l s f
+        | ShortText.null l = empty
+        | otherwise        = text s <+> f (ShortText.fromShortText l)
 
 showPackageDetailedInfo :: PackageDisplayInfo -> String
 showPackageDetailedInfo pkginfo =
@@ -335,7 +339,7 @@ showPackageDetailedInfo pkginfo =
             Disp.<> parens pkgkind
    $+$
    (nest 4 $ vcat [
-     entry "Synopsis"      synopsis     hideIfNull     reflowParagraphs
+     entryST "Synopsis"      synopsis     hideIfNull  reflowParagraphs
    , entry "Versions available" sourceVersions
            (altText null "[ Not available from server ]")
            (dispTopVersions 9 (preferredVersions pkginfo))
@@ -343,13 +347,13 @@ showPackageDetailedInfo pkginfo =
            (altText null (if hasLib pkginfo then "[ Not installed ]"
                                             else "[ Unknown ]"))
            (dispTopVersions 4 (preferredVersions pkginfo))
-   , entry "Homepage"      homepage     orNotSpecified text
-   , entry "Bug reports"   bugReports   orNotSpecified text
-   , entry "Description"   description  hideIfNull     reflowParagraphs
-   , entry "Category"      category     hideIfNull     text
+   , entryST "Homepage"      homepage     orNotSpecified text
+   , entryST "Bug reports"   bugReports   orNotSpecified text
+   , entryST "Description"   description  hideIfNull     reflowParagraphs
+   , entryST "Category"      category     hideIfNull     text
    , entry "License"       license      alwaysShow     (either pretty pretty)
-   , entry "Author"        author       hideIfNull     reflowLines
-   , entry "Maintainer"    maintainer   hideIfNull     reflowLines
+   , entryST "Author"        author       hideIfNull     reflowLines
+   , entryST "Maintainer"    maintainer   hideIfNull     reflowLines
    , entry "Source repo"   sourceRepo   orNotSpecified text
    , entry "Executables"   executables  hideIfNull     (commaSep disp)
    , entry "Flags"         flags        hideIfNull     (commaSep dispFlag)
@@ -368,6 +372,8 @@ showPackageDetailedInfo pkginfo =
       where
         label   = text fname Disp.<> char ':' Disp.<> padding
         padding = text (replicate (13 - length fname ) ' ')
+
+    entryST fname field = entry fname (ShortText.fromShortText . field)
 
     normal      = Nothing
     hide        = Just Nothing
@@ -446,14 +452,14 @@ mergePackageInfo versionPref installedPkgs sourcePkgs selectedPkg showVer =
                            Installed.author     installed,
     homepage     = combine Source.homepage      source
                            Installed.homepage   installed,
-    bugReports   = maybe "" Source.bugReports source,
-    sourceRepo   = fromMaybe "" . join
+    bugReports   = maybe mempty Source.bugReports source,
+    sourceRepo   = fromMaybe mempty . join
                  . fmap (uncons Nothing Source.repoLocation
                        . sortBy (comparing Source.repoKind)
                        . Source.sourceRepos)
                  $ source,
                     --TODO: installed package info is missing synopsis
-    synopsis     = maybe "" Source.synopsis      source,
+    synopsis     = maybe mempty Source.synopsis      source,
     description  = combine Source.description    source
                            Installed.description installed,
     category     = combine Source.category       source
@@ -470,7 +476,7 @@ mergePackageInfo versionPref installedPkgs sourcePkgs selectedPkg showVer =
                            source,
     dependencies =
       combine (map (SourceDependency . simplifyDependency)
-               . Source.buildDepends) source
+               . Source.allBuildDepends) source
       (map InstalledDependency . Installed.depends) installed,
     haddockHtml  = fromMaybe "" . join
                  . fmap (listToMaybe . Installed.haddockHTMLs)

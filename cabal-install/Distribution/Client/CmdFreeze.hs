@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, NamedFieldPuns, RecordWildCards, ViewPatterns #-}
+{-# LANGUAGE NamedFieldPuns, RecordWildCards #-}
 
 -- | cabal-install CLI command: freeze
 --
@@ -31,10 +31,9 @@ import Distribution.Version
 import Distribution.PackageDescription
          ( FlagAssignment, nullFlagAssignment )
 import Distribution.Client.Setup
-         ( GlobalFlags, ConfigFlags(..), ConfigExFlags, InstallFlags
-         , applyFlagDefaults )
+         ( GlobalFlags, ConfigFlags(..), ConfigExFlags, InstallFlags )
 import Distribution.Simple.Setup
-         ( HaddockFlags, fromFlagOrDefault )
+         ( HaddockFlags, TestFlags, BenchmarkFlags, fromFlagOrDefault )
 import Distribution.Simple.Utils
          ( die', notice, wrapText )
 import Distribution.Verbosity
@@ -50,11 +49,13 @@ import Distribution.Simple.Command
 import qualified Distribution.Client.Setup as Client
 
 
-freezeCommand :: CommandUI (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags)
+freezeCommand :: CommandUI ( ConfigFlags, ConfigExFlags, InstallFlags
+                           , HaddockFlags, TestFlags, BenchmarkFlags
+                           )
 freezeCommand = Client.installCommand {
-  commandName         = "new-freeze",
+  commandName         = "v2-freeze",
   commandSynopsis     = "Freeze dependencies.",
-  commandUsage        = usageAlternatives "new-freeze" [ "[FLAGS]" ],
+  commandUsage        = usageAlternatives "v2-freeze" [ "[FLAGS]" ],
   commandDescription  = Just $ \_ -> wrapText $
         "The project configuration is frozen so that it will be reproducible "
      ++ "in future.\n\n"
@@ -63,23 +64,23 @@ freezeCommand = Client.installCommand {
      ++ "the 'cabal.project.freeze' file (or '$project_file.freeze' if "
      ++ "'--project-file' is specified). This file extends the configuration "
      ++ "from the 'cabal.project' file and thus is used as the project "
-     ++ "configuration for all other commands (such as 'new-build', "
-     ++ "'new-repl' etc).\n\n"
+     ++ "configuration for all other commands (such as 'v2-build', "
+     ++ "'v2-repl' etc).\n\n"
 
      ++ "The freeze file can be kept in source control. To make small "
      ++ "adjustments it may be edited manually, or to make bigger changes "
      ++ "you may wish to delete the file and re-freeze. For more control, "
-     ++ "one approach is to try variations using 'new-build --dry-run' with "
+     ++ "one approach is to try variations using 'v2-build --dry-run' with "
      ++ "solver flags such as '--constraint=\"pkg < 1.2\"' and once you have "
-     ++ "a satisfactory solution to freeze it using the 'new-freeze' command "
+     ++ "a satisfactory solution to freeze it using the 'v2-freeze' command "
      ++ "with the same set of flags.",
   commandNotes        = Just $ \pname ->
         "Examples:\n"
-     ++ "  " ++ pname ++ " new-freeze\n"
+     ++ "  " ++ pname ++ " v2-freeze\n"
      ++ "    Freeze the configuration of the current project\n\n"
-     ++ "  " ++ pname ++ " new-build --dry-run --constraint=\"aeson < 1\"\n"
+     ++ "  " ++ pname ++ " v2-build --dry-run --constraint=\"aeson < 1\"\n"
      ++ "    Check what a solution with the given constraints would look like\n"
-     ++ "  " ++ pname ++ " new-freeze --constraint=\"aeson < 1\"\n"
+     ++ "  " ++ pname ++ " v2-freeze --constraint=\"aeson < 1\"\n"
      ++ "    Freeze a solution using the given constraints\n\n"
 
      ++ "Note: this command is part of the new project-based system (aka "
@@ -100,9 +101,11 @@ freezeCommand = Client.installCommand {
 -- For more details on how this works, see the module
 -- "Distribution.Client.ProjectOrchestration"
 --
-freezeAction :: (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags)
+freezeAction :: ( ConfigFlags, ConfigExFlags, InstallFlags
+                , HaddockFlags, TestFlags, BenchmarkFlags )
              -> [String] -> GlobalFlags -> IO ()
-freezeAction (applyFlagDefaults -> (configFlags, configExFlags, installFlags, haddockFlags))
+freezeAction ( configFlags, configExFlags, installFlags
+             , haddockFlags, testFlags, benchmarkFlags )
              extraArgs globalFlags = do
 
     unless (null extraArgs) $
@@ -114,7 +117,7 @@ freezeAction (applyFlagDefaults -> (configFlags, configExFlags, installFlags, ha
       cabalDirLayout,
       projectConfig,
       localPackages
-    } <- establishProjectBaseContext verbosity cliConfig
+    } <- establishProjectBaseContext verbosity cliConfig OtherCommand
 
     (_, elaboratedPlan, _) <-
       rebuildInstallPlan verbosity
@@ -131,7 +134,9 @@ freezeAction (applyFlagDefaults -> (configFlags, configExFlags, installFlags, ha
     verbosity = fromFlagOrDefault normal (configVerbosity configFlags)
     cliConfig = commandLineFlagsToProjectConfig
                   globalFlags configFlags configExFlags
-                  installFlags haddockFlags
+                  installFlags
+                  mempty -- ClientInstallFlags, not needed here
+                  haddockFlags testFlags benchmarkFlags
 
 
 
@@ -210,7 +215,6 @@ projectFreezeConstraints plan =
       :: Map PackageName [(UserConstraint, ConstraintSource)]
       -> Map PackageName [(UserConstraint, ConstraintSource)]
     deleteLocalPackagesVersionConstraints =
-#if MIN_VERSION_containers(0,5,0)
       Map.mergeWithKey
         (\_pkgname () constraints ->
             case filter (not . isVersionConstraint . fst) constraints of
@@ -218,15 +222,6 @@ projectFreezeConstraints plan =
               constraints' -> Just constraints')
         (const Map.empty) id
         localPackages
-#else
-      Map.mapMaybeWithKey
-        (\pkgname constraints ->
-            if pkgname `Map.member` localPackages
-              then case filter (not . isVersionConstraint . fst) constraints of
-                     []           -> Nothing
-                     constraints' -> Just constraints'
-              else Just constraints)
-#endif
 
     isVersionConstraint (UserConstraint _ (PackagePropertyVersion _)) = True
     isVersionConstraint _                                             = False

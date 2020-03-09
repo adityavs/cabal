@@ -19,11 +19,11 @@ module Distribution.Types.ForeignLib(
 import Distribution.Compat.Prelude
 import Prelude ()
 
+import Distribution.FieldGrammar.Described
 import Distribution.ModuleName
-import Distribution.Parsec.Class
+import Distribution.Parsec
 import Distribution.Pretty
 import Distribution.System
-import Distribution.Text
 import Distribution.Types.BuildInfo
 import Distribution.Types.ForeignLibOption
 import Distribution.Types.ForeignLibType
@@ -31,9 +31,8 @@ import Distribution.Types.UnqualComponentName
 import Distribution.Version
 
 import qualified Distribution.Compat.CharParsing as P
-import qualified Distribution.Compat.ReadP  as Parse
-import qualified Text.PrettyPrint           as Disp
-import qualified Text.Read                  as Read
+import qualified Text.PrettyPrint                as Disp
+import qualified Text.Read                       as Read
 
 import qualified Distribution.Types.BuildInfo.Lens as L
 
@@ -84,7 +83,7 @@ instance Read LibVersionInfo where
         return (mkLibVersionInfo t)
 
 instance Binary LibVersionInfo
-
+instance Structured LibVersionInfo
 instance NFData LibVersionInfo where rnf = genericRnf
 
 instance Pretty LibVersionInfo where
@@ -103,17 +102,9 @@ instance Parsec LibVersionInfo where
             return (r,a)
         return $ mkLibVersionInfo (c,r,a)
 
-instance Text LibVersionInfo where
-    parse = do
-        c <- parseNat
-        (r, a) <- Parse.option (0,0) $ do
-            _ <- Parse.char ':'
-            r <- parseNat
-            a <- Parse.option 0 (Parse.char ':' >> parseNat)
-            return (r, a)
-        return $ mkLibVersionInfo (c,r,a)
-      where
-        parseNat = read `fmap` Parse.munch1 isDigit
+instance Described LibVersionInfo where
+    describe _ = reDigits <> REOpt (reChar ':' <> reDigits <> REOpt (reChar ':' <> reDigits)) where
+        reDigits = reChars ['0'..'9']
 
 -- | Construct 'LibVersionInfo' from @(current, revision, age)@
 -- numbers.
@@ -149,7 +140,7 @@ instance L.HasBuildInfo ForeignLib where
     buildInfo f l = (\x -> l { foreignLibBuildInfo = x }) <$> f (foreignLibBuildInfo l)
 
 instance Binary ForeignLib
-
+instance Structured ForeignLib
 instance NFData ForeignLib where rnf = genericRnf
 
 instance Semigroup ForeignLib where

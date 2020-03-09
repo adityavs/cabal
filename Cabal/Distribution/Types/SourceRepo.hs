@@ -17,11 +17,10 @@ import Distribution.Compat.Prelude
 import Distribution.Utils.Generic (lowercase)
 
 import Distribution.Pretty
-import Distribution.Parsec.Class
-import Distribution.Text
+import Distribution.Parsec
+import Distribution.FieldGrammar.Described
 
 import qualified Distribution.Compat.CharParsing as P
-import qualified Distribution.Compat.ReadP as Parse
 import qualified Text.PrettyPrint as Disp
 
 -- ------------------------------------------------------------
@@ -83,7 +82,7 @@ data SourceRepo = SourceRepo {
   -- given the default is \".\" ie no subdirectory.
   repoSubdir   :: Maybe FilePath
 }
-  deriving (Eq, Generic, Read, Show, Typeable, Data)
+  deriving (Eq, Ord, Generic, Read, Show, Typeable, Data)
 
 emptySourceRepo :: RepoKind -> SourceRepo
 emptySourceRepo kind = SourceRepo
@@ -97,7 +96,7 @@ emptySourceRepo kind = SourceRepo
     }
 
 instance Binary SourceRepo
-
+instance Structured SourceRepo
 instance NFData SourceRepo where rnf = genericRnf
 
 -- | What this repo info is for, what it represents.
@@ -117,7 +116,7 @@ data RepoKind =
   deriving (Eq, Generic, Ord, Read, Show, Typeable, Data)
 
 instance Binary RepoKind
-
+instance Structured RepoKind
 instance NFData RepoKind where rnf = genericRnf
 
 -- | An enumeration of common source control systems. The fields used in the
@@ -130,7 +129,7 @@ data RepoType = Darcs | Git | SVN | CVS
   deriving (Eq, Generic, Ord, Read, Show, Typeable, Data)
 
 instance Binary RepoType
-
+instance Structured RepoType
 instance NFData RepoType where rnf = genericRnf
 
 knownRepoTypes :: [RepoType]
@@ -151,9 +150,6 @@ instance Pretty RepoKind where
 instance Parsec RepoKind where
   parsec = classifyRepoKind <$> P.munch1 isIdent
 
-instance Text RepoKind where
-  parse = fmap classifyRepoKind ident
-
 classifyRepoKind :: String -> RepoKind
 classifyRepoKind name = case lowercase name of
   "head" -> RepoHead
@@ -167,8 +163,8 @@ instance Pretty RepoType where
 instance Parsec RepoType where
   parsec = classifyRepoType <$> P.munch1 isIdent
 
-instance Text RepoType where
-  parse = fmap classifyRepoType ident
+instance Described RepoType where
+  describe _ = reMunch1CS $ csAlphaNum <> csChar '_' <> csChar '-'
 
 classifyRepoType :: String -> RepoType
 classifyRepoType s =
@@ -176,10 +172,7 @@ classifyRepoType s =
   where
     repoTypeMap = [ (name, repoType')
                   | repoType' <- knownRepoTypes
-                  , name <- display repoType' : repoTypeAliases repoType' ]
-
-ident :: Parse.ReadP r String
-ident = Parse.munch1 isIdent
+                  , name <- prettyShow repoType' : repoTypeAliases repoType' ]
 
 isIdent :: Char -> Bool
 isIdent c = isAlphaNum c || c == '_' || c == '-'

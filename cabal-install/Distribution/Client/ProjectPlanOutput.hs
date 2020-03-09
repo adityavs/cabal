@@ -18,8 +18,9 @@ module Distribution.Client.ProjectPlanOutput (
 import           Distribution.Client.ProjectPlanning.Types
 import           Distribution.Client.ProjectBuilding.Types
 import           Distribution.Client.DistDirLayout
-import           Distribution.Client.Types (confInstId)
-import           Distribution.Client.PackageHash (showHashValue)
+import           Distribution.Client.Types (Repo(..), RemoteRepo(..), PackageLocation(..), confInstId)
+import           Distribution.Client.HashValue (showHashValue, hashValue)
+import           Distribution.Client.SourceRepo (SourceRepoMaybe, SourceRepositoryPackage (..))
 
 import qualified Distribution.Client.InstallPlan as InstallPlan
 import qualified Distribution.Client.Utils.Json as J
@@ -40,7 +41,7 @@ import           Distribution.Simple.GHC
                    ( getImplInfo, GhcImplInfo(supportsPkgEnvFiles)
                    , GhcEnvironmentFileEntry(..), simpleGhcEnvironmentFile
                    , writeGhcEnvironmentFile )
-import           Distribution.Text
+import           Distribution.Deprecated.Text
 import qualified Distribution.Compat.Graph as Graph
 import           Distribution.Compat.Graph (Graph, Node)
 import qualified Distribution.Compat.Binary as Binary
@@ -52,7 +53,6 @@ import Prelude ()
 import Distribution.Client.Compat.Prelude
 
 import qualified Data.Map as Map
-import           Data.Set (Set)
 import qualified Data.Set as Set
 import qualified Data.ByteString.Lazy as BS
 import qualified Data.ByteString.Builder as BB
@@ -139,7 +139,10 @@ encodePlanAsJson distDirLayout elaboratedInstallPlan elaboratedSharedConfig =
         , "flags"      J..= J.object [ PD.unFlagName fn J..= v
                                      | (fn,v) <- PD.unFlagAssignment (elabFlagAssignment elab) ]
         , "style"      J..= J.String (style2str (elabLocalToProject elab) (elabBuildStyle elab))
+        , "pkg-src"    J..= packageLocationToJ (elabPkgSourceLocation elab)
         ] ++
+        [ "pkg-cabal-sha256" J..= J.String (showHashValue hash)
+        | Just hash <- [ fmap hashValue (elabPkgDescriptionOverride elab) ] ] ++
         [ "pkg-src-sha256" J..= J.String (showHashValue hash)
         | Just hash <- [elabPkgSourceHash elab] ] ++
         (case elabBuildStyle elab of
@@ -154,7 +157,8 @@ encodePlanAsJson distDirLayout elaboratedInstallPlan elaboratedSharedConfig =
             let components = J.object $
                   [ comp2str c J..= (J.object $
                     [ "depends"     J..= map (jdisplay . confInstId) ldeps
-                    , "exe-depends" J..= map (jdisplay . confInstId) edeps ] ++
+                    , "exe-depends" J..= map (jdisplay . confInstId) edeps
+                    ] ++
                     bin_file c)
                   | (c,(ldeps,edeps))
                       <- ComponentDeps.toList $
@@ -168,6 +172,60 @@ encodePlanAsJson distDirLayout elaboratedInstallPlan elaboratedSharedConfig =
             ] ++
             bin_file (compSolverName comp)
      where
+      packageLocationToJ :: PackageLocation (Maybe FilePath) -> J.Value
+      packageLocationToJ pkgloc =
+        case pkgloc of
+          LocalUnpackedPackage local ->
+            J.object [ "type" J..= J.String "local"
+                     , "path" J..= J.String local
+                     ]
+          LocalTarballPackage local ->
+            J.object [ "type" J..= J.String "local-tar"
+                     , "path" J..= J.String local
+                     ]
+          RemoteTarballPackage uri _ ->
+            J.object [ "type" J..= J.String "remote-tar"
+                     , "uri"  J..= J.String (show uri)
+                     ]
+          RepoTarballPackage repo _ _ ->
+            J.object [ "type" J..= J.String "repo-tar"
+                     , "repo" J..= repoToJ repo
+                     ]
+          RemoteSourceRepoPackage srcRepo _ ->
+            J.object [ "type" J..= J.String "source-repo"
+                     , "source-repo" J..= sourceRepoToJ srcRepo
+                     ]
+
+      repoToJ :: Repo -> J.Value
+      repoToJ repo =
+        case repo of
+          RepoLocal{..} ->
+            J.object [ "type" J..= J.String "local-repo"
+                     , "path" J..= J.String repoLocalDir
+                     ]
+          RepoLocalNoIndex{..} ->
+            J.object [ "type" J..= J.String "local-repo-no-index"
+                     , "path" J..= J.String repoLocalDir
+                     ]
+          RepoRemote{..} ->
+            J.object [ "type" J..= J.String "remote-repo"
+                     , "uri"  J..= J.String (show (remoteRepoURI repoRemote))
+                     ]
+          RepoSecure{..} ->
+            J.object [ "type" J..= J.String "secure-repo"
+                     , "uri"  J..= J.String (show (remoteRepoURI repoRemote))
+                     ]
+
+      sourceRepoToJ :: SourceRepoMaybe -> J.Value
+      sourceRepoToJ SourceRepositoryPackage{..} =
+        J.object $ filter ((/= J.Null) . snd) $
+          [ "type"     J..= jdisplay srpType
+          , "location" J..= J.String srpLocation
+          , "branch"   J..= fmap J.String srpBranch
+          , "tag"      J..= fmap J.String srpTag
+          , "subdir"   J..= fmap J.String srpSubdir
+          ]
+
       dist_dir = distBuildDirectory distDirLayout
                     (elabDistDirParams elaboratedSharedConfig elab)
 
@@ -510,7 +568,7 @@ postBuildProjectStatus plan previousPackagesUpToDate
       Graph.revClosure packagesLibDepGraph
         ( Map.keys
         . Map.filter (uncurry buildAttempted)
-        $ Map.intersectionWith (,) pkgBuildStatus buildOutcomes 
+        $ Map.intersectionWith (,) pkgBuildStatus buildOutcomes
         )
 
     -- The plan graph but only counting dependency-on-library edges
@@ -881,4 +939,3 @@ relativePackageDBPath relroot pkgdb =
       UserPackageDB          -> UserPackageDB
       SpecificPackageDB path -> SpecificPackageDB relpath
         where relpath = makeRelative relroot path
-

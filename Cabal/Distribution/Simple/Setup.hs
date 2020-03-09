@@ -1,4 +1,5 @@
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE RankNTypes #-}
@@ -45,7 +46,7 @@ module Distribution.Simple.Setup (
   HaddockFlags(..),  emptyHaddockFlags,  defaultHaddockFlags,  haddockCommand,
   HscolourFlags(..), emptyHscolourFlags, defaultHscolourFlags, hscolourCommand,
   BuildFlags(..),    emptyBuildFlags,    defaultBuildFlags,    buildCommand,
-  buildVerbose,
+  ShowBuildInfoFlags(..),                defaultShowBuildFlags, showBuildInfoCommand,
   ReplFlags(..),                         defaultReplFlags,     replCommand,
   CleanFlags(..),    emptyCleanFlags,    defaultCleanFlags,    cleanCommand,
   RegisterFlags(..), emptyRegisterFlags, defaultRegisterFlags, registerCommand,
@@ -58,8 +59,10 @@ module Distribution.Simple.Setup (
   CopyDest(..),
   configureArgs, configureOptions, configureCCompiler, configureLinker,
   buildOptions, haddockOptions, installDirsOptions,
+  testOptions', benchmarkOptions',
   programDbOptions, programDbPaths',
-  programConfigurationOptions, programConfigurationPaths',
+  programFlagsDescription,
+  replOptions,
   splitArgs,
 
   defaultDistPref, optionDistPref,
@@ -73,25 +76,23 @@ module Distribution.Simple.Setup (
   maybeToFlag,
   BooleanFlag(..),
   boolOpt, boolOpt', trueArg, falseArg,
-  optionVerbosity, optionNumJobs, readPToMaybe ) where
+  optionVerbosity, optionNumJobs) where
 
 import Prelude ()
 import Distribution.Compat.Prelude hiding (get)
 
 import Distribution.Compiler
 import Distribution.ReadE
-import Distribution.Text
-import Distribution.Parsec.Class
+import Distribution.Parsec
 import Distribution.Pretty
-import qualified Distribution.Compat.ReadP as Parse
 import qualified Distribution.Compat.CharParsing as P
-import Distribution.ParseUtils (readPToMaybe)
 import qualified Text.PrettyPrint as Disp
 import Distribution.ModuleName
 import Distribution.PackageDescription hiding (Flag)
 import Distribution.Simple.Command hiding (boolOpt, boolOpt')
 import qualified Distribution.Simple.Command as Command
 import Distribution.Simple.Compiler hiding (Flag)
+import Distribution.Simple.Flag
 import Distribution.Simple.Utils
 import Distribution.Simple.Program
 import Distribution.Simple.InstallDirs
@@ -99,105 +100,19 @@ import Distribution.Verbosity
 import Distribution.Utils.NubList
 import Distribution.Types.Dependency
 import Distribution.Types.ComponentId
+import Distribution.Types.GivenComponent
 import Distribution.Types.Module
 import Distribution.Types.PackageName
+import Distribution.Types.UnqualComponentName (unUnqualComponentName)
 
 import Distribution.Compat.Stack
-import Distribution.Compat.Semigroup (Last' (..))
+import Distribution.Compat.Semigroup (Last' (..), Option' (..))
 
 import Data.Function (on)
 
 -- FIXME Not sure where this should live
 defaultDistPref :: FilePath
 defaultDistPref = "dist"
-
--- ------------------------------------------------------------
--- * Flag type
--- ------------------------------------------------------------
-
--- | All flags are monoids, they come in two flavours:
---
--- 1. list flags eg
---
--- > --ghc-option=foo --ghc-option=bar
---
--- gives us all the values ["foo", "bar"]
---
--- 2. singular value flags, eg:
---
--- > --enable-foo --disable-foo
---
--- gives us Just False
--- So this Flag type is for the latter singular kind of flag.
--- Its monoid instance gives us the behaviour where it starts out as
--- 'NoFlag' and later flags override earlier ones.
---
-data Flag a = Flag a | NoFlag deriving (Eq, Generic, Show, Read)
-
-instance Binary a => Binary (Flag a)
-
-instance Functor Flag where
-  fmap f (Flag x) = Flag (f x)
-  fmap _ NoFlag  = NoFlag
-
-instance Monoid (Flag a) where
-  mempty = NoFlag
-  mappend = (<>)
-
-instance Semigroup (Flag a) where
-  _ <> f@(Flag _) = f
-  f <> NoFlag     = f
-
-instance Bounded a => Bounded (Flag a) where
-  minBound = toFlag minBound
-  maxBound = toFlag maxBound
-
-instance Enum a => Enum (Flag a) where
-  fromEnum = fromEnum . fromFlag
-  toEnum   = toFlag   . toEnum
-  enumFrom (Flag a) = map toFlag . enumFrom $ a
-  enumFrom _        = []
-  enumFromThen (Flag a) (Flag b) = toFlag `map` enumFromThen a b
-  enumFromThen _        _        = []
-  enumFromTo   (Flag a) (Flag b) = toFlag `map` enumFromTo a b
-  enumFromTo   _        _        = []
-  enumFromThenTo (Flag a) (Flag b) (Flag c) = toFlag `map` enumFromThenTo a b c
-  enumFromThenTo _        _        _        = []
-
-toFlag :: a -> Flag a
-toFlag = Flag
-
-fromFlag :: WithCallStack (Flag a -> a)
-fromFlag (Flag x) = x
-fromFlag NoFlag   = error "fromFlag NoFlag. Use fromFlagOrDefault"
-
-fromFlagOrDefault :: a -> Flag a -> a
-fromFlagOrDefault _   (Flag x) = x
-fromFlagOrDefault def NoFlag   = def
-
-flagToMaybe :: Flag a -> Maybe a
-flagToMaybe (Flag x) = Just x
-flagToMaybe NoFlag   = Nothing
-
-flagToList :: Flag a -> [a]
-flagToList (Flag x) = [x]
-flagToList NoFlag   = []
-
-allFlags :: [Flag Bool] -> Flag Bool
-allFlags flags = if all (\f -> fromFlagOrDefault False f) flags
-                 then Flag True
-                 else NoFlag
-
-maybeToFlag :: Maybe a -> Flag a
-maybeToFlag Nothing  = NoFlag
-maybeToFlag (Just x) = Flag x
-
--- | Types that represent boolean flags.
-class BooleanFlag a where
-    asBool :: a -> Bool
-
-instance BooleanFlag Bool where
-  asBool = id
 
 -- ------------------------------------------------------------
 -- * Global flags
@@ -213,7 +128,7 @@ instance BooleanFlag Bool where
 data GlobalFlags = GlobalFlags {
     globalVersion        :: Flag Bool,
     globalNumericVersion :: Flag Bool
-  } deriving (Generic)
+  } deriving (Generic, Typeable)
 
 defaultGlobalFlags :: GlobalFlags
 defaultGlobalFlags  = GlobalFlags {
@@ -288,15 +203,14 @@ data ConfigFlags = ConfigFlags {
     -- because the type of configure is constrained by the UserHooks.
     -- when we change UserHooks next we should pass the initial
     -- ProgramDb directly and not via ConfigFlags
-    configPrograms_     :: Last' ProgramDb, -- ^All programs that
-                                            -- @cabal@ may run
+    configPrograms_     :: Option' (Last' ProgramDb), -- ^All programs that
+                                                      -- @cabal@ may run
 
     configProgramPaths  :: [(String, FilePath)], -- ^user specified programs paths
     configProgramArgs   :: [(String, [String])], -- ^user specified programs args
     configProgramPathExtra :: NubList FilePath,  -- ^Extend the $PATH
     configHcFlavor      :: Flag CompilerFlavor, -- ^The \"flavor\" of the
-                                                -- compiler, such as GHC or
-                                                -- JHC.
+                                                -- compiler, e.g. GHC.
     configHcPath        :: Flag FilePath, -- ^given compiler location
     configHcPkg         :: Flag FilePath, -- ^given hc-pkg location
     configVanillaLib    :: Flag Bool,     -- ^Enable vanilla library
@@ -304,6 +218,8 @@ data ConfigFlags = ConfigFlags {
     configSharedLib     :: Flag Bool,     -- ^Build shared library
     configStaticLib     :: Flag Bool,     -- ^Build static library
     configDynExe        :: Flag Bool,     -- ^Enable dynamic linking of the
+                                          -- executables.
+    configFullyStaticExe :: Flag Bool,     -- ^Enable fully static linking of the
                                           -- executables.
     configProfExe       :: Flag Bool,     -- ^Enable profiling in the
                                           -- executables.
@@ -342,7 +258,7 @@ data ConfigFlags = ConfigFlags {
     configStripLibs :: Flag Bool,      -- ^Enable library stripping
     configConstraints :: [Dependency], -- ^Additional constraints for
                                        -- dependencies.
-    configDependencies :: [(PackageName, ComponentId)],
+    configDependencies :: [GivenComponent],
       -- ^The packages depended on.
     configInstantiateWith :: [(ModuleName, Module)],
       -- ^ The requested Backpack instantiation.  If empty, either this
@@ -360,18 +276,24 @@ data ConfigFlags = ConfigFlags {
       -- ^Halt and show an error message indicating an error in flag assignment
     configRelocatable :: Flag Bool, -- ^ Enable relocatable package built
     configDebugInfo :: Flag DebugInfoLevel,  -- ^ Emit debug info.
-    configUseResponseFiles :: Flag Bool
+    configUseResponseFiles :: Flag Bool,
       -- ^ Whether to use response files at all. They're used for such tools
       -- as haddock, or or ld.
+    configAllowDependingOnPrivateLibs :: Flag Bool
+      -- ^ Allow depending on private sublibraries. This is used by external
+      -- tools (like cabal-install) so they can add multiple-public-libraries
+      -- compatibility to older ghcs by checking visibility externally.
   }
-  deriving (Generic, Read, Show)
+  deriving (Generic, Read, Show, Typeable)
 
 instance Binary ConfigFlags
+instance Structured ConfigFlags
 
 -- | More convenient version of 'configPrograms'. Results in an
 -- 'error' if internal invariant is violated.
 configPrograms :: WithCallStack (ConfigFlags -> ProgramDb)
-configPrograms = maybe (error "FIXME: remove configPrograms") id . getLast' . configPrograms_
+configPrograms = fromMaybe (error "FIXME: remove configPrograms") . fmap getLast'
+               . getOption' . configPrograms_
 
 instance Eq ConfigFlags where
   (==) a b =
@@ -387,6 +309,7 @@ instance Eq ConfigFlags where
     && equal configSharedLib
     && equal configStaticLib
     && equal configDynExe
+    && equal configFullyStaticExe
     && equal configProfExe
     && equal configProf
     && equal configProfDetail
@@ -425,7 +348,7 @@ instance Eq ConfigFlags where
     where
       equal f = on (==) f a b
 
-configAbsolutePaths :: ConfigFlags -> NoCallStackIO ConfigFlags
+configAbsolutePaths :: ConfigFlags -> IO ConfigFlags
 configAbsolutePaths f =
   (\v -> f { configPackageDBs = v })
   `liftM` traverse (maybe (return Nothing) (liftM Just . absolutePackageDBPath))
@@ -434,13 +357,14 @@ configAbsolutePaths f =
 defaultConfigFlags :: ProgramDb -> ConfigFlags
 defaultConfigFlags progDb = emptyConfigFlags {
     configArgs         = [],
-    configPrograms_    = pure progDb,
+    configPrograms_    = Option' (Just (Last' progDb)),
     configHcFlavor     = maybe NoFlag Flag defaultCompilerFlavor,
     configVanillaLib   = Flag True,
     configProfLib      = NoFlag,
     configSharedLib    = NoFlag,
     configStaticLib    = NoFlag,
     configDynExe       = Flag False,
+    configFullyStaticExe = Flag False,
     configProfExe      = NoFlag,
     configProf         = NoFlag,
     configProfDetail   = NoFlag,
@@ -460,8 +384,8 @@ defaultConfigFlags progDb = emptyConfigFlags {
 #endif
     configSplitSections = Flag False,
     configSplitObjs    = Flag False, -- takes longer, so turn off by default
-    configStripExes    = Flag True,
-    configStripLibs    = Flag True,
+    configStripExes    = NoFlag,
+    configStripLibs    = NoFlag,
     configTests        = Flag False,
     configBenchmarks   = Flag False,
     configCoverage     = Flag False,
@@ -507,7 +431,7 @@ parsecModSubstEntry = do
 
 -- | Pretty-print a single entry of a module substitution.
 dispModSubstEntry :: (ModuleName, Module) -> Disp.Doc
-dispModSubstEntry (k, v) = disp k <<>> Disp.char '=' <<>> disp v
+dispModSubstEntry (k, v) = pretty k <<>> Disp.char '=' <<>> pretty v
 
 configureOptions :: ShowOrParseArgs -> [OptionField ConfigFlags]
 configureOptions showOrParseArgs =
@@ -521,8 +445,6 @@ configureOptions showOrParseArgs =
          configHcFlavor (\v flags -> flags { configHcFlavor = v })
          (choiceOpt [ (Flag GHC,   ("g", ["ghc"]),   "compile with GHC")
                     , (Flag GHCJS, ([] , ["ghcjs"]), "compile with GHCJS")
-                    , (Flag JHC,   ([] , ["jhc"]),   "compile with JHC")
-                    , (Flag LHC,   ([] , ["lhc"]),   "compile with LHC")
                     , (Flag UHC,   ([] , ["uhc"]),   "compile with UHC")
                     -- "haskell-suite" compiler id string will be replaced
                     -- by a more specific one during the configure stage
@@ -579,6 +501,11 @@ configureOptions showOrParseArgs =
       ,option "" ["executable-dynamic"]
          "Executable dynamic linking"
          configDynExe (\v flags -> flags { configDynExe = v })
+         (boolOpt [] [])
+
+      ,option "" ["executable-static"]
+         "Executable fully static linking"
+         configFullyStaticExe (\v flags -> flags { configFullyStaticExe = v })
          (boolOpt [] [])
 
       ,option "" ["profiling"]
@@ -704,7 +631,7 @@ configureOptions showOrParseArgs =
 
       ,option "" ["cid"]
          "Installed component ID to compile this component as"
-         (fmap display . configCID) (\v flags -> flags {configCID = fmap mkComponentId v})
+         (fmap prettyShow . configCID) (\v flags -> flags {configCID = fmap mkComponentId v})
          (reqArgFlag "CID")
 
       ,option "" ["extra-lib-dirs"]
@@ -728,14 +655,18 @@ configureOptions showOrParseArgs =
          configConstraints (\v flags -> flags { configConstraints = v})
          (reqArg "DEPENDENCY"
                  (parsecToReadE (const "dependency expected") ((\x -> [x]) `fmap` parsec))
-                 (map display))
+                 (map prettyShow))
 
       ,option "" ["dependency"]
          "A list of exact dependencies. E.g., --dependency=\"void=void-0.5.8-177d5cdf20962d0581fe2e4932a6c309\""
          configDependencies (\v flags -> flags { configDependencies = v})
-         (reqArg "NAME=CID"
-                 (parsecToReadE (const "dependency expected") ((\x -> [x]) `fmap` parsecDependency))
-                 (map (\x -> display (fst x) ++ "=" ++ display (snd x))))
+         (reqArg "NAME[:COMPONENT_NAME]=CID"
+                 (parsecToReadE (const "dependency expected") ((\x -> [x]) `fmap` parsecGivenComponent))
+                 (map (\(GivenComponent pn cn cid) ->
+                     prettyShow pn
+                     ++ case cn of LMainLibName -> ""
+                                   LSubLibName n -> ":" ++ prettyShow n
+                     ++ "=" ++ prettyShow cid)))
 
       ,option "" ["instantiate-with"]
         "A mapping of signature names to concrete module instantiations."
@@ -780,6 +711,13 @@ configureOptions showOrParseArgs =
          configUseResponseFiles
          (\v flags -> flags { configUseResponseFiles = v })
          (boolOpt' ([], ["disable-response-files"]) ([], []))
+
+      ,option "" ["allow-depending-on-private-libs"]
+         (  "Allow depending on private libraries. "
+         ++ "If set, the library visibility check MUST be done externally." )
+         configAllowDependingOnPrivateLibs
+         (\v flags -> flags { configAllowDependingOnPrivateLibs = v })
+         trueArg
       ]
   where
     liftInstallDirs =
@@ -817,12 +755,18 @@ showProfDetailLevelFlag :: Flag ProfDetailLevel -> [String]
 showProfDetailLevelFlag NoFlag    = []
 showProfDetailLevelFlag (Flag dl) = [showProfDetailLevel dl]
 
-parsecDependency :: ParsecParser (PackageName, ComponentId)
-parsecDependency = do
-  x <- parsec
+parsecGivenComponent :: ParsecParser GivenComponent
+parsecGivenComponent = do
+  pn <- parsec
+  ln <- P.option LMainLibName $ do
+    _ <- P.char ':'
+    ucn <- parsec
+    return $ if unUnqualComponentName ucn == unPackageName pn
+             then LMainLibName
+             else LSubLibName ucn
   _ <- P.char '='
-  y <- parsec
-  return (x, y)
+  cid <- parsec
+  return $ GivenComponent pn ln cid
 
 installDirsOptions :: [OptionField (InstallDirs (Flag PathTemplate))]
 installDirsOptions =
@@ -918,7 +862,8 @@ data CopyFlags = CopyFlags {
     -- This is the same hack as in 'buildArgs'.  But I (ezyang) don't
     -- think it's a hack, it's the right way to make hooks more robust
     -- TODO: Stop using this eventually when 'UserHooks' gets changed
-    copyArgs :: [String]
+    copyArgs :: [String],
+    copyCabalFilePath :: Flag FilePath
   }
   deriving (Show, Generic)
 
@@ -927,7 +872,8 @@ defaultCopyFlags  = CopyFlags {
     copyDest      = Flag NoCopyDest,
     copyDistPref  = NoFlag,
     copyVerbosity = Flag normal,
-    copyArgs      = []
+    copyArgs      = [],
+    copyCabalFilePath = mempty
   }
 
 copyCommand :: CommandUI CopyFlags
@@ -940,18 +886,19 @@ copyCommand = CommandUI
        ++ "Without the --destdir flag, configure determines location.\n"
   , commandNotes        = Just $ \pname ->
        "Examples:\n"
-        ++ "  " ++ pname ++ " build           "
+        ++ "  " ++ pname ++ " copy           "
         ++ "    All the components in the package\n"
-        ++ "  " ++ pname ++ " build foo       "
+        ++ "  " ++ pname ++ " copy foo       "
         ++ "    A component (i.e. lib, exe, test suite)"
   , commandUsage        = usageAlternatives "copy" $
       [ "[FLAGS]"
       , "COMPONENTS [FLAGS]"
       ]
   , commandDefaultFlags = defaultCopyFlags
-  , commandOptions      = \showOrParseArgs ->
-      (filter ((`notElem` ["target-package-db"])
-        . optionName)) $ copyOptions showOrParseArgs
+  , commandOptions      = \showOrParseArgs -> case showOrParseArgs of
+      ShowArgs -> filter ((`notElem` ["target-package-db"])
+                          . optionName) $ copyOptions ShowArgs
+      ParseArgs -> copyOptions ParseArgs
 }
 
 copyOptions ::  ShowOrParseArgs -> [OptionField CopyFlags]
@@ -1001,7 +948,10 @@ data InstallFlags = InstallFlags {
     installDistPref  :: Flag FilePath,
     installUseWrapper :: Flag Bool,
     installInPlace    :: Flag Bool,
-    installVerbosity :: Flag Verbosity
+    installVerbosity :: Flag Verbosity,
+    -- this is only here, because we can not
+    -- change the hooks API.
+    installCabalFilePath :: Flag FilePath
   }
   deriving (Show, Generic)
 
@@ -1012,7 +962,8 @@ defaultInstallFlags  = InstallFlags {
     installDistPref  = NoFlag,
     installUseWrapper = Flag False,
     installInPlace    = Flag False,
-    installVerbosity = Flag normal
+    installVerbosity = Flag normal,
+    installCabalFilePath = mempty
   }
 
 installCommand :: CommandUI InstallFlags
@@ -1028,9 +979,10 @@ installCommand = CommandUI
   , commandUsage        = \pname ->
       "Usage: " ++ pname ++ " install [FLAGS]\n"
   , commandDefaultFlags = defaultInstallFlags
-  , commandOptions      = \showOrParseArgs ->
-      (filter ((`notElem` ["target-package-db"])
-        . optionName)) $ installOptions showOrParseArgs
+  , commandOptions      = \showOrParseArgs -> case showOrParseArgs of
+      ShowArgs -> filter ((`notElem` ["target-package-db"])
+                          . optionName) $ installOptions ShowArgs
+      ParseArgs -> installOptions ParseArgs
   }
 
 installOptions ::  ShowOrParseArgs -> [OptionField InstallFlags]
@@ -1085,7 +1037,7 @@ data SDistFlags = SDistFlags {
     sDistListSources :: Flag FilePath,
     sDistVerbosity   :: Flag Verbosity
   }
-  deriving (Show, Generic)
+  deriving (Show, Generic, Typeable)
 
 defaultSDistFlags :: SDistFlags
 defaultSDistFlags = SDistFlags {
@@ -1155,9 +1107,10 @@ data RegisterFlags = RegisterFlags {
     regPrintId     :: Flag Bool,
     regVerbosity   :: Flag Verbosity,
     -- Same as in 'buildArgs' and 'copyArgs'
-    regArgs        :: [String]
+    regArgs        :: [String],
+    regCabalFilePath :: Flag FilePath
   }
-  deriving (Show, Generic)
+  deriving (Show, Generic, Typeable)
 
 defaultRegisterFlags :: RegisterFlags
 defaultRegisterFlags = RegisterFlags {
@@ -1168,6 +1121,7 @@ defaultRegisterFlags = RegisterFlags {
     regDistPref    = NoFlag,
     regPrintId     = Flag False,
     regArgs        = [],
+    regCabalFilePath = mempty,
     regVerbosity   = Flag normal
   }
 
@@ -1267,9 +1221,10 @@ data HscolourFlags = HscolourFlags {
     hscolourBenchmarks  :: Flag Bool,
     hscolourForeignLibs :: Flag Bool,
     hscolourDistPref    :: Flag FilePath,
-    hscolourVerbosity   :: Flag Verbosity
-  }
-  deriving (Show, Generic)
+    hscolourVerbosity   :: Flag Verbosity,
+    hscolourCabalFilePath :: Flag FilePath
+    }
+  deriving (Show, Generic, Typeable)
 
 emptyHscolourFlags :: HscolourFlags
 emptyHscolourFlags = mempty
@@ -1282,7 +1237,8 @@ defaultHscolourFlags = HscolourFlags {
     hscolourBenchmarks  = Flag False,
     hscolourDistPref    = NoFlag,
     hscolourForeignLibs = Flag False,
-    hscolourVerbosity   = Flag normal
+    hscolourVerbosity   = Flag normal,
+    hscolourCabalFilePath = mempty
   }
 
 instance Monoid HscolourFlags where
@@ -1298,7 +1254,8 @@ hscolourCommand = CommandUI
   , commandSynopsis     =
       "Generate HsColour colourised code, in HTML format."
   , commandDescription  = Just (\_ -> "Requires the hscolour program.\n")
-  , commandNotes        = Nothing
+  , commandNotes        = Just $ \_ ->
+      "Deprecated in favour of 'cabal haddock --hyperlink-source'."
   , commandUsage        = \pname ->
       "Usage: " ++ pname ++ " hscolour [FLAGS]\n"
   , commandDefaultFlags = defaultHscolourFlags
@@ -1360,7 +1317,7 @@ data DoctestFlags = DoctestFlags {
     doctestDistPref     :: Flag FilePath,
     doctestVerbosity    :: Flag Verbosity
   }
-   deriving (Show, Generic)
+   deriving (Show, Generic, Typeable)
 
 defaultDoctestFlags :: DoctestFlags
 defaultDoctestFlags = DoctestFlags {
@@ -1428,16 +1385,18 @@ instance Semigroup DoctestFlags where
 --    from documentation tarballs, and we might also want to use different
 --    flags than for development builds, so in this case we store the generated
 --    documentation in @<dist>/doc/html/<package id>-docs@.
-data HaddockTarget = ForHackage | ForDevelopment deriving (Eq, Show, Generic)
+data HaddockTarget = ForHackage | ForDevelopment deriving (Eq, Show, Generic, Typeable)
 
 instance Binary HaddockTarget
+instance Structured HaddockTarget
 
-instance Text HaddockTarget where
-    disp ForHackage     = Disp.text "for-hackage"
-    disp ForDevelopment = Disp.text "for-development"
+instance Pretty HaddockTarget where
+    pretty ForHackage     = Disp.text "for-hackage"
+    pretty ForDevelopment = Disp.text "for-development"
 
-    parse = Parse.choice [ Parse.string "for-hackage"     >> return ForHackage
-                         , Parse.string "for-development" >> return ForDevelopment]
+instance Parsec HaddockTarget where
+    parsec = P.choice [ P.try $ P.string "for-hackage"     >> return ForHackage
+                      , P.string "for-development" >> return ForDevelopment]
 
 data HaddockFlags = HaddockFlags {
     haddockProgramPaths :: [(String, FilePath)],
@@ -1452,14 +1411,17 @@ data HaddockFlags = HaddockFlags {
     haddockForeignLibs  :: Flag Bool,
     haddockInternal     :: Flag Bool,
     haddockCss          :: Flag FilePath,
-    haddockHscolour     :: Flag Bool,
+    haddockLinkedSource :: Flag Bool,
+    haddockQuickJump    :: Flag Bool,
     haddockHscolourCss  :: Flag FilePath,
     haddockContents     :: Flag PathTemplate,
     haddockDistPref     :: Flag FilePath,
     haddockKeepTempFiles:: Flag Bool,
-    haddockVerbosity    :: Flag Verbosity
+    haddockVerbosity    :: Flag Verbosity,
+    haddockCabalFilePath :: Flag FilePath,
+    haddockArgs         :: [String]
   }
-  deriving (Show, Generic)
+  deriving (Show, Generic, Typeable)
 
 defaultHaddockFlags :: HaddockFlags
 defaultHaddockFlags  = HaddockFlags {
@@ -1475,12 +1437,15 @@ defaultHaddockFlags  = HaddockFlags {
     haddockForeignLibs  = Flag False,
     haddockInternal     = Flag False,
     haddockCss          = NoFlag,
-    haddockHscolour     = Flag False,
+    haddockLinkedSource = Flag False,
+    haddockQuickJump    = Flag False,
     haddockHscolourCss  = NoFlag,
     haddockContents     = NoFlag,
     haddockDistPref     = NoFlag,
     haddockKeepTempFiles= Flag False,
-    haddockVerbosity    = Flag normal
+    haddockVerbosity    = Flag normal,
+    haddockCabalFilePath = mempty,
+    haddockArgs         = mempty
   }
 
 haddockCommand :: CommandUI HaddockFlags
@@ -1490,8 +1455,10 @@ haddockCommand = CommandUI
   , commandDescription  = Just $ \_ ->
       "Requires the program haddock, version 2.x.\n"
   , commandNotes        = Nothing
-  , commandUsage        = \pname ->
-      "Usage: " ++ pname ++ " haddock [FLAGS]\n"
+  , commandUsage        = usageAlternatives "haddock" $
+      [ "[FLAGS]"
+      , "COMPONENTS [FLAGS]"
+      ]
   , commandDefaultFlags = defaultHaddockFlags
   , commandOptions      = \showOrParseArgs ->
          haddockOptions showOrParseArgs
@@ -1584,9 +1551,14 @@ haddockOptions showOrParseArgs =
    haddockCss (\v flags -> flags { haddockCss = v })
    (reqArgFlag "PATH")
 
-  ,option "" ["hyperlink-source","hyperlink-sources"]
-   "Hyperlink the documentation to the source code (using HsColour)"
-   haddockHscolour (\v flags -> flags { haddockHscolour = v })
+  ,option "" ["hyperlink-source","hyperlink-sources","hyperlinked-source"]
+   "Hyperlink the documentation to the source code"
+   haddockLinkedSource (\v flags -> flags { haddockLinkedSource = v })
+   trueArg
+
+  ,option "" ["quickjump"]
+   "Generate an index for interactive documentation navigation"
+   haddockQuickJump (\v flags -> flags { haddockQuickJump = v })
    trueArg
 
   ,option "" ["hscolour-css"]
@@ -1619,15 +1591,17 @@ instance Semigroup HaddockFlags where
 data CleanFlags = CleanFlags {
     cleanSaveConf  :: Flag Bool,
     cleanDistPref  :: Flag FilePath,
-    cleanVerbosity :: Flag Verbosity
+    cleanVerbosity :: Flag Verbosity,
+    cleanCabalFilePath :: Flag FilePath
   }
-  deriving (Show, Generic)
+  deriving (Show, Generic, Typeable)
 
 defaultCleanFlags :: CleanFlags
 defaultCleanFlags  = CleanFlags {
     cleanSaveConf  = Flag False,
     cleanDistPref  = NoFlag,
-    cleanVerbosity = Flag normal
+    cleanVerbosity = Flag normal,
+    cleanCabalFilePath = mempty
   }
 
 cleanCommand :: CommandUI CleanFlags
@@ -1675,13 +1649,10 @@ data BuildFlags = BuildFlags {
     buildNumJobs     :: Flag (Maybe Int),
     -- TODO: this one should not be here, it's just that the silly
     -- UserHooks stop us from passing extra info in other ways
-    buildArgs :: [String]
+    buildArgs :: [String],
+    buildCabalFilePath :: Flag FilePath
   }
-  deriving (Read, Show, Generic)
-
-{-# DEPRECATED buildVerbose "Use buildVerbosity instead" #-}
-buildVerbose :: BuildFlags -> Verbosity
-buildVerbose = fromFlagOrDefault normal . buildVerbosity
+  deriving (Read, Show, Generic, Typeable)
 
 defaultBuildFlags :: BuildFlags
 defaultBuildFlags  = BuildFlags {
@@ -1690,7 +1661,8 @@ defaultBuildFlags  = BuildFlags {
     buildDistPref    = mempty,
     buildVerbosity   = Flag normal,
     buildNumJobs     = mempty,
-    buildArgs        = []
+    buildArgs        = [],
+    buildCabalFilePath = mempty
   }
 
 buildCommand :: ProgramDb -> CommandUI BuildFlags
@@ -1767,9 +1739,10 @@ data ReplFlags = ReplFlags {
     replProgramArgs :: [(String, [String])],
     replDistPref    :: Flag FilePath,
     replVerbosity   :: Flag Verbosity,
-    replReload      :: Flag Bool
+    replReload      :: Flag Bool,
+    replReplOptions :: [String]
   }
-  deriving (Show, Generic)
+  deriving (Show, Generic, Typeable)
 
 defaultReplFlags :: ReplFlags
 defaultReplFlags  = ReplFlags {
@@ -1777,7 +1750,8 @@ defaultReplFlags  = ReplFlags {
     replProgramArgs = [],
     replDistPref    = NoFlag,
     replVerbosity   = Flag normal,
-    replReload      = Flag False
+    replReload      = Flag False,
+    replReplOptions = []
   }
 
 instance Monoid ReplFlags where
@@ -1817,7 +1791,7 @@ replCommand progDb = CommandUI
       ++ "    The first component in the package\n"
       ++ "  " ++ pname ++ " repl foo       "
       ++ "    A named component (i.e. lib, exe, test suite)\n"
-      ++ "  " ++ pname ++ " repl --ghc-options=\"-lstdc++\""
+      ++ "  " ++ pname ++ " repl --repl-options=\"-lstdc++\""
       ++ "  Specifying flags for interpreter\n"
 --TODO: re-enable once we have support for module/file targets
 --        ++ "  " ++ pname ++ " repl Foo.Bar   "
@@ -1853,14 +1827,24 @@ replCommand progDb = CommandUI
               trueArg
             ]
           _ -> []
+     ++ map liftReplOption (replOptions showOrParseArgs)
   }
+  where
+    liftReplOption = liftOption replReplOptions (\v flags -> flags { replReplOptions = v })
+
+replOptions :: ShowOrParseArgs -> [OptionField [String]]
+replOptions _ = [ option [] ["repl-options"] "use this option for the repl" id
+              const (reqArg "FLAG" (succeedReadE (:[])) id) ]
 
 -- ------------------------------------------------------------
 -- * Test flags
 -- ------------------------------------------------------------
 
 data TestShowDetails = Never | Failures | Always | Streaming | Direct
-    deriving (Eq, Ord, Enum, Bounded, Show)
+    deriving (Eq, Ord, Enum, Bounded, Generic, Show, Typeable)
+
+instance Binary TestShowDetails
+instance Structured TestShowDetails
 
 knownTestShowDetails :: [TestShowDetails]
 knownTestShowDetails = [minBound..maxBound]
@@ -1874,16 +1858,7 @@ instance Parsec TestShowDetails where
         ident        = P.munch1 (\c -> isAlpha c || c == '_' || c == '-')
         classify str = lookup (lowercase str) enumMap
         enumMap     :: [(String, TestShowDetails)]
-        enumMap      = [ (display x, x)
-                       | x <- knownTestShowDetails ]
-
-instance Text TestShowDetails where
-    parse = maybe Parse.pfail return . classify =<< ident
-      where
-        ident        = Parse.munch1 (\c -> isAlpha c || c == '_' || c == '-')
-        classify str = lookup (lowercase str) enumMap
-        enumMap     :: [(String, TestShowDetails)]
-        enumMap      = [ (display x, x)
+        enumMap      = [ (prettyShow x, x)
                        | x <- knownTestShowDetails ]
 
 --TODO: do we need this instance?
@@ -1901,9 +1876,11 @@ data TestFlags = TestFlags {
     testMachineLog  :: Flag PathTemplate,
     testShowDetails :: Flag TestShowDetails,
     testKeepTix     :: Flag Bool,
+    testWrapper     :: Flag FilePath,
+    testFailWhenNoTestSuites :: Flag Bool,
     -- TODO: think about if/how options are passed to test exes
     testOptions     :: [PathTemplate]
-  } deriving (Generic)
+  } deriving (Generic, Typeable)
 
 defaultTestFlags :: TestFlags
 defaultTestFlags  = TestFlags {
@@ -1913,6 +1890,8 @@ defaultTestFlags  = TestFlags {
     testMachineLog  = toFlag $ toPathTemplate $ "$pkgid.log",
     testShowDetails = toFlag Failures,
     testKeepTix     = toFlag False,
+    testWrapper     = NoFlag,
+    testFailWhenNoTestSuites = toFlag False,
     testOptions     = []
   }
 
@@ -1937,59 +1916,71 @@ testCommand = CommandUI
       , "TESTCOMPONENTS [FLAGS]"
       ]
   , commandDefaultFlags = defaultTestFlags
-  , commandOptions = \showOrParseArgs ->
-      [ optionVerbosity testVerbosity (\v flags -> flags { testVerbosity = v })
-      , optionDistPref
-            testDistPref (\d flags -> flags { testDistPref = d })
-            showOrParseArgs
-      , option [] ["log"]
-            ("Log all test suite results to file (name template can use "
-            ++ "$pkgid, $compiler, $os, $arch, $test-suite, $result)")
-            testHumanLog (\v flags -> flags { testHumanLog = v })
-            (reqArg' "TEMPLATE"
-                (toFlag . toPathTemplate)
-                (flagToList . fmap fromPathTemplate))
-      , option [] ["machine-log"]
-            ("Produce a machine-readable log file (name template can use "
-            ++ "$pkgid, $compiler, $os, $arch, $result)")
-            testMachineLog (\v flags -> flags { testMachineLog = v })
-            (reqArg' "TEMPLATE"
-                (toFlag . toPathTemplate)
-                (flagToList . fmap fromPathTemplate))
-      , option [] ["show-details"]
-            ("'always': always show results of individual test cases. "
-             ++ "'never': never show results of individual test cases. "
-             ++ "'failures': show results of failing test cases. "
-             ++ "'streaming': show results of test cases in real time."
-             ++ "'direct': send results of test cases in real time; no log file.")
-            testShowDetails (\v flags -> flags { testShowDetails = v })
-            (reqArg "FILTER"
-                (parsecToReadE (\_ -> "--show-details flag expects one of "
-                              ++ intercalate ", "
-                                   (map display knownTestShowDetails))
-                            (fmap toFlag parsec))
-                (flagToList . fmap display))
-      , option [] ["keep-tix-files"]
-            "keep .tix files for HPC between test runs"
-            testKeepTix (\v flags -> flags { testKeepTix = v})
-            trueArg
-      , option [] ["test-options"]
-            ("give extra options to test executables "
-             ++ "(name templates can use $pkgid, $compiler, "
-             ++ "$os, $arch, $test-suite)")
-            testOptions (\v flags -> flags { testOptions = v })
-            (reqArg' "TEMPLATES" (map toPathTemplate . splitArgs)
-                (const []))
-      , option [] ["test-option"]
-            ("give extra option to test executables "
-             ++ "(no need to quote options containing spaces, "
-             ++ "name template can use $pkgid, $compiler, "
-             ++ "$os, $arch, $test-suite)")
-            testOptions (\v flags -> flags { testOptions = v })
-            (reqArg' "TEMPLATE" (\x -> [toPathTemplate x])
-                (map fromPathTemplate))
-      ]
+  , commandOptions = testOptions'
   }
+
+testOptions' ::  ShowOrParseArgs -> [OptionField TestFlags]
+testOptions' showOrParseArgs =
+  [ optionVerbosity testVerbosity (\v flags -> flags { testVerbosity = v })
+  , optionDistPref
+        testDistPref (\d flags -> flags { testDistPref = d })
+        showOrParseArgs
+  , option [] ["log"]
+        ("Log all test suite results to file (name template can use "
+        ++ "$pkgid, $compiler, $os, $arch, $test-suite, $result)")
+        testHumanLog (\v flags -> flags { testHumanLog = v })
+        (reqArg' "TEMPLATE"
+            (toFlag . toPathTemplate)
+            (flagToList . fmap fromPathTemplate))
+  , option [] ["machine-log"]
+        ("Produce a machine-readable log file (name template can use "
+        ++ "$pkgid, $compiler, $os, $arch, $result)")
+        testMachineLog (\v flags -> flags { testMachineLog = v })
+        (reqArg' "TEMPLATE"
+            (toFlag . toPathTemplate)
+            (flagToList . fmap fromPathTemplate))
+  , option [] ["show-details"]
+        ("'always': always show results of individual test cases. "
+         ++ "'never': never show results of individual test cases. "
+         ++ "'failures': show results of failing test cases. "
+         ++ "'streaming': show results of test cases in real time."
+         ++ "'direct': send results of test cases in real time; no log file.")
+        testShowDetails (\v flags -> flags { testShowDetails = v })
+        (reqArg "FILTER"
+            (parsecToReadE (\_ -> "--show-details flag expects one of "
+                          ++ intercalate ", "
+                               (map prettyShow knownTestShowDetails))
+                        (fmap toFlag parsec))
+            (flagToList . fmap prettyShow))
+  , option [] ["keep-tix-files"]
+        "keep .tix files for HPC between test runs"
+        testKeepTix (\v flags -> flags { testKeepTix = v})
+        trueArg
+  , option [] ["test-wrapper"]
+        "Run test through a wrapper."
+        testWrapper (\v flags -> flags { testWrapper = v })
+        (reqArg' "FILE" (toFlag :: FilePath -> Flag FilePath)
+            (flagToList :: Flag FilePath -> [FilePath]))
+  , option [] ["fail-when-no-test-suites"]
+        ("Exit with failure when no test suites are found.")
+        testFailWhenNoTestSuites (\v flags -> flags { testFailWhenNoTestSuites = v})
+        trueArg
+  , option [] ["test-options"]
+        ("give extra options to test executables "
+         ++ "(name templates can use $pkgid, $compiler, "
+         ++ "$os, $arch, $test-suite)")
+        testOptions (\v flags -> flags { testOptions = v })
+        (reqArg' "TEMPLATES" (map toPathTemplate . splitArgs)
+            (const []))
+  , option [] ["test-option"]
+        ("give extra option to test executables "
+         ++ "(no need to quote options containing spaces, "
+         ++ "name template can use $pkgid, $compiler, "
+         ++ "$os, $arch, $test-suite)")
+        testOptions (\v flags -> flags { testOptions = v })
+        (reqArg' "TEMPLATE" (\x -> [toPathTemplate x])
+            (map fromPathTemplate))
+  ]
 
 emptyTestFlags :: TestFlags
 emptyTestFlags  = mempty
@@ -2009,7 +2000,7 @@ data BenchmarkFlags = BenchmarkFlags {
     benchmarkDistPref  :: Flag FilePath,
     benchmarkVerbosity :: Flag Verbosity,
     benchmarkOptions   :: [PathTemplate]
-  } deriving (Generic)
+  } deriving (Generic, Typeable)
 
 defaultBenchmarkFlags :: BenchmarkFlags
 defaultBenchmarkFlags  = BenchmarkFlags {
@@ -2040,29 +2031,32 @@ benchmarkCommand = CommandUI
       , "BENCHCOMPONENTS [FLAGS]"
       ]
   , commandDefaultFlags = defaultBenchmarkFlags
-  , commandOptions = \showOrParseArgs ->
-      [ optionVerbosity benchmarkVerbosity
-        (\v flags -> flags { benchmarkVerbosity = v })
-      , optionDistPref
-            benchmarkDistPref (\d flags -> flags { benchmarkDistPref = d })
-            showOrParseArgs
-      , option [] ["benchmark-options"]
-            ("give extra options to benchmark executables "
-             ++ "(name templates can use $pkgid, $compiler, "
-             ++ "$os, $arch, $benchmark)")
-            benchmarkOptions (\v flags -> flags { benchmarkOptions = v })
-            (reqArg' "TEMPLATES" (map toPathTemplate . splitArgs)
-                (const []))
-      , option [] ["benchmark-option"]
-            ("give extra option to benchmark executables "
-             ++ "(no need to quote options containing spaces, "
-             ++ "name template can use $pkgid, $compiler, "
-             ++ "$os, $arch, $benchmark)")
-            benchmarkOptions (\v flags -> flags { benchmarkOptions = v })
-            (reqArg' "TEMPLATE" (\x -> [toPathTemplate x])
-                (map fromPathTemplate))
-      ]
+  , commandOptions = benchmarkOptions'
   }
+
+benchmarkOptions' :: ShowOrParseArgs -> [OptionField BenchmarkFlags]
+benchmarkOptions' showOrParseArgs =
+  [ optionVerbosity benchmarkVerbosity
+    (\v flags -> flags { benchmarkVerbosity = v })
+  , optionDistPref
+        benchmarkDistPref (\d flags -> flags { benchmarkDistPref = d })
+        showOrParseArgs
+  , option [] ["benchmark-options"]
+        ("give extra options to benchmark executables "
+         ++ "(name templates can use $pkgid, $compiler, "
+         ++ "$os, $arch, $benchmark)")
+        benchmarkOptions (\v flags -> flags { benchmarkOptions = v })
+        (reqArg' "TEMPLATES" (map toPathTemplate . splitArgs)
+            (const []))
+  , option [] ["benchmark-option"]
+        ("give extra option to benchmark executables "
+         ++ "(no need to quote options containing spaces, "
+         ++ "name template can use $pkgid, $compiler, "
+         ++ "$os, $arch, $benchmark)")
+        benchmarkOptions (\v flags -> flags { benchmarkOptions = v })
+        (reqArg' "TEMPLATE" (\x -> [toPathTemplate x])
+            (map fromPathTemplate))
+  ]
 
 emptyBenchmarkFlags :: BenchmarkFlags
 emptyBenchmarkFlags = mempty
@@ -2097,19 +2091,14 @@ programDbPaths
 programDbPaths progDb showOrParseArgs get set =
   programDbPaths' ("with-" ++) progDb showOrParseArgs get set
 
-{-# DEPRECATED programConfigurationPaths' "Use programDbPaths' instead" #-}
-
 -- | Like 'programDbPaths', but allows to customise the option name.
-programDbPaths', programConfigurationPaths'
+programDbPaths'
   :: (String -> String)
   -> ProgramDb
   -> ShowOrParseArgs
   -> (flags -> [(String, FilePath)])
   -> ([(String, FilePath)] -> (flags -> flags))
   -> [OptionField flags]
-
-programConfigurationPaths' = programDbPaths'
-
 programDbPaths' mkName progDb showOrParseArgs get set =
   case showOrParseArgs of
     -- we don't want a verbose help text list so we just show a generic one:
@@ -2148,19 +2137,15 @@ programDbOption progDb showOrParseArgs get set =
            (\progArgs -> concat [ args
                                 | (prog', args) <- progArgs, prog==prog' ]))
 
-{-# DEPRECATED programConfigurationOptions "Use programDbOptions instead" #-}
 
 -- | For each known program @PROG@ in 'progDb', produce a @PROG-options@
 -- 'OptionField'.
-programDbOptions, programConfigurationOptions
+programDbOptions
   :: ProgramDb
   -> ShowOrParseArgs
   -> (flags -> [(String, [String])])
   -> ([(String, [String])] -> (flags -> flags))
   -> [OptionField flags]
-
-programConfigurationOptions = programDbOptions
-
 programDbOptions progDb showOrParseArgs get set =
   case showOrParseArgs of
     -- we don't want a verbose help text list so we just show a generic one:
@@ -2240,6 +2225,81 @@ optionNumJobs get set =
             | otherwise -> Right (Just n)
           _             -> Left "The jobs value should be a number or '$ncpus'"
 
+
+-- ------------------------------------------------------------
+-- * show-build-info command flags
+-- ------------------------------------------------------------
+
+data ShowBuildInfoFlags = ShowBuildInfoFlags
+  { buildInfoBuildFlags :: BuildFlags
+  , buildInfoOutputFile :: Maybe FilePath
+  } deriving (Show, Typeable)
+
+defaultShowBuildFlags  :: ShowBuildInfoFlags
+defaultShowBuildFlags =
+    ShowBuildInfoFlags
+      { buildInfoBuildFlags = defaultBuildFlags
+      , buildInfoOutputFile = Nothing
+      }
+
+showBuildInfoCommand :: ProgramDb -> CommandUI ShowBuildInfoFlags
+showBuildInfoCommand progDb = CommandUI
+  { commandName         = "show-build-info"
+  , commandSynopsis     = "Emit details about how a package would be built."
+  , commandDescription  = Just $ \_ -> wrapText $
+         "Components encompass executables, tests, and benchmarks.\n"
+      ++ "\n"
+      ++ "Affected by configuration options, see `configure`.\n"
+  , commandNotes        = Just $ \pname ->
+       "Examples:\n"
+        ++ "  " ++ pname ++ " show-build-info      "
+        ++ "    All the components in the package\n"
+        ++ "  " ++ pname ++ " show-build-info foo       "
+        ++ "    A component (i.e. lib, exe, test suite)\n\n"
+        ++ programFlagsDescription progDb
+--TODO: re-enable once we have support for module/file targets
+--        ++ "  " ++ pname ++ " show-build-info Foo.Bar   "
+--        ++ "    A module\n"
+--        ++ "  " ++ pname ++ " show-build-info Foo/Bar.hs"
+--        ++ "    A file\n\n"
+--        ++ "If a target is ambiguous it can be qualified with the component "
+--        ++ "name, e.g.\n"
+--        ++ "  " ++ pname ++ " show-build-info foo:Foo.Bar\n"
+--        ++ "  " ++ pname ++ " show-build-info testsuite1:Foo/Bar.hs\n"
+  , commandUsage        = usageAlternatives "show-build-info" $
+      [ "[FLAGS]"
+      , "COMPONENTS [FLAGS]"
+      ]
+  , commandDefaultFlags = defaultShowBuildFlags
+  , commandOptions      = \showOrParseArgs ->
+      parseBuildFlagsForShowBuildInfoFlags showOrParseArgs progDb
+      ++
+      [ option [] ["buildinfo-json-output"]
+                "Write the result to the given file instead of stdout"
+                buildInfoOutputFile (\pf flags -> flags { buildInfoOutputFile = pf })
+                (reqArg' "FILE" Just (maybe [] pure))
+      ]
+
+  }
+
+parseBuildFlagsForShowBuildInfoFlags :: ShowOrParseArgs -> ProgramDb -> [OptionField ShowBuildInfoFlags]
+parseBuildFlagsForShowBuildInfoFlags showOrParseArgs progDb =
+  map
+      (liftOption
+        buildInfoBuildFlags
+          (\bf flags -> flags { buildInfoBuildFlags = bf } )
+      )
+      buildFlags
+  where
+    buildFlags = buildOptions progDb showOrParseArgs
+      ++
+      [ optionVerbosity
+        buildVerbosity (\v flags -> flags { buildVerbosity = v })
+
+      , optionDistPref
+        buildDistPref (\d flags -> flags { buildDistPref = d }) showOrParseArgs
+      ]
+
 -- ------------------------------------------------------------
 -- * Other Utils
 -- ------------------------------------------------------------
@@ -2260,7 +2320,7 @@ configureArgs bcHack flags
   where
         hc_flag = case (configHcFlavor flags, configHcPath flags) of
                         (_, Flag hc_path) -> [hc_flag_name ++ hc_path]
-                        (Flag hc, NoFlag) -> [hc_flag_name ++ display hc]
+                        (Flag hc, NoFlag) -> [hc_flag_name ++ prettyShow hc]
                         (NoFlag,NoFlag)   -> []
         hc_flag_name
             --TODO kill off thic bc hack when defaultUserHooks is removed.

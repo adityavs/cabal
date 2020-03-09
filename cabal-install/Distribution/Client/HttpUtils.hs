@@ -15,7 +15,8 @@ module Distribution.Client.HttpUtils (
   ) where
 
 import Prelude ()
-import Distribution.Client.Compat.Prelude
+import Distribution.Client.Compat.Prelude hiding (Proxy (..))
+import Distribution.Utils.Generic
 
 import Network.HTTP
          ( Request (..), Response (..), RequestMethod (..)
@@ -36,17 +37,16 @@ import Control.Monad
 import qualified Data.ByteString.Lazy.Char8 as BS
 import qualified Paths_cabal_install (version)
 import Distribution.Verbosity (Verbosity)
+import Distribution.Pretty (prettyShow)
 import Distribution.Simple.Utils
-         ( die', info, warn, debug, notice, writeFileAtomic
-         , copyFileVerbose,  withTempFile )
+         ( die', info, warn, debug, notice
+         , copyFileVerbose,  withTempFile, IOData (..) )
 import Distribution.Client.Utils
          ( withTempFileName )
 import Distribution.Client.Types
          ( RemoteRepo(..) )
 import Distribution.System
          ( buildOS, buildArch )
-import Distribution.Text
-         ( display )
 import qualified System.FilePath.Posix as FilePath.Posix
          ( splitDirectories )
 import System.FilePath
@@ -72,6 +72,7 @@ import Distribution.Simple.Program.Run
 import Numeric (showHex)
 import System.Random (randomRIO)
 import System.Exit (ExitCode(..))
+import Data.Version (showVersion)
 
 
 ------------------------------------------------------------------------------
@@ -269,7 +270,7 @@ supportedTransports =
 configureTransport :: Verbosity -> [FilePath] -> Maybe String -> IO HttpTransport
 
 configureTransport verbosity extraPath (Just name) =
-    -- the user secifically selected a transport by name so we'll try and
+    -- the user specifically selected a transport by name so we'll try and
     -- configure that one
 
     case find (\(name',_,_,_) -> name' == name) supportedTransports of
@@ -281,7 +282,7 @@ configureTransport verbosity extraPath (Just name) =
           Just prog -> snd <$> requireProgram verbosity prog baseProgDb
                        --      ^^ if it fails, it'll fail here
 
-        let Just transport = mkTrans progdb
+        let transport = fromMaybe (error "configureTransport: failed to make transport") $ mkTrans progdb
         return transport { transportManuallySelected = True }
 
       Nothing -> die' verbosity $ "Unknown HTTP transport specified: " ++ name
@@ -305,8 +306,8 @@ configureTransport verbosity extraPath Nothing = do
           [ (name, transport)
           | (name, _, _, mkTrans) <- supportedTransports
           , transport <- maybeToList (mkTrans progdb) ]
-        -- there's always one because the plain one is last and never fails
-    let (name, transport) = head availableTransports
+    let (name, transport) =
+         fromMaybe ("plain-http", plainHttpTransport) (safeHead availableTransports)
     debug verbosity $ "Selected http transport implementation: " ++ name
 
     return transport { transportManuallySelected = False }
@@ -350,7 +351,7 @@ curlTransport prog =
     addAuthConfig auth progInvocation = progInvocation
       { progInvokeInput = do
           (uname, passwd) <- auth
-          return $ unlines
+          return $ IODataText $ unlines
             [ "--digest"
             , "--user " ++ uname ++ ":" ++ passwd
             ]
@@ -507,7 +508,7 @@ wgetTransport prog =
         -- and sensitive data should not be passed via command line arguments.
         let
           invocation = (programInvocation prog ("--input-file=-" : args))
-            { progInvokeInput = Just (uriToString id uri "")
+            { progInvokeInput = Just $ IODataText $ uriToString id uri ""
             }
 
         -- wget returns its output on stderr rather than stdout
@@ -545,16 +546,37 @@ powershellTransport prog =
     gethttp verbosity uri etag destPath reqHeaders = do
       resp <- runPowershellScript verbosity $
         webclientScript
-          (setupHeaders ((useragentHeader : etagHeader) ++ reqHeaders))
-          [ "$wc.DownloadFile(" ++ escape (show uri)
-              ++ "," ++ escape destPath ++ ");"
-          , "Write-Host \"200\";"
-          , "Write-Host $wc.ResponseHeaders.Item(\"ETag\");"
+          (escape (show uri))
+          (("$targetStream = New-Object -TypeName System.IO.FileStream -ArgumentList " ++ (escape destPath) ++ ", Create")
+          :(setupHeaders ((useragentHeader : etagHeader) ++ reqHeaders)))
+          [ "$response = $request.GetResponse()"
+          , "$responseStream = $response.GetResponseStream()"
+          , "$buffer = new-object byte[] 10KB"
+          , "$count = $responseStream.Read($buffer, 0, $buffer.length)"
+          , "while ($count -gt 0)"
+          , "{"
+          , "    $targetStream.Write($buffer, 0, $count)"
+          , "    $count = $responseStream.Read($buffer, 0, $buffer.length)"
+          , "}"
+          , "Write-Host ($response.StatusCode -as [int]);"
+          , "Write-Host $response.GetResponseHeader(\"ETag\").Trim('\"')"
+          ]
+          [ "$targetStream.Flush()"
+          , "$targetStream.Close()"
+          , "$targetStream.Dispose()"
+          , "$responseStream.Dispose()"
           ]
       parseResponse resp
       where
-        parseResponse x = case readMaybe . unlines . take 1 . lines $ trim x of
-          Just i  -> return (i, Nothing) -- TODO extract real etag
+        parseResponse :: String -> IO (HttpCode, Maybe ETag)
+        parseResponse x =
+          case lines $ trim x of
+            (code:etagv:_) -> fmap (\c -> (c, Just etagv)) $ parseCode code x
+            (code:      _) -> fmap (\c -> (c, Nothing  )) $ parseCode code x
+            _              -> statusParseFail verbosity uri x
+        parseCode :: String -> String -> IO HttpCode
+        parseCode code x = case readMaybe code of
+          Just i  -> return i
           Nothing -> statusParseFail verbosity uri x
         etagHeader = [ Header HdrIfNoneMatch t | t <- maybeToList etag ]
 
@@ -571,15 +593,19 @@ powershellTransport prog =
         let contentHeader = Header HdrContentType
               ("multipart/form-data; boundary=" ++ boundary)
         resp <- runPowershellScript verbosity $ webclientScript
+          (escape (show uri))
           (setupHeaders (contentHeader : extraHeaders) ++ setupAuth auth)
           (uploadFileAction "POST" uri fullPath)
+          uploadFileCleanup
         parseUploadResponse verbosity uri resp
 
     puthttpfile verbosity uri path auth headers = do
       fullPath <- canonicalizePath path
       resp <- runPowershellScript verbosity $ webclientScript
+        (escape (show uri))
         (setupHeaders (extraHeaders ++ headers) ++ setupAuth auth)
         (uploadFileAction "PUT" uri fullPath)
+        uploadFileCleanup
       parseUploadResponse verbosity uri resp
 
     runPowershellScript verbosity script = do
@@ -591,8 +617,9 @@ powershellTransport prog =
             , "-NoProfile", "-NonInteractive"
             , "-Command", "-"
             ]
+      debug verbosity script
       getProgramInvocationOutput verbosity (programInvocation prog args)
-        { progInvokeInput = Just (script ++ "\nExit(0);")
+        { progInvokeInput = Just $ IODataText $ script ++ "\nExit(0);"
         }
 
     escape = show
@@ -601,22 +628,65 @@ powershellTransport prog =
     extraHeaders = [Header HdrAccept "text/plain", useragentHeader]
 
     setupHeaders headers =
-      [ "$wc.Headers.Add(" ++ escape (show name) ++ "," ++ escape value ++ ");"
+      [ "$request." ++ addHeader name value
       | Header name value <- headers
       ]
+      where
+        addHeader header value
+          = case header of
+              HdrAccept           -> "Accept = "           ++ escape value
+              HdrUserAgent        -> "UserAgent = "        ++ escape value
+              HdrConnection       -> "Connection = "       ++ escape value
+              HdrContentLength    -> "ContentLength = "    ++ escape value
+              HdrContentType      -> "ContentType = "      ++ escape value
+              HdrDate             -> "Date = "             ++ escape value
+              HdrExpect           -> "Expect = "           ++ escape value
+              HdrHost             -> "Host = "             ++ escape value
+              HdrIfModifiedSince  -> "IfModifiedSince = "  ++ escape value
+              HdrReferer          -> "Referer = "          ++ escape value
+              HdrTransferEncoding -> "TransferEncoding = " ++ escape value
+              HdrRange            -> let (start, end) =
+                                          if "bytes=" `isPrefixOf` value
+                                             then case break (== '-') value' of
+                                                 (start', '-':end') -> (start', end')
+                                                 _                  -> error $ "Could not decode range: " ++ value
+                                             else error $ "Could not decode range: " ++ value
+                                         value' = drop 6 value
+                                     in "AddRange(\"bytes\", " ++ escape start ++ ", " ++ escape end ++ ");"
+              name                -> "Headers.Add(" ++ escape (show name) ++ "," ++ escape value ++ ");"
 
     setupAuth auth =
-      [ "$wc.Credentials = new-object System.Net.NetworkCredential("
+      [ "$request.Credentials = new-object System.Net.NetworkCredential("
           ++ escape uname ++ "," ++ escape passwd ++ ",\"\");"
       | (uname,passwd) <- maybeToList auth
       ]
 
-    uploadFileAction method uri fullPath =
-      [ "$fileBytes = [System.IO.File]::ReadAllBytes(" ++ escape fullPath ++ ");"
-      , "$bodyBytes = $wc.UploadData(" ++ escape (show uri) ++ ","
-        ++ show method ++ ", $fileBytes);"
-      , "Write-Host \"200\";"
-      , "Write-Host (-join [System.Text.Encoding]::UTF8.GetChars($bodyBytes));"
+    uploadFileAction method _uri fullPath =
+      [ "$request.Method = " ++ show method
+      , "$requestStream = $request.GetRequestStream()"
+      , "$fileStream = [System.IO.File]::OpenRead(" ++ escape fullPath ++ ")"
+      , "$bufSize=10000"
+      , "$chunk = New-Object byte[] $bufSize"
+      , "while( $bytesRead = $fileStream.Read($chunk,0,$bufsize) )"
+      , "{"
+      , "  $requestStream.write($chunk, 0, $bytesRead)"
+      , "  $requestStream.Flush()"
+      , "}"
+      , ""
+      , "$responseStream = $request.getresponse()"
+      , "$responseReader = new-object System.IO.StreamReader $responseStream.GetResponseStream()"
+      , "$code = $response.StatusCode -as [int]"
+      , "if ($code -eq 0) {"
+      , "  $code = 200;"
+      , "}"
+      , "Write-Host $code"
+      , "Write-Host $responseReader.ReadToEnd()"
+      ]
+
+    uploadFileCleanup =
+      [ "$fileStream.Close()"
+      , "$requestStream.Close()"
+      , "$responseStream.Close()"
       ]
 
     parseUploadResponse verbosity uri resp = case lines (trim resp) of
@@ -624,8 +694,10 @@ powershellTransport prog =
         | Just code <- readMaybe codeStr -> return (code, unlines message)
       _ -> statusParseFail verbosity uri resp
 
-    webclientScript setup action = unlines
-      [ "$wc = new-object system.net.webclient;"
+    webclientScript uri setup action cleanup = unlines
+      [ "[Net.ServicePointManager]::SecurityProtocol = \"tls12, tls11, tls\""
+      , "$uri = New-Object \"System.Uri\" " ++ uri
+      , "$request = [System.Net.HttpWebRequest]::Create($uri)"
       , unlines setup
       , "Try {"
       , unlines (map ("  " ++) action)
@@ -643,6 +715,8 @@ powershellTransport prog =
       , "  }"
       , "} Catch {"
       , "  Write-Host $_.Exception.Message;"
+      , "} finally {"
+      , unlines (map ("  " ++) cleanup)
       , "}"
       ]
 
@@ -736,8 +810,8 @@ plainHttpTransport =
 --
 
 userAgent :: String
-userAgent = concat [ "cabal-install/", display Paths_cabal_install.version
-                   , " (", display buildOS, "; ", display buildArch, ")"
+userAgent = concat [ "cabal-install/", showVersion Paths_cabal_install.version
+                   , " (", prettyShow buildOS, "; ", prettyShow buildArch, ")"
                    ]
 
 statusParseFail :: Verbosity -> URI -> String -> IO a

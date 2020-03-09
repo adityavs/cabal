@@ -40,13 +40,15 @@ import Distribution.Client.HttpUtils
 import Distribution.Package
          ( PackageId, packageName, packageVersion )
 import Distribution.Simple.Utils
-         ( notice, info, debug, setupMessage )
-import Distribution.Text
+         ( notice, info, debug, die' )
+import Distribution.Deprecated.Text
          ( display )
 import Distribution.Verbosity
          ( Verbosity, verboseUnmarkOutput )
 import Distribution.Client.GlobalFlags
          ( RepoContext(..) )
+import Distribution.Client.Utils
+         ( ProgressPhase(..), progressMessage )
 
 import Data.Maybe
 import Data.Map (Map)
@@ -81,6 +83,8 @@ isFetched loc = case loc of
     LocalTarballPackage  _file      -> return True
     RemoteTarballPackage _uri local -> return (isJust local)
     RepoTarballPackage repo pkgid _ -> doesFileExist (packageFile repo pkgid)
+    RemoteSourceRepoPackage _ local -> return (isJust local)
+    
 
 -- | Checks if the package has already been fetched (or does not need
 -- fetching) and if so returns evidence in the form of a 'PackageLocation'
@@ -97,12 +101,14 @@ checkFetched loc = case loc of
       return (Just $ RemoteTarballPackage uri file)
     RepoTarballPackage repo pkgid (Just file) ->
       return (Just $ RepoTarballPackage repo pkgid file)
+    RemoteSourceRepoPackage repo (Just dir) ->
+      return (Just $ RemoteSourceRepoPackage repo dir)
 
-    RemoteTarballPackage _uri Nothing -> return Nothing
+    RemoteTarballPackage     _uri Nothing -> return Nothing
+    RemoteSourceRepoPackage _repo Nothing -> return Nothing
     RepoTarballPackage repo pkgid Nothing ->
       fmap (fmap (RepoTarballPackage repo pkgid))
            (checkRepoTarballFetched repo pkgid)
-
 
 -- | Like 'checkFetched' but for the specific case of a 'RepoTarballPackage'.
 --
@@ -130,6 +136,8 @@ fetchPackage verbosity repoCtxt loc = case loc of
       return (RemoteTarballPackage uri file)
     RepoTarballPackage repo pkgid (Just file) ->
       return (RepoTarballPackage repo pkgid file)
+    RemoteSourceRepoPackage repo (Just dir) ->
+      return (RemoteSourceRepoPackage repo dir)
 
     RemoteTarballPackage uri Nothing -> do
       path <- downloadTarballPackage uri
@@ -137,6 +145,8 @@ fetchPackage verbosity repoCtxt loc = case loc of
     RepoTarballPackage repo pkgid Nothing -> do
       local <- fetchRepoTarball verbosity repoCtxt repo pkgid
       return (RepoTarballPackage repo pkgid local)
+    RemoteSourceRepoPackage _repo Nothing ->
+      die' verbosity "fetchPackage: source repos not supported"
   where
     downloadTarballPackage uri = do
       transport <- repoContextGetTransport repoCtxt
@@ -152,16 +162,22 @@ fetchPackage verbosity repoCtxt loc = case loc of
 -- | Fetch a repo package if we don't have it already.
 --
 fetchRepoTarball :: Verbosity -> RepoContext -> Repo -> PackageId -> IO FilePath
-fetchRepoTarball verbosity repoCtxt repo pkgid = do
+fetchRepoTarball verbosity' repoCtxt repo pkgid = do
   fetched <- doesFileExist (packageFile repo pkgid)
   if fetched
     then do info verbosity $ display pkgid ++ " has already been downloaded."
             return (packageFile repo pkgid)
-    else do setupMessage verbosity "Downloading" pkgid
-            downloadRepoPackage
+    else do progressMessage verbosity ProgressDownloading (display pkgid)
+            res <- downloadRepoPackage
+            progressMessage verbosity ProgressDownloaded (display pkgid)
+            return res
   where
+    -- whether we download or not is non-deterministic
+    verbosity = verboseUnmarkOutput verbosity'
+
     downloadRepoPackage = case repo of
       RepoLocal{..} -> return (packageFile repo pkgid)
+      RepoLocalNoIndex{..} -> return (packageFile repo pkgid)
 
       RepoRemote{..} -> do
         transport <- repoContextGetTransport repoCtxt
@@ -277,6 +293,7 @@ packageFile repo pkgid = packageDir repo pkgid
 -- the tarball for a given @PackageIdentifer@ is stored.
 --
 packageDir :: Repo -> PackageId -> FilePath
+packageDir (RepoLocalNoIndex (LocalRepo _ dir _) _) _pkgid = dir
 packageDir repo pkgid = repoLocalDir repo
                     </> display (packageName    pkgid)
                     </> display (packageVersion pkgid)

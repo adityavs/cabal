@@ -62,9 +62,14 @@ module Distribution.Client.InstallPlan (
   showInstallPlan,
 
   -- * Graph-like operations
+  dependencyClosure,
   reverseTopologicalOrder,
   reverseDependencyClosure,
   ) where
+
+import Distribution.Client.Compat.Prelude hiding (toList, lookup, tail)
+import Prelude (tail)
+import Distribution.Compat.Stack (WithCallStack)
 
 import Distribution.Client.Types hiding (BuildOutcomes)
 import qualified Distribution.PackageDescription as PD
@@ -78,7 +83,8 @@ import Distribution.Package
          , HasUnitId(..), UnitId )
 import Distribution.Solver.Types.SolverPackage
 import Distribution.Client.JobControl
-import Distribution.Text
+import Distribution.Deprecated.Text
+import Distribution.Pretty (prettyShow)
 import Text.PrettyPrint
 import qualified Distribution.Client.SolverInstallPlan as SolverInstallPlan
 import Distribution.Client.SolverInstallPlan (SolverInstallPlan)
@@ -89,30 +95,18 @@ import           Distribution.Solver.Types.SolverId
 import           Distribution.Solver.Types.InstSolverPackage
 
 import           Distribution.Utils.LogProgress
+import           Distribution.Utils.Structured (Structured (..), Structure(Nominal))
 
 -- TODO: Need this when we compute final UnitIds
 -- import qualified Distribution.Simple.Configure as Configure
 
-import Data.List
-         ( foldl', intercalate )
-import qualified Data.Foldable as Foldable (all)
-import Data.Maybe
-         ( fromMaybe, mapMaybe )
+import qualified Data.Foldable as Foldable (all, toList)
 import qualified Distribution.Compat.Graph as Graph
 import Distribution.Compat.Graph (Graph, IsNode(..))
-import Distribution.Compat.Binary (Binary(..))
-import GHC.Generics
-import Data.Typeable
-import Control.Monad
 import Control.Exception
          ( assert )
 import qualified Data.Map as Map
-import           Data.Map (Map)
 import qualified Data.Set as Set
-import           Data.Set (Set)
-
-import Prelude hiding (lookup)
-
 
 -- When cabal tries to install a number of packages, including all their
 -- dependencies it has a non-trivial problem to solve.
@@ -173,6 +167,11 @@ data GenericPlanPackage ipkg srcpkg
    | Installed   srcpkg
   deriving (Eq, Show, Generic)
 
+displayGenericPlanPackage :: (IsUnit ipkg, IsUnit srcpkg) => GenericPlanPackage ipkg srcpkg -> String
+displayGenericPlanPackage (PreExisting pkg) = "PreExisting " ++ prettyShow (nodeKey pkg)
+displayGenericPlanPackage (Configured pkg)  = "Configured " ++ prettyShow (nodeKey pkg)
+displayGenericPlanPackage (Installed pkg)   = "Installed " ++ prettyShow (nodeKey pkg)
+
 -- | Convenience combinator for destructing 'GenericPlanPackage'.
 -- This is handy because if you case manually, you have to handle
 -- 'Configured' and 'Installed' separately (where often you want
@@ -202,8 +201,8 @@ instance (IsNode ipkg, IsNode srcpkg, Key ipkg ~ UnitId, Key srcpkg ~ UnitId)
     nodeNeighbors (Configured  spkg) = nodeNeighbors spkg
     nodeNeighbors (Installed   spkg) = nodeNeighbors spkg
 
-instance (Binary ipkg, Binary srcpkg)
-      => Binary (GenericPlanPackage ipkg srcpkg)
+instance (Binary ipkg, Binary srcpkg) => Binary (GenericPlanPackage ipkg srcpkg)
+instance (Structured ipkg, Structured srcpkg) => Structured (GenericPlanPackage ipkg srcpkg)
 
 type PlanPackage = GenericPlanPackage
                    InstalledPackageInfo (ConfiguredPackage UnresolvedPkgLoc)
@@ -257,9 +256,15 @@ mkInstallPlan loc graph indepGoals =
       planIndepGoals = indepGoals
     }
 
-internalError :: String -> String -> a
+internalError :: WithCallStack (String -> String -> a)
 internalError loc msg = error $ "internal error in InstallPlan." ++ loc
                              ++ if null msg then "" else ": " ++ msg
+
+instance (Structured ipkg, Structured srcpkg) => Structured (GenericInstallPlan ipkg srcpkg) where
+    structure p = Nominal (typeRep p) 0 "GenericInstallPlan"
+        [ structure (Proxy :: Proxy ipkg)
+        , structure (Proxy :: Proxy srcpkg)
+        ]
 
 instance (IsNode ipkg, Key ipkg ~ UnitId, IsNode srcpkg, Key srcpkg ~ UnitId,
           Binary ipkg, Binary srcpkg)
@@ -267,17 +272,18 @@ instance (IsNode ipkg, Key ipkg ~ UnitId, IsNode srcpkg, Key srcpkg ~ UnitId,
     put GenericInstallPlan {
               planGraph      = graph,
               planIndepGoals = indepGoals
-        } = put (graph, indepGoals)
+        } = put graph >> put indepGoals
 
     get = do
-      (graph, indepGoals) <- get
+      graph <- get
+      indepGoals <- get
       return $! mkInstallPlan "(instance Binary)" graph indepGoals
 
 showPlanGraph :: (Package ipkg, Package srcpkg,
                   IsUnit ipkg, IsUnit srcpkg)
               => Graph (GenericPlanPackage ipkg srcpkg) -> String
 showPlanGraph graph = renderStyle defaultStyle $
-    vcat (map dispPlanPackage (Graph.toList graph))
+    vcat (map dispPlanPackage (Foldable.toList graph))
   where dispPlanPackage p =
             hang (hsep [ text (showPlanPackageTag p)
                        , disp (packageId p)
@@ -308,7 +314,7 @@ toGraph = planGraph
 
 toList :: GenericInstallPlan ipkg srcpkg
        -> [GenericPlanPackage ipkg srcpkg]
-toList = Graph.toList . planGraph
+toList = Foldable.toList . planGraph
 
 toMap :: GenericInstallPlan ipkg srcpkg
       -> Map UnitId (GenericPlanPackage ipkg srcpkg)
@@ -402,6 +408,15 @@ reverseTopologicalOrder :: GenericInstallPlan ipkg srcpkg
                         -> [GenericPlanPackage ipkg srcpkg]
 reverseTopologicalOrder plan = Graph.revTopSort (planGraph plan)
 
+
+-- | Return the packages in the plan that are direct or indirect dependencies of
+-- the given packages.
+--
+dependencyClosure :: GenericInstallPlan ipkg srcpkg
+                  -> [UnitId]
+                  -> [GenericPlanPackage ipkg srcpkg]
+dependencyClosure plan = fromMaybe []
+                       . Graph.closure (planGraph plan)
 
 -- | Return the packages in the plan that depend directly or indirectly on the
 -- given packages.
@@ -517,7 +532,7 @@ configureInstallPlan configFlags solverPlan =
                         Cabal.NoFlag
                         Cabal.NoFlag
                         (packageId spkg)
-                        PD.CLibName
+                        (PD.CLibName PD.LMainLibName)
                         (Just (map confInstId (CD.libraryDeps deps),
                                solverPkgFlags spkg)),
         confPkgSource = solverPkgSource spkg,
@@ -611,7 +626,7 @@ isInstalled _                = False
 -- and return any packages that are newly in the processing state (ie ready to
 -- process), along with the updated 'Processing' state.
 --
-completed :: (IsUnit ipkg, IsUnit srcpkg)
+completed :: forall ipkg srcpkg. (IsUnit ipkg, IsUnit srcpkg)
           => GenericInstallPlan ipkg srcpkg
           -> Processing -> UnitId
           -> ([GenericReadyPackage srcpkg], Processing)
@@ -636,8 +651,9 @@ completed plan (Processing processingSet completedSet failedSet) pkgid =
                             (map nodeKey newlyReady)
     processing'    = Processing processingSet' completedSet' failedSet
 
-    asReadyPackage (Configured pkg) = ReadyPackage pkg
-    asReadyPackage _ = internalError "completed" ""
+    asReadyPackage :: GenericPlanPackage ipkg srcpkg -> GenericReadyPackage srcpkg
+    asReadyPackage (Configured pkg)  = ReadyPackage pkg
+    asReadyPackage pkg = internalError "completed" $ "not in configured state: " ++ displayGenericPlanPackage pkg
 
 failed :: (IsUnit ipkg, IsUnit srcpkg)
        => GenericInstallPlan ipkg srcpkg
@@ -663,7 +679,7 @@ failed plan (Processing processingSet completedSet failedSet) pkgid =
     processing'    = Processing processingSet' completedSet failedSet'
 
     asConfiguredPackage (Configured pkg) = pkg
-    asConfiguredPackage _ = internalError "failed" "not in configured state"
+    asConfiguredPackage pkg = internalError "failed" $ "not in configured state: " ++ displayGenericPlanPackage pkg
 
 processingInvariant :: (IsUnit ipkg, IsUnit srcpkg)
                     => GenericInstallPlan ipkg srcpkg
@@ -919,7 +935,7 @@ problems graph =
      --TODO: consider re-enabling this one, see SolverInstallPlan
 -}
   ++ [ PackageStateInvalid pkg pkg'
-     | pkg <- Graph.toList graph
+     | pkg <- Foldable.toList graph
      , Just pkg' <- map (flip Graph.lookup graph)
                     (nodeNeighbors pkg)
      , not (stateDependencyRelation pkg pkg') ]

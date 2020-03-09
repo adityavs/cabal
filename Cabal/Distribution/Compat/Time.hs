@@ -1,4 +1,6 @@
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE FlexibleContexts #-}
@@ -23,12 +25,8 @@ import System.FilePath
 
 import Data.Time.Clock.POSIX ( POSIXTime, getPOSIXTime )
 import Data.Time             ( diffUTCTime, getCurrentTime )
-#if MIN_VERSION_directory(1,2,0)
 import Data.Time.Clock.POSIX ( posixDayLength )
-#else
-import System.Time ( getClockTime, diffClockTimes
-                   , normalizeTimeDiff, tdDay, tdHour )
-#endif
+
 
 #if defined mingw32_HOST_OS
 
@@ -59,7 +57,9 @@ import System.Posix.Files ( modificationTime )
 -- | An opaque type representing a file's modification time, represented
 -- internally as a 64-bit unsigned integer in the Windows UTC format.
 newtype ModTime = ModTime Word64
-                deriving (Binary, Bounded, Eq, Ord)
+                deriving (Binary, Generic, Bounded, Eq, Ord, Typeable)
+
+instance Structured ModTime
 
 instance Show ModTime where
   show (ModTime x) = show x
@@ -72,7 +72,7 @@ instance Read ModTime where
 --
 -- This is a modified version of the code originally written for Shake by Neil
 -- Mitchell. See module Development.Shake.FileInfo.
-getModTime :: FilePath -> NoCallStackIO ModTime
+getModTime :: FilePath -> IO ModTime
 
 #if defined mingw32_HOST_OS
 
@@ -110,7 +110,7 @@ getModTime path = allocaBytes size_WIN32_FILE_ATTRIBUTE_DATA $ \info -> do
 foreign import CALLCONV "windows.h GetFileAttributesExW"
   c_getFileAttributesEx :: LPCTSTR -> Int32 -> LPVOID -> Prelude.IO BOOL
 
-getFileAttributesEx :: String -> LPVOID -> NoCallStackIO BOOL
+getFileAttributesEx :: String -> LPVOID -> IO BOOL
 getFileAttributesEx path lpFileInformation =
   withTString path $ \c_path ->
       c_getFileAttributesEx c_path getFileExInfoStandard lpFileInformation
@@ -135,12 +135,7 @@ getModTime path = do
     return $! (extractFileTime st)
 
 extractFileTime :: FileStatus -> ModTime
-#if MIN_VERSION_unix(2,6,0)
 extractFileTime x = posixTimeToModTime (modificationTimeHiRes x)
-#else
-extractFileTime x = posixSecondsToModTime $ fromIntegral $ fromEnum $
-                    modificationTime x
-#endif
 
 #endif
 
@@ -159,20 +154,14 @@ posixTimeToModTime p = ModTime $ (ceiling $ p * 1e7) -- 100 ns precision
                        + (secToUnixEpoch * windowsTick)
 
 -- | Return age of given file in days.
-getFileAge :: FilePath -> NoCallStackIO Double
+getFileAge :: FilePath -> IO Double
 getFileAge file = do
   t0 <- getModificationTime file
-#if MIN_VERSION_directory(1,2,0)
   t1 <- getCurrentTime
   return $ realToFrac (t1 `diffUTCTime` t0) / realToFrac posixDayLength
-#else
-  t1 <- getClockTime
-  let dt = normalizeTimeDiff (t1 `diffClockTimes` t0)
-  return $ fromIntegral ((24 * tdDay dt) + tdHour dt) / 24.0
-#endif
 
 -- | Return the current time as 'ModTime'.
-getCurTime :: NoCallStackIO ModTime
+getCurTime :: IO ModTime
 getCurTime = posixTimeToModTime `fmap` getPOSIXTime -- Uses 'gettimeofday'.
 
 -- | Based on code written by Neil Mitchell for Shake. See

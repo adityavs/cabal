@@ -1,5 +1,6 @@
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveGeneric      #-}
+{-# LANGUAGE OverloadedStrings  #-}
 
 module Distribution.Types.BenchmarkType (
     BenchmarkType(..),
@@ -9,11 +10,11 @@ module Distribution.Types.BenchmarkType (
 import Distribution.Compat.Prelude
 import Prelude ()
 
-import Distribution.Parsec.Class
+import Distribution.FieldGrammar.Described (Described (..))
+import Distribution.Parsec
 import Distribution.Pretty
-import Distribution.Text
 import Distribution.Version
-import Text.PrettyPrint          (char, text)
+import Text.PrettyPrint                    (char, text)
 
 -- | The \"benchmark-type\" field in the benchmark stanza.
 --
@@ -24,7 +25,7 @@ data BenchmarkType = BenchmarkTypeExe Version
     deriving (Generic, Show, Read, Eq, Typeable, Data)
 
 instance Binary BenchmarkType
-
+instance Structured BenchmarkType
 instance NFData BenchmarkType where rnf = genericRnf
 
 knownBenchmarkTypes :: [BenchmarkType]
@@ -39,9 +40,5 @@ instance Parsec BenchmarkType where
        "exitcode-stdio" -> BenchmarkTypeExe ver
        _                -> BenchmarkTypeUnknown name ver
 
-instance Text BenchmarkType where
-  parse = stdParse $ \ver name -> case name of
-    "exitcode-stdio" -> BenchmarkTypeExe ver
-    _                -> BenchmarkTypeUnknown name ver
-
-
+instance Described BenchmarkType where
+    describe _ = "exitcode-stdio-1.0"

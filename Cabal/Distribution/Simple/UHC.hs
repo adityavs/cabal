@@ -25,7 +25,6 @@ module Distribution.Simple.UHC (
 import Prelude ()
 import Distribution.Compat.Prelude
 
-import Distribution.Compat.ReadP
 import Distribution.InstalledPackageInfo
 import Distribution.Package hiding (installedUnitId)
 import Distribution.PackageDescription
@@ -35,7 +34,8 @@ import Distribution.Simple.LocalBuildInfo
 import Distribution.Simple.PackageIndex
 import Distribution.Simple.Program
 import Distribution.Simple.Utils
-import Distribution.Text
+import Distribution.Pretty
+import Distribution.Parsec
 import Distribution.Types.MungedPackageId
 import Distribution.Verbosity
 import Distribution.Version
@@ -102,7 +102,7 @@ getInstalledPackages verbosity comp packagedbs progdb = do
   let pkgDirs    = nub (concatMap (packageDbPaths userPkgDir systemPkgDir) packagedbs)
   -- putStrLn $ "pkgdirs: " ++ show pkgDirs
   pkgs <- liftM (map addBuiltinVersions . concat) $
-          traverse (\ d -> getDirectoryContents d >>= filterM (isPkgDir (display compilerid) d))
+          traverse (\ d -> getDirectoryContents d >>= filterM (isPkgDir (prettyShow compilerid) d))
           pkgDirs
   -- putStrLn $ "pkgs: " ++ show pkgs
   let iPkgs =
@@ -116,11 +116,13 @@ getGlobalPackageDir :: Verbosity -> ProgramDb -> IO FilePath
 getGlobalPackageDir verbosity progdb = do
     output <- getDbProgramOutput verbosity
                 uhcProgram progdb ["--meta-pkgdir-system"]
-    -- call to "lines" necessary, because pkgdir contains an extra newline at the end
-    let [pkgdir] = lines output
+    -- we need to trim because pkgdir contains an extra newline at the end
+    let pkgdir = trimEnd output
     return pkgdir
+  where
+    trimEnd = reverse . dropWhile isSpace . reverse
 
-getUserPackageDir :: NoCallStackIO FilePath
+getUserPackageDir :: IO FilePath
 getUserPackageDir = do
     homeDir <- getHomeDirectory
     return $ homeDir </> ".cabal" </> "lib"  -- TODO: determine in some other way
@@ -149,7 +151,7 @@ installedPkgConfig = "installed-pkg-config"
 -- | Check if a certain dir contains a valid package. Currently, we are
 -- looking only for the presence of an installed package configuration.
 -- TODO: Actually make use of the information provided in the file.
-isPkgDir :: String -> String -> String -> NoCallStackIO Bool
+isPkgDir :: String -> String -> String -> IO Bool
 isPkgDir _ _   ('.' : _)  = return False  -- ignore files starting with a .
 isPkgDir c dir xs         = do
                               let candidate = dir </> uhcPackageDir xs c
@@ -157,7 +159,7 @@ isPkgDir c dir xs         = do
                               doesFileExist (candidate </> installedPkgConfig)
 
 parsePackage :: String -> [PackageId]
-parsePackage x = map fst (filter (\ (_,y) -> null y) (readP_to_S parse x))
+parsePackage = toList  . simpleParsec
 
 -- | Create a trivial package info from a directory name.
 mkInstalledPackageInfo :: PackageId -> InstalledPackageInfo
@@ -177,7 +179,7 @@ buildLib verbosity pkg_descr lbi lib clbi = do
   userPkgDir   <- getUserPackageDir
   let runUhcProg = runDbProgram verbosity uhcProgram (withPrograms lbi)
   let uhcArgs =    -- set package name
-                   ["--pkg-build=" ++ display (packageId pkg_descr)]
+                   ["--pkg-build=" ++ prettyShow (packageId pkg_descr)]
                    -- common flags lib/exe
                 ++ constructUHCCmdLine userPkgDir systemPkgDir
                                        lbi (libBuildInfo lib) clbi
@@ -186,7 +188,7 @@ buildLib verbosity pkg_descr lbi lib clbi = do
                    -- suboptimal: UHC does not understand module names, so
                    -- we replace periods by path separators
                 ++ map (map (\ c -> if c == '.' then pathSeparator else c))
-                       (map display (allLibModules lib clbi))
+                       (map prettyShow (allLibModules lib clbi))
 
   runUhcProg uhcArgs
 
@@ -203,7 +205,7 @@ buildExe verbosity _pkg_descr lbi exe clbi = do
                                        lbi (buildInfo exe) clbi
                                        (buildDir lbi) verbosity
                    -- output file
-                ++ ["--output", buildDir lbi </> display (exeName exe)]
+                ++ ["--output", buildDir lbi </> prettyShow (exeName exe)]
                    -- main source module
                 ++ [modulePath exe]
   runUhcProg uhcArgs
@@ -224,7 +226,7 @@ constructUHCCmdLine user system lbi bi clbi odir verbosity =
   ++ ["--hide-all-packages"]
   ++ uhcPackageDbOptions user system (withPackageDB lbi)
   ++ ["--package=uhcbase"]
-  ++ ["--package=" ++ display (mungedName pkgid) | (_, pkgid) <- componentPackageDeps clbi ]
+  ++ ["--package=" ++ prettyShow (mungedName pkgid) | (_, pkgid) <- componentPackageDeps clbi ]
      -- search paths
   ++ ["-i" ++ odir]
   ++ ["-i" ++ l | l <- nub (hsSourceDirs bi)]
@@ -253,7 +255,7 @@ installLib :: Verbosity -> LocalBuildInfo
 installLib verbosity _lbi targetDir _dynlibTargetDir builtDir pkg _library _clbi = do
     -- putStrLn $ "dest:  " ++ targetDir
     -- putStrLn $ "built: " ++ builtDir
-    installDirectoryContents verbosity (builtDir </> display (packageId pkg)) targetDir
+    installDirectoryContents verbosity (builtDir </> prettyShow (packageId pkg)) targetDir
 
 -- currently hard-coded UHC code generator and variant to use
 uhcTarget, uhcTargetVariant :: String
@@ -277,11 +279,11 @@ registerPackage
   -> InstalledPackageInfo
   -> IO ()
 registerPackage verbosity comp progdb packageDbs installedPkgInfo = do
-    dbdir <- case last packageDbs of
+    dbdir <- case registrationPackageDB packageDbs of
       GlobalPackageDB       -> getGlobalPackageDir verbosity progdb
       UserPackageDB         -> getUserPackageDir
       SpecificPackageDB dir -> return dir
-    let pkgdir = dbdir </> uhcPackageDir (display pkgid) (display compilerid)
+    let pkgdir = dbdir </> uhcPackageDir (prettyShow pkgid) (prettyShow compilerid)
     createDirectoryIfMissingVerbose verbosity True pkgdir
     writeUTF8File (pkgdir </> installedPkgConfig)
                   (showInstalledPackageInfo installedPkgInfo)

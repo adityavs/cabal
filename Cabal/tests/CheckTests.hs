@@ -5,15 +5,19 @@ module Main
 import Test.Tasty
 import Test.Tasty.Golden.Advanced (goldenTest)
 
-import Data.Algorithm.Diff                    (Diff (..), getGroupedDiff)
+import Data.Algorithm.Diff                    (PolyDiff (..), getGroupedDiff)
+import Distribution.Fields                    (runParseResult)
 import Distribution.PackageDescription.Check  (checkPackage)
 import Distribution.PackageDescription.Parsec (parseGenericPackageDescription)
-import Distribution.Parsec.ParseResult        (runParseResult)
+import Distribution.Parsec
 import Distribution.Utils.Generic             (fromUTF8BS, toUTF8BS)
+import System.Directory                       (setCurrentDirectory)
+import System.Environment                     (getArgs, withArgs)
 import System.FilePath                        (replaceExtension, (</>))
 
 import qualified Data.ByteString       as BS
 import qualified Data.ByteString.Char8 as BS8
+import qualified Data.List.NonEmpty    as NE
 
 tests :: TestTree
 tests = checkTests
@@ -27,17 +31,30 @@ checkTests = testGroup "regressions"
     [ checkTest "nothing-unicode.cabal"
     , checkTest "haddock-api-2.18.1-check.cabal"
     , checkTest "issue-774.cabal"
+    , checkTest "extensions-paths-5054.cabal"
+    , checkTest "pre-1.6-glob.cabal"
+    , checkTest "pre-2.4-globstar.cabal"
+    , checkTest "bad-glob-syntax.cabal"
+    , checkTest "cc-options-with-optimization.cabal"
+    , checkTest "cxx-options-with-optimization.cabal"
+    , checkTest "ghc-option-j.cabal"
+    , checkTest "multiple-libs-2.cabal"
+    , checkTest "assoc-cpp-options.cabal"
     ]
 
 checkTest :: FilePath -> TestTree
 checkTest fp = cabalGoldenTest fp correct $ do
     contents <- BS.readFile input
     let res =  parseGenericPackageDescription contents
-    let (_, x) = runParseResult res
+    let (ws, x) = runParseResult res
 
     return $ toUTF8BS $ case x of
-        Right gpd      -> unlines $ map show (checkPackage gpd Nothing)
-        Left (_, errs) -> unlines $ "ERROR" : map show errs
+        Right gpd      ->
+            -- Note: parser warnings are reported by `cabal check`, but not by
+            -- D.PD.Check functionality.
+            unlines (map (showPWarning fp) ws) ++
+            unlines (map show (checkPackage gpd Nothing))
+        Left (_, errs) -> unlines $ map (("ERROR: " ++) . showPError fp) $ NE.toList errs
   where
     input = "tests" </> "ParserTests" </> "regressions" </> fp
     correct = replaceExtension input "check"
@@ -47,7 +64,13 @@ checkTest fp = cabalGoldenTest fp correct $ do
 -------------------------------------------------------------------------------
 
 main :: IO ()
-main = defaultMain tests
+main = do
+    args <- getArgs
+    case args of
+        ("--cwd" : cwd : args') -> do
+            setCurrentDirectory cwd
+            withArgs args' $ defaultMain tests
+        _ -> defaultMain tests
 
 cabalGoldenTest :: TestName -> FilePath -> IO BS.ByteString -> TestTree
 cabalGoldenTest name ref act = goldenTest name (BS.readFile ref) act cmp upd

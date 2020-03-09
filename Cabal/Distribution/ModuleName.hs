@@ -1,5 +1,5 @@
 {-# LANGUAGE DeriveDataTypeable #-}
-{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE DeriveGeneric      #-}
 
 -----------------------------------------------------------------------------
 -- |
@@ -19,24 +19,21 @@ module Distribution.ModuleName (
         components,
         toFilePath,
         main,
-        simple,
         -- * Internal
         validModuleComponent,
   ) where
 
-import Prelude ()
 import Distribution.Compat.Prelude
+import Prelude ()
 
-import Distribution.Utils.ShortText
-import System.FilePath ( pathSeparator )
-
+import Distribution.FieldGrammar.Described
+import Distribution.Parsec
 import Distribution.Pretty
-import Distribution.Parsec.Class
-import Distribution.Text
+import Distribution.Utils.ShortText        (ShortText, fromShortText, toShortText)
+import System.FilePath                     (pathSeparator)
 
 import qualified Distribution.Compat.CharParsing as P
-import qualified Distribution.Compat.ReadP       as Parse
-import qualified Text.PrettyPrint as Disp
+import qualified Text.PrettyPrint                as Disp
 
 -- | A valid Haskell module name.
 --
@@ -44,6 +41,7 @@ newtype ModuleName = ModuleName ShortTextLst
   deriving (Eq, Generic, Ord, Read, Show, Typeable, Data)
 
 instance Binary ModuleName
+instance Structured ModuleName
 
 instance NFData ModuleName where
     rnf (ModuleName ms) = rnf ms
@@ -53,23 +51,15 @@ instance Pretty ModuleName where
     Disp.hcat (intersperse (Disp.char '.') (map Disp.text $ stlToStrings ms))
 
 instance Parsec ModuleName where
-    parsec = fromComponents <$> P.sepBy1 component (P.char '.')
+    parsec = fromComponents <$> toList <$> P.sepByNonEmpty component (P.char '.')
       where
         component = do
             c  <- P.satisfy isUpper
             cs <- P.munch validModuleChar
             return (c:cs)
 
-instance Text ModuleName where
-  parse = do
-    ms <- Parse.sepBy1 component (Parse.char '.')
-    return (ModuleName $ stlFromStrings ms)
-
-    where
-      component = do
-        c  <- Parse.satisfy isUpper
-        cs <- Parse.munch validModuleChar
-        return (c:cs)
+instance Described ModuleName where
+    describe _ = RETodo
 
 validModuleChar :: Char -> Bool
 validModuleChar c = isAlphaNum c || c == '_' || c == '\''
@@ -78,10 +68,6 @@ validModuleComponent :: String -> Bool
 validModuleComponent []     = False
 validModuleComponent (c:cs) = isUpper c
                            && all validModuleChar cs
-
-{-# DEPRECATED simple "use ModuleName.fromString instead. This symbol will be removed in Cabal-3.0 (est. Oct 2018)." #-}
-simple :: String -> ModuleName
-simple str = ModuleName (stlFromStrings [str])
 
 -- | Construct a 'ModuleName' from a valid module name 'String'.
 --
@@ -148,6 +134,8 @@ instance Read ShortTextLst where
 instance Binary ShortTextLst where
     put = put . stlToList
     get = stlFromList <$> get
+
+instance Structured ShortTextLst
 
 stlToList :: ShortTextLst -> [ShortText]
 stlToList STLNil = []

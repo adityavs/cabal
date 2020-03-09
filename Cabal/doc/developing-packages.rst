@@ -185,6 +185,27 @@ The last is just shorthand, for example ``base == 4.*`` means exactly
 the same thing as ``base >= 4 && < 5``. Please refer to the documentation
 on the :pkg-field:`build-depends` field for more information.
 
+Also, you can factor out shared ``build-depends`` (and other fields such
+as ``ghc-options``) into a ``common`` stanza which you can ``import`` in
+your libraries and executable sections. For example:
+
+::
+
+    common shared-properties
+      default-language: Haskell2010
+      build-depends:
+        base == 4.*
+      ghc-options:
+        -Wall
+
+    library
+      import: shared-properties
+      exposed-modules:
+        Proglet
+
+Note that the ``import`` **must** be the first thing in the stanza. For more
+information see the `Common stanzas`_ section.
+
 Building the package
 --------------------
 
@@ -241,7 +262,7 @@ Packages are also used for distribution: the idea is that a package can
 be created in one place and be moved to a different computer and be
 usable in that different environment. There are a surprising number of
 details that have to be got right for this to work, and a good package
-system helps to simply this process and make it reliable.
+system helps to simplify this process and make it reliable.
 
 Packages come in two main flavours: libraries of reusable code, and
 complete programs. Libraries present a code interface, an API, while
@@ -409,6 +430,15 @@ management. The need to remain compatible with automatic package
 management means that Cabal's conditional dependencies system is a bit
 less flexible than with the "./configure" approach.
 
+.. note::
+   `GNU autoconf places restrictions on paths, including the
+   path that the user builds a package from.
+   <https://www.gnu.org/software/autoconf/manual/autoconf.html#File-System-Conventions>`_
+   Package authors using ``build-type: configure`` should be aware of
+   these restrictions; because users may be unexpectedly constrained and
+   face mysterious errors, it is recommended that ``build-type: configure``
+   is only used where strictly necessary.
+
 Portability
 -----------
 
@@ -563,7 +593,7 @@ The HUnit package contains a file ``HUnit.cabal`` containing:
     author:         Dean Herington
     license:        BSD3
     license-file:   LICENSE
-    cabal-version:  >= 1.10
+    cabal-version:  1.12
     build-type:     Simple
 
     library
@@ -647,6 +677,8 @@ is governed by system-dependent parameters, if you specify a little more
 (see the section on `system-dependent parameters`_).
 A few packages require `more elaborate solutions <more complex packages>`_.
 
+.. _pkg-desc:
+
 Package descriptions
 --------------------
 
@@ -691,7 +723,7 @@ of field/value pairs, with a syntax roughly like mail message headers.
 -  Tabs are *not* allowed as indentation characters due to a missing
    standard interpretation of tab width.
 
--  To get a blank line in a field value, use an indented "``.``"
+-  Before Cabal 3.0, to get a blank line in a field value, use an indented "``.``"
 
 The syntax of the value depends on the field. Field types include:
 
@@ -707,7 +739,7 @@ The syntax of the value depends on the field. Field types include:
 *identifier*
     A letter followed by zero or more alphanumerics or underscores.
 *compiler*
-    A compiler flavor (one of: ``GHC``, ``JHC``, ``UHC`` or ``LHC``)
+    A compiler flavor (one of: ``GHC``, ``UHC`` or ``LHC``)
     followed by a version range. For example, ``GHC ==6.10.3``, or
     ``LHC >=0.6 && <0.8``.
 
@@ -785,28 +817,27 @@ describe the package as a whole:
 
         package-version = 1*DIGIT *("." 1*DIGIT)
 
-.. pkg-field:: cabal-version: >= x.y
+.. pkg-field:: cabal-version: x.y[.z]
 
-    The version of the Cabal specification that this package description
-    uses. The Cabal specification does slowly evolve, introducing new
-    features and occasionally changing the meaning of existing features.
-    By specifying which version of the spec you are using it enables
-    programs which process the package description to know what syntax
-    to expect and what each part means.
-
-    For historical reasons this is always expressed using *>=* version
-    range syntax. No other kinds of version range make sense, in
-    particular upper bounds do not make sense. In future this field will
-    specify just a version number, rather than a version range.
+    The version of the Cabal specification that this package
+    description uses. The Cabal specification does slowly evolve (see
+    also :ref:`spec-history`), introducing new features and
+    occasionally changing the meaning of existing features. By
+    specifying which version of the specification you are using it
+    enables programs which process the package description to know
+    what syntax to expect and what each part means.
 
     The version number you specify will affect both compatibility and
-    behaviour. Most tools (including the Cabal library and cabal
+    behaviour. Most tools (including the Cabal library and the ``cabal``
     program) understand a range of versions of the Cabal specification.
     Older tools will of course only work with older versions of the
-    Cabal specification. Most of the time, tools that are too old will
-    recognise this fact and produce a suitable error message.
+    Cabal specification that was known at the time. Most of the time,
+    tools that are too old will recognise this fact and produce a
+    suitable error message. Likewise, ``cabal check`` will tell you
+    whether the version number is sufficiently high for the features
+    you use in the package description.
 
-    As for behaviour, new versions of the Cabal spec can change the
+    As for behaviour, new versions of the Cabal specification can change the
     meaning of existing syntax. This means if you want to take advantage
     of the new meaning or behaviour then you must specify the newer
     Cabal version. Tools are expected to use the meaning and behaviour
@@ -820,6 +851,40 @@ describe the package as a whole:
     old syntax. Please consult the user's guide of an older Cabal
     version for a description of that syntax.
 
+    Starting with ``cabal-version: 2.2`` this field is only valid if
+    fully contained in the very first line of a package description
+    and ought to adhere to the ABNF_ grammar
+
+    .. code-block:: abnf
+
+        newstyle-spec-version-decl = "cabal-version" *WS ":" *WS newstyle-spec-version *WS
+
+        newstyle-spec-version      = NUM "." NUM [ "." NUM ]
+
+        NUM    = DIGIT0 / DIGITP 1*DIGIT0
+        DIGIT0 = %x30-39
+        DIGITP = %x31-39
+        WS     = %20
+
+
+    .. note::
+
+        For package descriptions using a format prior to
+        ``cabal-version: 1.12`` the legacy syntax resembling a version
+        range syntax
+
+        .. code-block:: cabal
+
+            cabal-version: >= 1.10
+
+        needs to be used.
+
+        This legacy syntax is supported up until ``cabal-version: >=
+        2.0`` it is however strongly recommended to avoid using the
+        legacy syntax. See also :issue:`4899`.
+
+
+
 .. pkg-field:: build-type: identifier
 
     :default: ``Custom`` or ``Simple``
@@ -830,7 +895,7 @@ describe the package as a whole:
     type. This field is optional and when missing, its default value
     is inferred according to the following rules:
 
-     - When :pkg-field:`cabal-version` is set to ``2.1`` or higher,
+     - When :pkg-field:`cabal-version` is set to ``2.2`` or higher,
        the default is ``Simple`` unless a :pkg-section:`custom-setup`
        exists, in which case the inferred default is ``Custom``.
 
@@ -873,17 +938,86 @@ describe the package as a whole:
 
     For most packages, the build type ``Simple`` is sufficient.
 
-.. pkg-field:: license: identifier
+.. pkg-field:: license: SPDX expression
 
-    :default: ``AllRightsReserved``
+    :default: ``NONE``
 
-    The type of license under which this package is distributed. License
-    names are the constants of the
-    `License <../release/cabal-latest/doc/API/Cabal/Distribution-License.html#t:License>`__
-    type.
+    The type of license under which this package is distributed.
+
+    Starting with ``cabal-version: 2.2`` the ``license`` field takes a
+    (case-sensitive) SPDX expression such as
+
+    .. code-block:: cabal
+
+        license: Apache-2.0 AND (MIT OR GPL-2.0-or-later)
+
+    See `SPDX IDs: How to use <https://spdx.org/ids-how>`__ for more
+    examples of SPDX expressions.
+
+    The version of the
+    `list of SPDX license identifiers <https://spdx.org/licenses/>`__
+    is a function of the :pkg-field:`cabal-version` value as defined
+    in the following table:
+
+    +--------------------------+--------------------+
+    | Cabal specification      | SPDX license list  |
+    | version                  | version            |
+    |                          |                    |
+    +==========================+====================+
+    | ``cabal-version: 2.2``   | ``3.0 2017-12-28`` |
+    +--------------------------+--------------------+
+    | ``cabal-version: 2.4``   | ``3.2 2018-07-10`` |
+    +--------------------------+--------------------+
+
+    **Pre-SPDX Legacy Identifiers**
+
+    The license identifier in the table below are defined for
+    ``cabal-version: 2.0`` and previous versions of the Cabal
+    specification.
+
+    +--------------------------+-----------------+
+    | :pkg-field:`license`     | Note            |
+    | identifier               |                 |
+    |                          |                 |
+    +==========================+=================+
+    | ``GPL``                  |                 |
+    | ``GPL-2``                |                 |
+    | ``GPL-3``                |                 |
+    +--------------------------+-----------------+
+    | ``LGPL``                 |                 |
+    | ``LGPL-2.1``             |                 |
+    | ``LGPL-3``               |                 |
+    +--------------------------+-----------------+
+    | ``AGPL``                 | since 1.18      |
+    | ``AGPL-3``               |                 |
+    +--------------------------+-----------------+
+    | ``BSD2``                 | since 1.20      |
+    +--------------------------+-----------------+
+    | ``BSD3``                 |                 |
+    +--------------------------+-----------------+
+    | ``MIT``                  |                 |
+    +--------------------------+-----------------+
+    | ``ISC``                  | since 1.22      |
+    +--------------------------+-----------------+
+    | ``MPL-2.0``              | since 1.20      |
+    +--------------------------+-----------------+
+    | ``Apache``               |                 |
+    | ``Apache-2.0``           |                 |
+    +--------------------------+-----------------+
+    | ``PublicDomain``         |                 |
+    +--------------------------+-----------------+
+    | ``AllRightsReserved``    |                 |
+    +--------------------------+-----------------+
+    | ``OtherLicense``         |                 |
+    +--------------------------+-----------------+
+
 
 .. pkg-field:: license-file: filename
+
+    See :pkg-field:`license-files`.
+
 .. pkg-field:: license-files: filename list
+    :since: 1.20
 
     The name of a file(s) containing the precise copyright license for
     this package. The license file(s) will be installed with the
@@ -970,33 +1104,76 @@ describe the package as a whole:
 .. pkg-field:: tested-with: compiler list
 
     A list of compilers and versions against which the package has been
-    tested (or at least built).
+    tested (or at least built). The value of this field is not used by Cabal
+    and is rather intended as extra metadata for use by third party
+    tooling, such as e.g. CI tooling.
+
+    Here's a typical usage example
+
+    ::
+
+        tested-with: GHC == 8.6.3, GHC == 8.4.4, GHC == 8.2.2, GHC == 8.0.2,
+                     GHC == 7.10.3, GHC == 7.8.4, GHC == 7.6.3, GHC == 7.4.2
+
+    which can (starting with Cabal 3.0) also be written using the more
+    concise set notation syntax
+
+    ::
+
+        tested-with: GHC == { 8.6.3, 8.4.4, 8.2.2, 8.0.2, 7.10.3, 7.8.4, 7.6.3, 7.4.2 }
 
 .. pkg-field:: data-files: filename list
 
     A list of files to be installed for run-time use by the package.
     This is useful for packages that use a large amount of static data,
     such as tables of values or code templates. Cabal provides a way to
-    `find these files at run-time <accessing data files from package code>`_.
+    `find these files at run-time <#accessing-data-files-from-package-code>`_.
 
     A limited form of ``*`` wildcards in file names, for example
     ``data-files: images/*.png`` matches all the ``.png`` files in the
-    ``images`` directory.
+    ``images`` directory. ``data-files: audio/**/*.mp3`` matches all
+    the ``.mp3`` files in the ``audio`` directory, including
+    subdirectories.
 
-    The limitation is that ``*`` wildcards are only allowed in place of
-    the file name, not in the directory name or file extension. In
-    particular, wildcards do not include directories contents
-    recursively. Furthermore, if a wildcard is used it must be used with
-    an extension, so ``data-files: data/*`` is not allowed. When
-    matching a wildcard plus extension, a file's full extension must
-    match exactly, so ``*.gz`` matches ``foo.gz`` but not
-    ``foo.tar.gz``. A wildcard that does not match any files is an
-    error.
+    The specific limitations of this wildcard syntax are
+
+    - ``*`` wildcards are only allowed in place of the file name, not
+      in the directory name or file extension. It must replace the
+      whole file name (e.g., ``*.html`` is allowed, but
+      ``chapter-*.html`` is not). If a wildcard is used, it must be
+      used with an extension, so ``data-files: data/*`` is not
+      allowed.
+
+    - Prior to Cabal 2.4, when matching a wildcard plus extension, a
+      file's full extension must match exactly, so ``*.gz`` matches
+      ``foo.gz`` but not ``foo.tar.gz``. This restriction has been
+      lifted when ``cabal-version: 2.4`` or greater so that ``*.gz``
+      does match ``foo.tar.gz``
+
+    - ``*`` wildcards will not match if the file name is empty (e.g.,
+      ``*.html`` will not match ``foo/.html``).
+
+    - ``**`` wildcards can only appear as the final path component
+      before the file name (e.g., ``data/**/images/*.jpg`` is not
+      allowed). If a ``**`` wildcard is used, then the file name must
+      include a ``*`` wildcard (e.g., ``data/**/README.rst`` is not
+      allowed).
+
+    - A wildcard that does not match any files is an error.
 
     The reason for providing only a very limited form of wildcard is to
     concisely express the common case of a large number of related files
     of the same file type without making it too easy to accidentally
     include unwanted files.
+
+    On efficiency: if you use ``**`` patterns, the directory tree will
+    be walked starting with the parent directory of the ``**``. If
+    that's the root of the project, this might include ``.git/``,
+    ``dist-newstyle/``, or other large directories! To avoid this
+    behaviour, put the files that wildcards will match against in
+    their own folder.
+
+    ``**`` wildcards are available starting in Cabal 2.4.
 
 .. pkg-field:: data-dir: directory
 
@@ -1011,6 +1188,7 @@ describe the package as a whole:
     a limited form of ``*`` wildcards in file names.
 
 .. pkg-field:: extra-doc-files: filename list
+    :since: 1.18
 
     A list of additional files to be included in source distributions,
     and also copied to the html directory when Haddock documentation is
@@ -1027,12 +1205,20 @@ describe the package as a whole:
 Library
 ^^^^^^^
 
-.. pkg-section:: library
+.. pkg-section:: library name
     :synopsis: Library build information.
 
-    Build information for libraries. There can be only one library in a
+    Build information for libraries.
+
+    Currently, there can only be one publicly exposed library in a
     package, and its name is the same as package name set by global
-    :pkg-field:`name` field.
+    :pkg-field:`name` field. In this case, the ``name`` argument to
+    the :pkg-section:`library` section must be omitted.
+
+    Starting with Cabal 2.0, private internal sub-library components
+    can be defined by using setting the ``name`` field to a name
+    different from the current package's name; see section on
+    :ref:`Internal Libraries <sublibs>` for more information.
 
 The library section should contain the following fields:
 
@@ -1043,6 +1229,7 @@ The library section should contain the following fields:
     A list of modules added by this package.
 
 .. pkg-field:: virtual-modules: identifier list
+    :since: 2.2
 
     A list of virtual modules provided by this package.  Virtual modules
     are modules without a source file.  See for example the ``GHC.Prim``
@@ -1068,7 +1255,18 @@ The library section should contain the following fields:
     that use a flat module namespace or where it is known that the
     exposed modules would clash with other common modules.
 
+.. pkg-field:: visibility: visibilty specifiers
+
+    :since 3.0
+
+    :default: ``private`` for internal libraries. Cannot be set for public library.
+
+    Cabal recognizes ``public`` and ``private`` here...
+
+    Multiple public libraries...
+
 .. pkg-field:: reexported-modules: exportlist
+    :since: 1.22
 
     Supported only in GHC 7.10 and later. A list of modules to
     *reexport* from this package. The syntax of this field is
@@ -1086,8 +1284,27 @@ The library section should contain the following fields:
     conflict (as would be the case with a stub module.) They can also be
     used to resolve name conflicts.
 
+.. pkg-field:: signatures: signature list
+    :since: 2.0
+
+    Supported only in GHC 8.2 and later. A list of `module signatures <https://downloads.haskell.org/~ghc/master/users-guide/separate_compilation.html#module-signatures>`__ required by this package.
+
+    Module signatures are part of the Backpack_ extension to
+    the Haskell module system.
+
+    Packages that do not export any modules and only export required signatures
+    are called "signature-only packages", and their signatures are subjected to
+    `signature thinning
+    <https://wiki.haskell.org/Module_signature#How_to_use_a_signature_package>`__.
+
+
+
 The library section may also contain build information fields (see the
 section on `build information`_).
+
+.. _sublibs:
+
+**Internal Libraries**
 
 Cabal 2.0 and later support "internal libraries", which are extra named
 libraries (as opposed to the usual unnamed library section). For
@@ -1099,10 +1316,10 @@ look something like this:
 
 ::
 
+    cabal-version:  2.0
     name:           foo
-    version:        1.0
+    version:        0.1.0.0
     license:        BSD3
-    cabal-version:  >= 1.23
     build-type:     Simple
 
     library foo-internal
@@ -1123,12 +1340,59 @@ look something like this:
         build-depends: foo-internal, base
 
 Internal libraries are also useful for packages that define multiple
-executables, but do not define a publically accessible library. Internal
+executables, but do not define a publicly accessible library. Internal
 libraries are only visible internally in the package (so they can only
 be added to the :pkg-field:`build-depends` of same-package libraries,
 executables, test suites, etc.) Internal libraries locally shadow any
-packages which have the same name (so don't name an internal library
-with the same name as an external dependency.)
+packages which have the same name; consequently, don't name an internal
+library with the same name as an external dependency if you need to be
+able to refer to the external dependency in a
+:pkg-field:`build-depends` declaration.
+
+Shadowing can be used to vendor an external dependency into a package
+and thus emulate *private dependencies*. Below is an example based on
+a real-world use case:
+
+::
+
+    cabal-version: 2.2
+    name: haddock-library
+    version: 1.6.0
+
+    library
+      build-depends:
+        , base         ^>= 4.11.1.0
+        , bytestring   ^>= 0.10.2.0
+        , containers   ^>= 0.4.2.1 || ^>= 0.5.0.0
+        , transformers ^>= 0.5.0.0
+
+      hs-source-dirs:       src
+
+      -- internal sub-lib
+      build-depends:        attoparsec
+
+      exposed-modules:
+        Documentation.Haddock
+
+    library attoparsec
+      build-depends:
+        , base         ^>= 4.11.1.0
+        , bytestring   ^>= 0.10.2.0
+        , deepseq      ^>= 1.4.0.0
+
+      hs-source-dirs:       vendor/attoparsec-0.13.1.0
+
+      -- NB: haddock-library needs only small part of lib:attoparsec
+      --     internally, so we only bundle that subset here
+      exposed-modules:
+        Data.Attoparsec.ByteString
+        Data.Attoparsec.Combinator
+
+      other-modules:
+        Data.Attoparsec.Internal
+
+      ghc-options: -funbox-strict-fields -Wall -fwarn-tabs -O2
+
 
 Opening an interpreter session
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -1211,7 +1475,7 @@ dependencies. The ``cabal outdated`` command is designed to help with
 that. It will print a list of packages for which there is a new
 version on Hackage that is outside the version bound specified in the
 ``build-depends`` field. The ``outdated`` command can also be
-configured to act on the freeze file (both old- and new-style) and
+configured to act on the freeze file (both old- and v2-style) and
 ignore major (or all) version bumps on Hackage for a subset of
 dependencies.
 
@@ -1220,9 +1484,22 @@ The following flags are supported by the ``outdated`` command:
 ``--freeze-file``
     Read dependency version bounds from the freeze file (``cabal.config``)
     instead of the package description file (``$PACKAGENAME.cabal``).
-``--new-freeze-file``
-    Read dependency version bounds from the new-style freeze file
-    (``cabal.project.freeze``) instead of the package description file.
+    ``--v1-freeze-file`` is an alias for this flag starting in Cabal 2.4.
+``--v2-freeze-file``
+    :since: 2.4
+
+    Read dependency version bounds from the v2-style freeze file
+    (by default, ``cabal.project.freeze``) instead of the package
+    description file. ``--new-freeze-file`` is an alias for this flag
+    that can be used with pre-2.4 ``cabal``.
+``--project-file`` *PROJECTFILE*
+    :since: 2.4
+
+    Read dependendency version bounds from the v2-style freeze file
+    related to the named project file (i.e., ``$PROJECTFILE.freeze``)
+    instead of the package desctription file. If multiple ``--project-file``
+    flags are provided, only the final one is considered. This flag
+    must only be passed in when ``--new-freeze-file`` is present.
 ``--simple-output``
     Print only the names of outdated dependencies, one per line.
 ``--exit-code``
@@ -1299,7 +1576,11 @@ build information fields (see the section on `build information`_).
     module. Note that it is the ``.hs`` filename that must be listed,
     even if that file is generated using a preprocessor. The source file
     must be relative to one of the directories listed in
-    :pkg-field:`hs-source-dirs`.
+    :pkg-field:`hs-source-dirs`. Further, while the name of the file may
+    vary, the module itself must be named ``Main``.
+
+    Starting with ``cabal-version: 1.18`` this field supports
+    specifying a C, C++, or objC source file as the main entry point.
 
 .. pkg-field:: scope: token
     :since: 2.0
@@ -1515,7 +1796,8 @@ standard output and error channels.
     even if that file is generated using a preprocessor. The source file
     must be relative to one of the directories listed in
     :pkg-field:`hs-source-dirs`. This field is analogous to the ``main-is``
-    field of an executable section.
+    field of an executable section. Further, while the name of the file may
+    vary, the module itself must be named ``Main``.
 
 Example: Package using ``exitcode-stdio-1.0`` interface
 """""""""""""""""""""""""""""""""""""""""""""""""""""""
@@ -1721,10 +2003,28 @@ of the corresponding library or executable. See also the sections on
 `system-dependent parameters`_ and `configurations`_ for a way to supply
 system-dependent values for these fields.
 
-.. pkg-field:: build-depends: package list
+.. pkg-field:: build-depends: library list
 
-    A list of packages needed to build this one. Each package can be
-    annotated with a version constraint.
+    Declares the *library* dependencies required to build the current
+    package component; see :pkg-field:`build-tool-depends` for
+    declaring build-time *tool* dependencies. External library
+    dependencies should be annotated with a version constraint.
+
+    **Library Names**
+
+    External libraries are identified by the package's name they're
+    provided by (currently a package can only publicly expose its
+    main library compeonent; in future, packages with multiple exposed
+    public library components will be supported and a syntax for
+    referring to public sub-libraries will be provided).
+
+    In order to specify an intra-package dependency on an internal
+    library component you can use the unqualified name of the
+    component library component. Note that locally defined sub-library
+    names shadow external package names of the same name. See section on
+    :ref:`Internal Libraries <sublibs>` for examples and more information.
+
+    **Version Constraints**
 
     Version constraints use the operators ``==, >=, >, <, <=`` and a
     version number. Multiple constraints can be combined using ``&&`` or
@@ -1852,6 +2152,25 @@ system-dependent values for these fields.
        renaming in ``build-depends``; however, this support has since been
        removed and should not be used.
 
+    Starting with Cabal 3.0, a set notation for the ``==`` and ``^>=`` operator
+    is available. For instance,
+
+    ::
+
+        tested-with: GHC == 8.6.3, GHC == 8.4.4, GHC == 8.2.2, GHC == 8.0.2,
+                     GHC == 7.10.3, GHC == 7.8.4, GHC == 7.6.3, GHC == 7.4.2
+
+        build-depends: network ^>= 2.6.3.6 || ^>= 2.7.0.2 || ^>= 2.8.0.0 || ^>= 3.0.1.0
+
+    can be then written in a more convenient and concise form
+
+    ::
+
+        tested-with: GHC == { 8.6.3, 8.4.4, 8.2.2, 8.0.2, 7.10.3, 7.8.4, 7.6.3, 7.4.2 }
+
+        build-depends: network ^>= { 2.6.3.6, 2.7.0.2, 2.8.0.0, 3.0.1.0 }
+
+
 .. pkg-field:: other-modules: identifier list
 
     A list of modules used by the component but not exposed to users.
@@ -1865,14 +2184,29 @@ system-dependent values for these fields.
        :pkg-field:`other-modules`, :pkg-field:`library:exposed-modules` or
        :pkg-field:`executable:main-is` fields.
 
+.. pkg-field:: hs-source-dir: directory list
+    :deprecated: 2.0
+    :removed: 3.0
+
+    :default: ``.``
+
+    Root directories for the module hierarchy.
+
+    Deprecated in favor of :pkg-field:`hs-source-dirs`.
+
 .. pkg-field:: hs-source-dirs: directory list
 
     :default: ``.``
 
     Root directories for the module hierarchy.
 
-    For backwards compatibility, the old variant ``hs-source-dir`` is
-    also recognized.
+    .. note::
+
+      Components can share source directories but modules found there will be
+      recompiled even if other components already built them, i.e., if a
+      library and an executable share a source directory and the executable
+      depends on the library and imports its ``Foo`` module, ``Foo`` will be
+      compiled twice, once as part of the library and again for the executable.
 
 .. pkg-field:: default-extensions: identifier list
 
@@ -1912,31 +2246,66 @@ system-dependent values for these fields.
     :pkg-field:`other-extensions` declarations.
 
 .. pkg-field:: extensions: identifier list
-   :deprecated:
+   :deprecated: 1.12
+   :removed: 3.0
 
    Deprecated in favor of :pkg-field:`default-extensions`.
 
 .. pkg-field:: build-tool-depends: package:executable list
     :since: 2.0
 
-    A list of Haskell programs needed to build this component.
-    Each is specified by the package containing the executable and the name of the executable itself, separated by a colon, and optionally followed by a version bound.
-    It is fine for the package to be the current one, in which case this is termed an *internal*, rather than *external* executable dependency.
+    A list of Haskell executables needed to build this component. Executables are provided
+    during the whole duration of the component, so this field can be used for executables
+    needed during :pkg-section:`test-suite` as well.
 
-    External dependencies can (and should) contain a version bound like conventional :pkg-field:`build-depends` dependencies.
-    Internal deps should not contain a version bound, as they will be always resolved within the same configuration of the package in the build plan.
-    Specifically, version bounds that include the package's version will be warned for being extraneous, and version bounds that exclude the package's version will raise an error for being impossible to follow.
+    Each is specified by the package containing the executable and the name of the
+    executable itself, separated by a colon, and optionally followed by a version bound.
 
-    Cabal can make sure that specified programs are built and on the ``PATH`` before building the component in question.
-    It will always do so for internal dependencies, and also do so for external dependencies when using Nix-style local builds.
+    All executables defined in the given Cabal file are termed as *internal* dependencies
+    as opposed to the rest which are *external* dependencies.
 
-    :pkg-field:`build-tool-depends` was added in Cabal 2.0, and it will
-    be ignored (with a warning) with old versions of Cabal.  See
-    :pkg-field:`build-tools` for more information about backwards
-    compatibility.
+    Each of the two is handled differently:
+
+    1. External dependencies can (and should) contain a version bound like conventional
+       :pkg-field:`build-depends` dependencies.
+    2. Internal depenedencies should not contain a version bound, as they will be always
+       resolved within the same configuration of the package in the build plan.
+       Specifically, version bounds that include the package's version will be warned for
+       being extraneous, and version bounds that exclude the package's version will raise
+       an error for being impossible to follow.
+
+    For example (1) using a test-suite to make sure README.md Haskell snippets are tested using
+    `markdown-unlit <http://hackage.haskell.org/package/markdown-unlit>`__:
+
+    ::
+
+        build-tool-depends: markdown-unlit:markdown-unlit >= 0.5.0 && < 0.6
+
+    For example (2) using a test-suite to test executable behaviour in the same package:
+
+    ::
+
+        build-tool-depends: mypackage:executable
+
+    Cabal tries to make sure that all specified programs are atomically built and prepended
+    on the ``$PATH`` shell variable before building the component in question, but can only do
+    so for Nix-style builds. Specifically:
+
+    a) For Nix-style local builds, both internal and external dependencies.
+    b) For old-style builds, only for internal dependencies [#old-style-build-tool-depends]_.
+       It's up to the user to provide needed executables in this case under `$PATH.`
+
+
+    .. note::
+
+      :pkg-field:`build-tool-depends` was added in Cabal 2.0, and it will
+      be ignored (with a warning) with old versions of Cabal.  See
+      :pkg-field:`build-tools` for more information about backwards
+      compatibility.
 
 .. pkg-field:: build-tools: program list
-    :deprecated:
+    :deprecated: 2.0
+    :removed: 3.0
 
     Deprecated in favor of :pkg-field:`build-tool-depends`, but :ref:`see below for backwards compatibility information <buildtoolsbc>`.
 
@@ -1963,7 +2332,7 @@ system-dependent values for these fields.
 
     .. _buildtoolsbc:
 
-    **Backward Compatiblity**
+    **Backward Compatibility**
 
     Although this field is deprecated in favor of :pkg-field:`build-tool-depends`, there are some situations where you may prefer to use :pkg-field:`build-tools` in cases (1) and (2), as it is supported by more versions of Cabal.
     In case (3), :pkg-field:`build-tool-depends` is better for backwards-compatibility, as it will be ignored by old versions of Cabal; if you add the executable to :pkg-field:`build-tools`, a setup script built against old Cabal will choke.
@@ -2019,7 +2388,7 @@ system-dependent values for these fields.
 .. pkg-field:: ghc-options: token list
 
     Additional options for GHC. You can often achieve the same effect
-    using the :pkg-field:`extensions` field, which is preferred.
+    using the :pkg-field:`default-extensions` field, which is preferred.
 
     Options required only by one module may be specified by placing an
     ``OPTIONS_GHC`` pragma in the source file affected.
@@ -2113,6 +2482,7 @@ system-dependent values for these fields.
     files.
 
 .. pkg-field:: cxx-sources: filename list
+    :since: 2.2
 
     A list of C++ source files to be compiled and linked with the Haskell
     files. Useful for segregating C and C++ sources when supplying different
@@ -2123,11 +2493,13 @@ system-dependent values for these fields.
     appropriately.
 
 .. pkg-field:: asm-sources: filename list
+    :since: 3.0
 
     A list of assembly source files to be compiled and linked with the
     Haskell files.
 
 .. pkg-field:: cmm-sources: filename list
+    :since: 3.0
 
     A list of C-- source files to be compiled and linked with the Haskell
     files.
@@ -2147,13 +2519,23 @@ system-dependent values for these fields.
     when the package is loaded with GHCi.
 
 .. pkg-field:: extra-bundled-libraries: token list
+   :since: 2.2
 
    A list of libraries that are supposed to be copied from the build
-   directory alongside the produced haskell libraries.  Note that you
-   are under the obligation to produce those lirbaries in the build
+   directory alongside the produced Haskell libraries.  Note that you
+   are under the obligation to produce those libraries in the build
    directory (e.g. via a custom setup).  Libraries listed here will
    be included when ``copy``-ing packages and be listed in the
-   ``hs-libraries`` of the package configuration.
+   ``hs-libraries`` of the package configuration in the package database.
+   Library names must either be prefixed with "HS" or "C" and corresponding
+   library file names must match:
+
+      - Libraries with name "HS<library-name>":
+         - `libHS<library-name>.a`
+         - `libHS<library-name>-ghc<ghc-flavour><ghc-version>.<dyn-library-extension>*`
+      - Libraries with name "C<library-name>":
+         - `libC<library-name>.a`
+         - `lib<library-name>.<dyn-library-extension>*`
 
 .. pkg-field:: extra-lib-dirs: directory list
 
@@ -2168,10 +2550,11 @@ system-dependent values for these fields.
 .. pkg-field:: cpp-options: token list
 
     Command-line arguments for pre-processing Haskell code. Applies to
-    haskell source and other pre-processed Haskell source like .hsc
+    Haskell source and other pre-processed Haskell source like .hsc
     .chs. Does not apply to C code, that's what cc-options is for.
 
 .. pkg-field:: cxx-options: token list
+    :since: 2.2
 
     Command-line arguments to be passed to the compiler when compiling
     C++ code. The C++ sources to which these command-line arguments
@@ -2182,6 +2565,18 @@ system-dependent values for these fields.
     :pkg-field:`cxx-sources` fields respectively, and providing different
     command-line arguments with the :pkg-field:`cc-options` and the
     :pkg-field:`cxx-options` fields.
+
+.. pkg-field:: cmm-options: token list
+    :since: 3.0
+
+    Command-line arguments to be passed to the compiler when compiling
+    C-- code. See also :pkg-field:`cmm-sources`.
+
+.. pkg-field:: asm-options: token list
+    :since: 3.0
+
+    Command-line arguments to be passed to the assembler when compiling
+    assembler code. See also :pkg-field:`asm-sources`.
 
 .. pkg-field:: ld-options: token list
 
@@ -2200,10 +2595,11 @@ system-dependent values for these fields.
     the system and to find the extra compilation and linker options
     needed to use the packages.
 
-    If you need to bind to a C library that supports ``pkg-config`` (use
-    ``pkg-config --list-all`` to find out if it is supported) then it is
-    much preferable to use this field rather than hard code options into
-    the other fields.
+    If you need to bind to a C library that supports ``pkg-config`` then
+    it is much preferable to use this field rather than hard code options
+    into the other fields. ``pkg-config --list-all`` will show you all
+    supported libraries. Depending on your system you may need to adjust
+    ``PKG_CONFIG_PATH``.
 
 .. pkg-field:: frameworks: token list
 
@@ -2212,9 +2608,108 @@ system-dependent values for these fields.
     is ignored on all other platforms.
 
 .. pkg-field:: extra-frameworks-dirs: directory list
+    :since: 1.24
 
     On Darwin/MacOS X, a list of directories to search for frameworks.
     This entry is ignored on all other platforms.
+
+.. pkg-field:: mixins: mixin list
+    :since: 2.0
+
+    Supported only in GHC 8.2 and later. A list of packages mentioned in the
+    :pkg-field:`build-depends` field, each optionally accompanied by a list of
+    module and module signature renamings.
+
+    The simplest mixin syntax is simply the name of a package mentioned in the
+    :pkg-field:`build-depends` field. For example:
+
+    ::
+
+        library
+          build-depends:
+            foo ^>= 1.2.3
+          mixins:
+            foo
+
+    But this doesn't have any effect. More interesting is to use the mixin
+    entry to rename one or more modules from the package, like this:
+
+    ::
+
+        library
+          mixins:
+            foo (Foo.Bar as AnotherFoo.Bar, Foo.Baz as AnotherFoo.Baz)
+
+    Note that renaming a module like this will hide all the modules
+    that are not explicitly named.
+
+    Modules can also be hidden:
+
+    ::
+
+        library:
+          mixins:
+            foo hiding (Foo.Bar)
+
+    Hiding modules exposes everything that is not explicitly hidden.
+
+    .. Note::
+
+       The current version of Cabal suffers from an infelicity in how the
+       entries of :pkg-field:`mixins` are parsed: an entry will fail to parse
+       if the provided renaming clause has whitespace after the opening
+       parenthesis. This will be fixed in future versions of Cabal.
+
+       See issues :issue:`5150`, :issue:`4864`, and :issue:`5293`.
+
+    There can be multiple mixin entries for a given package, in effect creating
+    multiple copies of the dependency:
+
+    ::
+
+        library
+          mixins:
+            foo (Foo.Bar as AnotherFoo.Bar, Foo.Baz as AnotherFoo.Baz),
+            foo (Foo.Bar as YetAnotherFoo.Bar)
+
+    The ``requires`` clause is used to rename the module signatures required by
+    a package:
+
+    ::
+
+        library
+          mixins:
+            foo (Foo.Bar as AnotherFoo.Bar) requires (Foo.SomeSig as AnotherFoo.SomeSig)
+
+    Signature-only packages don't have any modules, so only the signatures can
+    be renamed, with the following syntax:
+
+    ::
+
+        library
+          mixins:
+            sigonly requires (SigOnly.SomeSig as AnotherSigOnly.SomeSig)
+
+    See the :pkg-field:`library:signatures` field for more details.
+
+    Mixin packages are part of the Backpack_ extension to the
+    Haskell module system.
+
+    The matching of the module signatures required by a
+    :pkg-field:`build-depends` dependency with the implementation modules
+    present in another dependency is triggered by a coincidence of names. When
+    the names of the signature and of the implementation are already the same,
+    the matching is automatic. But when the names don't coincide, or we want to
+    instantiate a signature in two different ways, adding mixin entries that
+    perform renamings becomes necessary.
+
+    .. Warning::
+
+       Backpack_ has the limitation that implementation modules that instantiate
+       signatures required by a :pkg-field:`build-depends` dependency can't
+       reside in the same component that has the dependency. They must reside
+       in a different package dependency, or at least in a separate internal
+       library.
 
 Configurations
 ^^^^^^^^^^^^^^
@@ -2381,6 +2876,7 @@ Configuration Flags
 .. pkg-field:: manual: boolean
 
     :default: ``False``
+    :since: 1.6
 
     By default, Cabal will first try to satisfy dependencies with the
     default flag value and then, if that is not possible, with the
@@ -2575,7 +3071,7 @@ Starting with Cabal-2.2 it's possible to use common build info stanzas.
         ghc-options: -Wall
 
       common test-deps
-        build-depends: tasty
+        build-depends: tasty ^>= 0.12.0.1
 
       library
         import: deps
@@ -2594,6 +3090,9 @@ Starting with Cabal-2.2 it's possible to use common build info stanzas.
 -  Common stanzas can import other common stanzas.
 
 -  You can import multiple stanzas at once. Stanza names must be separated by commas.
+
+-  ``import`` must be the first field in a section. Since Cabal 3.0 imports
+   are also allowed inside conditionals.
 
 .. Note::
 
@@ -2754,6 +3253,11 @@ rely on dependencies being implicitly in scope.  Please refer
 `this article <https://www.well-typed.com/blog/2015/07/cabal-setup-deps/>`__
 for more details.
 
+As of Cabal library version 3.0, ``defaultMain*`` variants implement support
+for response files. Custom ``Setup.hs`` files that do not use one of these
+main functions are required to implement their own support, such as by using
+``GHC.ResponseFile.getArgsWithResponseFiles``.
+
 Declaring a ``custom-setup`` stanza also enables the generation of
 ``MIN_VERSION_package_(A,B,C)`` CPP macros for the Setup component.
 
@@ -2778,6 +3282,18 @@ Declaring a ``custom-setup`` stanza also enables the generation of
     :pkg-field:`build-depends` field for a description of the syntax expected by
     this field.
 
+    If the field is not specified the implicit package set will be used.
+    The package set contains packages bundled with GHC (i.e. ``base``,
+    ``bytestring``) and specifically ``Cabal``.
+    The specific bounds are put on ``Cabal`` dependency:
+    lower-bound is inferred from :pkg-field:`cabal-version`,
+    and the upper-bound is ``< 1.25``.
+
+    ``Cabal`` version is additionally restricted by GHC,
+    with absolute minimum being ``1.20``, and for example ``Custom``
+    builds with GHC-8.10 require at least ``Cabal-3.2``.
+
+
 Backward compatibility and ``custom-setup``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
@@ -2793,7 +3309,7 @@ The availability of the
 ``MIN_VERSION_package_(A,B,C)`` CPP macros
 inside ``Setup.hs`` scripts depends on the condition that either
 
-- a ``custom-setup`` section has been declared (or ``cabal new-build`` is being
+- a ``custom-setup`` section has been declared (or ``cabal v2-build`` is being
   used which injects an implicit hard-coded ``custom-setup`` stanza if it's missing), or
 - GHC 8.0 or later is used (which natively injects package version CPP macros)
 
@@ -2846,8 +3362,8 @@ is to distinguish ``Cabal < 2.0`` from ``Cabal >= 2.0``.
 
 
 
-Autogenerated modules
----------------------
+Autogenerated modules and includes
+----------------------------------
 
 Modules that are built automatically at setup, created with a custom
 setup script, must appear on :pkg-field:`other-modules` for the library,
@@ -2864,7 +3380,7 @@ complex build hooks for this poweruser case.
 .. pkg-field:: autogen-modules: module list
    :since: 2.0
 
-   .. TODO: document autogen-modules field
+   .. todo:: document autogen-modules field
 
 Right now :pkg-field:`executable:main-is` modules are not supported on
 :pkg-field:`autogen-modules`.
@@ -2891,6 +3407,13 @@ Right now :pkg-field:`executable:main-is` modules are not supported on
             MyExeHelperModule
         autogen-modules:
             MyExeHelperModule
+
+.. pkg-field:: autogen-includes: filename list
+   :since: 3.0
+
+   A list of header files from this package which are autogenerated
+   (e.g. by a ``configure`` script). Autogenerated header files are not
+   packaged by ``sdist`` command.
 
 Accessing data files from package code
 --------------------------------------
@@ -3230,3 +3753,13 @@ a few options:
 
 
 .. include:: references.inc
+
+.. rubric:: Footnotes
+
+.. [#old-style-build-tool-depends]
+
+  Some packages (ab)use :pkg-field:`build-depends` on old-style builds, but this has a few major drawbacks:
+
+    - using Nix-style builds it's considered an error if you depend on a exe-only package via build-depends: the solver will refuse it.
+    - it may or may not place the executable on ``$PATH``.
+    - it does not ensure the correct version of the package is installed, so you might end up overwriting versions with each other.

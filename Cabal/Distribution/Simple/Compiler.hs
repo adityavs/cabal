@@ -73,10 +73,10 @@ module Distribution.Simple.Compiler (
 
 import Prelude ()
 import Distribution.Compat.Prelude
+import Distribution.Pretty
 
 import Distribution.Compiler
 import Distribution.Version
-import Distribution.Text
 import Language.Haskell.Extension
 import Distribution.Simple.Utils
 
@@ -103,13 +103,14 @@ data Compiler = Compiler {
     deriving (Eq, Generic, Typeable, Show, Read)
 
 instance Binary Compiler
+instance Structured Compiler
 
 showCompilerId :: Compiler -> String
-showCompilerId = display . compilerId
+showCompilerId = prettyShow . compilerId
 
 showCompilerIdWithAbi :: Compiler -> String
 showCompilerIdWithAbi comp =
-  display (compilerId comp) ++
+  prettyShow (compilerId comp) ++
   case compilerAbiTag comp of
     NoAbiTag  -> []
     AbiTag xs -> '-':xs
@@ -171,9 +172,10 @@ compilerInfo c = CompilerInfo (compilerId c)
 data PackageDB = GlobalPackageDB
                | UserPackageDB
                | SpecificPackageDB FilePath
-    deriving (Eq, Generic, Ord, Show, Read)
+    deriving (Eq, Generic, Ord, Show, Read, Typeable)
 
 instance Binary PackageDB
+instance Structured PackageDB
 
 -- | We typically get packages from several databases, and stack them
 -- together. This type lets us be explicit about that stacking. For example
@@ -197,16 +199,17 @@ type PackageDBStack = [PackageDB]
 -- the top of the stack.
 --
 registrationPackageDB :: PackageDBStack -> PackageDB
-registrationPackageDB []  = error "internal error: empty package db set"
-registrationPackageDB dbs = last dbs
+registrationPackageDB dbs  = case safeLast dbs of
+  Nothing -> error "internal error: empty package db set"
+  Just p  -> p
 
 -- | Make package paths absolute
 
 
-absolutePackageDBPaths :: PackageDBStack -> NoCallStackIO PackageDBStack
+absolutePackageDBPaths :: PackageDBStack -> IO PackageDBStack
 absolutePackageDBPaths = traverse absolutePackageDBPath
 
-absolutePackageDBPath :: PackageDB -> NoCallStackIO PackageDB
+absolutePackageDBPath :: PackageDB -> IO PackageDB
 absolutePackageDBPath GlobalPackageDB        = return GlobalPackageDB
 absolutePackageDBPath UserPackageDB          = return UserPackageDB
 absolutePackageDBPath (SpecificPackageDB db) =
@@ -223,9 +226,10 @@ absolutePackageDBPath (SpecificPackageDB db) =
 data OptimisationLevel = NoOptimisation
                        | NormalOptimisation
                        | MaximumOptimisation
-    deriving (Bounded, Enum, Eq, Generic, Read, Show)
+    deriving (Bounded, Enum, Eq, Generic, Read, Show, Typeable)
 
 instance Binary OptimisationLevel
+instance Structured OptimisationLevel
 
 flagToOptimisationLevel :: Maybe String -> OptimisationLevel
 flagToOptimisationLevel Nothing  = NormalOptimisation
@@ -250,9 +254,10 @@ data DebugInfoLevel = NoDebugInfo
                     | MinimalDebugInfo
                     | NormalDebugInfo
                     | MaximalDebugInfo
-    deriving (Bounded, Enum, Eq, Generic, Read, Show)
+    deriving (Bounded, Enum, Eq, Generic, Read, Show, Typeable)
 
 instance Binary DebugInfoLevel
+instance Structured DebugInfoLevel
 
 flagToDebugInfoLevel :: Maybe String -> DebugInfoLevel
 flagToDebugInfoLevel Nothing  = NormalDebugInfo
@@ -374,7 +379,6 @@ profilingSupported comp =
   case compilerFlavor comp of
     GHC   -> True
     GHCJS -> True
-    LHC   -> True
     _     -> False
 
 -- | Utility function for GHC only features
@@ -406,9 +410,10 @@ data ProfDetailLevel = ProfDetailNone
                      | ProfDetailToplevelFunctions
                      | ProfDetailAllFunctions
                      | ProfDetailOther String
-    deriving (Eq, Generic, Read, Show)
+    deriving (Eq, Generic, Read, Show, Typeable)
 
 instance Binary ProfDetailLevel
+instance Structured ProfDetailLevel
 
 flagToProfDetailLevel :: String -> ProfDetailLevel
 flagToProfDetailLevel "" = ProfDetailDefault
@@ -437,4 +442,3 @@ showProfDetailLevel dl = case dl of
     ProfDetailToplevelFunctions -> "toplevel-functions"
     ProfDetailAllFunctions      -> "all-functions"
     ProfDetailOther other       -> other
-

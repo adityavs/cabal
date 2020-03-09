@@ -21,9 +21,9 @@ import Distribution.Client.Compat.Prelude
 import           Data.List (stripPrefix)
 import           Control.Monad (mapM)
 
-import           Distribution.Text
-import           Distribution.Compat.ReadP (ReadP, (<++), (+++))
-import qualified Distribution.Compat.ReadP as Parse
+import           Distribution.Deprecated.Text
+import           Distribution.Deprecated.ReadP (ReadP, (<++), (+++))
+import qualified Distribution.Deprecated.ReadP as Parse
 import qualified Text.PrettyPrint as Disp
 
 import           System.FilePath
@@ -61,6 +61,10 @@ instance Binary FilePathRoot
 instance Binary FilePathGlobRel
 instance Binary GlobPiece
 
+instance Structured FilePathGlob
+instance Structured FilePathRoot
+instance Structured FilePathGlobRel
+instance Structured GlobPiece
 
 -- | Check if a 'FilePathGlob' doesn't actually make use of any globbing and
 -- is in fact equivalent to a non-glob 'FilePath'.

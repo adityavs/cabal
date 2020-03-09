@@ -10,12 +10,10 @@ import Prelude ()
 import Distribution.Compat.Prelude
 import Distribution.Utils.ShortText
 
-import qualified Distribution.Compat.ReadP as Parse
-import qualified Distribution.Compat.CharParsing as P
-import Distribution.Text
 import Distribution.Pretty
-import Distribution.Parsec.Class
+import Distribution.Parsec
 
+import qualified Distribution.Compat.CharParsing as P
 import Text.PrettyPrint (text)
 
 -- | A 'ComponentId' uniquely identifies the transitive source
@@ -58,16 +56,13 @@ instance IsString ComponentId where
     fromString = mkComponentId
 
 instance Binary ComponentId
+instance Structured ComponentId
 
 instance Pretty ComponentId where
   pretty = text . unComponentId
 
 instance Parsec ComponentId where
   parsec = mkComponentId `fmap` P.munch1 abi_char
-   where abi_char c = isAlphaNum c || c `elem` "-_."
-
-instance Text ComponentId where
-  parse = mkComponentId `fmap` Parse.munch1 abi_char
    where abi_char c = isAlphaNum c || c `elem` "-_."
 
 instance NFData ComponentId where

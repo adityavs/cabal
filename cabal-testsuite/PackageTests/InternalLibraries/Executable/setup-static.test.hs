@@ -1,6 +1,7 @@
 import Test.Cabal.Prelude
 import Control.Monad.IO.Class
 import Control.Monad
+import Distribution.System (buildPlatform)
 import Distribution.Package
 import Distribution.Simple.Configure
 import Distribution.Simple.BuildPaths
@@ -28,7 +29,7 @@ main = setupAndCabalTest $ do
             lbi <- liftIO $ getPersistBuildConfig dist_dir
             let pkg_descr = localPkgDescr lbi
                 compiler_id = compilerId (compiler lbi)
-                cname = CSubLibName $ mkUnqualComponentName "foo-internal"
+                cname = CLibName $ LSubLibName $ mkUnqualComponentName "foo-internal"
                 [target] = componentNameTargets' pkg_descr lbi cname
                 uid = componentUnitId (targetCLBI target)
                 InstallDirs{libdir=dir,dynlibdir=dyndir} =
@@ -41,11 +42,11 @@ main = setupAndCabalTest $ do
               then
                 assertBool "dynamic library MUST be installed"
                     =<< liftIO (doesFileExist (dyndir </> mkSharedLibName
-                                               compiler_id uid))
+                                               buildPlatform compiler_id uid))
               else
                 assertBool "dynamic library should be installed"
                     =<< liftIO (doesFileExist (dyndir </> mkSharedLibName
-                                               compiler_id uid))
+                                               buildPlatform compiler_id uid))
             fails $ ghcPkg "describe" ["foo"]
             -- clean away the dist directory so that we catch accidental
             -- dependence on the inplace files

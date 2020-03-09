@@ -4,7 +4,6 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE TypeFamilies #-}
-{-# OPTIONS_GHC -fno-warn-orphans #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Client.Types
@@ -46,6 +45,11 @@ import Distribution.Types.PackageName
          ( PackageName, mkPackageName )
 import Distribution.Types.ComponentName
          ( ComponentName(..) )
+import Distribution.Types.LibraryName
+         ( LibraryName(..) )
+import Distribution.Client.SourceRepo
+         ( SourceRepoMaybe )
+import Distribution.Client.HashValue (showHashValue, hashValue, truncateHash)
 
 import Distribution.Solver.Types.PackageIndex
          ( PackageIndex )
@@ -59,15 +63,16 @@ import Distribution.Solver.Types.PackageConstraint
 import Distribution.Solver.Types.PackageFixedDeps
 import Distribution.Solver.Types.SourcePackage
 import Distribution.Compat.Graph (IsNode(..))
-import qualified Distribution.Compat.ReadP as Parse
-import Distribution.ParseUtils (parseOptCommaList)
-import Distribution.Simple.Utils (ordNub)
-import Distribution.Text (Text(..))
+import qualified Distribution.Deprecated.ReadP as Parse
+import Distribution.Deprecated.ParseUtils (parseOptCommaList)
+import Distribution.Simple.Utils (ordNub, toUTF8BS)
+import Distribution.Deprecated.Text (Text(..))
 
-import Network.URI (URI(..), URIAuth(..), nullURI)
-import Control.Exception
-         ( Exception, SomeException )
+import Network.URI (URI(..), nullURI)
+import Control.Exception (Exception, SomeException)
+
 import qualified Text.PrettyPrint as Disp
+import qualified Data.ByteString.Lazy.Char8 as LBS
 
 
 newtype Username = Username { unUsername :: String }
@@ -107,7 +112,7 @@ type InstalledPackageId = ComponentId
 -- final configure process will be independent of the environment.
 --
 -- 'ConfiguredPackage' is assumed to not support Backpack.  Only the
--- @new-build@ codepath supports Backpack.
+-- @v2-build@ codepath supports Backpack.
 --
 data ConfiguredPackage loc = ConfiguredPackage {
        confPkgId :: InstalledPackageId,
@@ -127,7 +132,7 @@ data ConfiguredPackage loc = ConfiguredPackage {
 -- 'ElaboratedPackage' and 'ElaboratedComponent'.
 --
 instance HasConfiguredId (ConfiguredPackage loc) where
-    configuredId pkg = ConfiguredId (packageId pkg) (Just CLibName) (confPkgId pkg)
+    configuredId pkg = ConfiguredId (packageId pkg) (Just (CLibName LMainLibName)) (confPkgId pkg)
 
 -- 'ConfiguredPackage' is the legacy codepath, we are guaranteed
 -- to never have a nontrivial 'UnitId'
@@ -168,6 +173,7 @@ annotatedIdToConfiguredId aid = ConfiguredId {
     }
 
 instance Binary ConfiguredId
+instance Structured ConfiguredId
 
 instance Show ConfiguredId where
   show cid = show (confInstId cid)
@@ -179,7 +185,7 @@ instance Package (ConfiguredPackage loc) where
   packageId cpkg = packageId (confPkgSource cpkg)
 
 instance HasMungedPackageId (ConfiguredPackage loc) where
-  mungedId cpkg = computeCompatPackageId (packageId cpkg) Nothing
+  mungedId cpkg = computeCompatPackageId (packageId cpkg) LMainLibName
 
 -- Never has nontrivial UnitId
 instance HasUnitId (ConfiguredPackage loc) where
@@ -234,9 +240,10 @@ data PackageSpecifier pkg =
      -- | A fully specified source package.
      --
    | SpecificSourcePackage pkg
-  deriving (Eq, Show, Generic)
+  deriving (Eq, Show, Functor, Generic)
 
 instance Binary pkg => Binary (PackageSpecifier pkg)
+instance Structured pkg => Structured (PackageSpecifier pkg)
 
 pkgSpecifierTarget :: Package pkg => PackageSpecifier pkg -> PackageName
 pkgSpecifierTarget (NamedPackage name _)       = name
@@ -282,23 +289,12 @@ data PackageLocation local =
     -- locally cached copy. ie a package available from hackage
   | RepoTarballPackage Repo PackageId local
 
---TODO:
---  * add support for darcs and other SCM style remote repos with a local cache
---  | ScmPackage
+    -- | A package available from a version control system source repository
+  | RemoteSourceRepoPackage SourceRepoMaybe local
   deriving (Show, Functor, Eq, Ord, Generic, Typeable)
 
 instance Binary local => Binary (PackageLocation local)
-
--- note, network-uri-2.6.0.3+ provide a Generic instance but earlier
--- versions do not, so we use manual Binary instances here
-instance Binary URI where
-  put (URI a b c d e) = do put a; put b; put c; put d; put e
-  get = do !a <- get; !b <- get; !c <- get; !d <- get; !e <- get
-           return (URI a b c d e)
-
-instance Binary URIAuth where
-  put (URIAuth a b c) = do put a; put b; put c
-  get = do !a <- get; !b <- get; !c <- get; return (URIAuth a b c)
+instance Structured local => Structured (PackageLocation local)
 
 data RemoteRepo =
     RemoteRepo {
@@ -331,10 +327,39 @@ data RemoteRepo =
   deriving (Show, Eq, Ord, Generic)
 
 instance Binary RemoteRepo
+instance Structured RemoteRepo
 
 -- | Construct a partial 'RemoteRepo' value to fold the field parser list over.
 emptyRemoteRepo :: String -> RemoteRepo
 emptyRemoteRepo name = RemoteRepo name nullURI Nothing [] 0 False
+
+-- | /no-index/ style local repositories.
+--
+-- https://github.com/haskell/cabal/issues/6359
+data LocalRepo = LocalRepo
+    { localRepoName        :: String
+    , localRepoPath        :: FilePath
+    , localRepoSharedCache :: Bool
+    }
+  deriving (Show, Eq, Ord, Generic)
+
+instance Binary LocalRepo
+instance Structured LocalRepo
+
+-- | Construct a partial 'LocalRepo' value to fold the field parser list over.
+emptyLocalRepo :: String -> LocalRepo
+emptyLocalRepo name = LocalRepo name "" False
+
+-- | Calculate a cache key for local-repo.
+--
+-- For remote repositories we just use name, but local repositories may
+-- all be named "local", so we add a bit of `localRepoPath` into the
+-- mix.
+localRepoCacheKey :: LocalRepo -> String
+localRepoCacheKey local = localRepoName local ++ "-" ++ hashPart where
+    hashPart
+        = showHashValue $ truncateHash 8 $ hashValue
+        $ LBS.fromStrict $ toUTF8BS $ localRepoPath local
 
 -- | Different kinds of repositories
 --
@@ -343,6 +368,14 @@ data Repo =
     -- | Local repositories
     RepoLocal {
         repoLocalDir :: FilePath
+      }
+  
+    -- | Local repository, without index.
+    --
+    -- https://github.com/haskell/cabal/issues/6359
+  | RepoLocalNoIndex
+      { repoLocal    :: LocalRepo
+      , repoLocalDir :: FilePath
       }
 
     -- | Standard (unsecured) remote repositores
@@ -366,17 +399,20 @@ data Repo =
   deriving (Show, Eq, Ord, Generic)
 
 instance Binary Repo
+instance Structured Repo
 
 -- | Check if this is a remote repo
 isRepoRemote :: Repo -> Bool
-isRepoRemote RepoLocal{} = False
-isRepoRemote _           = True
+isRepoRemote RepoLocal{}        = False
+isRepoRemote RepoLocalNoIndex{} = False
+isRepoRemote _                  = True
 
 -- | Extract @RemoteRepo@ from @Repo@ if remote.
 maybeRepoRemote :: Repo -> Maybe RemoteRepo
-maybeRepoRemote (RepoLocal    _localDir) = Nothing
-maybeRepoRemote (RepoRemote r _localDir) = Just r
-maybeRepoRemote (RepoSecure r _localDir) = Just r
+maybeRepoRemote (RepoLocal          _localDir) = Nothing
+maybeRepoRemote (RepoLocalNoIndex _ _localDir) = Nothing
+maybeRepoRemote (RepoRemote       r _localDir) = Just r
+maybeRepoRemote (RepoSecure       r _localDir) = Just r
 
 -- ------------------------------------------------------------
 -- * Build results
@@ -420,11 +456,10 @@ instance Binary BuildResult
 instance Binary DocsResult
 instance Binary TestsResult
 
---FIXME: this is a total cheat
-instance Binary SomeException where
-  put _ = return ()
-  get = fail "cannot serialise exceptions"
-
+instance Structured BuildFailure
+instance Structured BuildResult
+instance Structured DocsResult
+instance Structured TestsResult
 
 -- ------------------------------------------------------------
 -- * --allow-newer/--allow-older
@@ -551,6 +586,14 @@ instance Binary RelaxedDep
 instance Binary AllowNewer
 instance Binary AllowOlder
 
+instance Structured RelaxDeps
+instance Structured RelaxDepMod
+instance Structured RelaxDepScope
+instance Structured RelaxDepSubject
+instance Structured RelaxedDep
+instance Structured AllowNewer
+instance Structured AllowOlder
+
 -- | Return 'True' if 'RelaxDeps' specifies a non-empty set of relaxations
 --
 -- Equivalent to @isRelaxDeps = (/= 'mempty')@
@@ -588,3 +631,20 @@ instance Monoid AllowNewer where
 instance Monoid AllowOlder where
   mempty  = AllowOlder mempty
   mappend = (<>)
+
+-- ------------------------------------------------------------
+-- * --write-ghc-environment-file
+-- ------------------------------------------------------------
+
+-- | Whether 'v2-build' should write a .ghc.environment file after
+-- success. Possible values: 'always', 'never' (the default), 'ghc8.4.4+'
+-- (8.4.4 is the earliest version that supports
+-- '-package-env -').
+data WriteGhcEnvironmentFilesPolicy
+  = AlwaysWriteGhcEnvironmentFiles
+  | NeverWriteGhcEnvironmentFiles
+  | WriteGhcEnvironmentFilesOnlyForGhc844AndNewer
+  deriving (Eq, Enum, Bounded, Generic, Show)
+
+instance Binary WriteGhcEnvironmentFilesPolicy
+instance Structured WriteGhcEnvironmentFilesPolicy

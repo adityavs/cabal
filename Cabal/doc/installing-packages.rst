@@ -15,6 +15,10 @@ explicitly ask ``cabal`` to create it for you using
 
     $ cabal user-config update
 
+You can change the location of the global configuration file by specifying
+either ``--config-file=FILE`` on the command line or by setting the
+``CABAL_CONFIG`` environment variable.
+
 Most of the options in this configuration file are also available as
 command line arguments, and the corresponding documentation can be used
 to lookup their meaning. The created configuration file only specifies
@@ -37,10 +41,57 @@ executables by default, you would change this line to
 You can also use ``cabal user-config update`` to migrate configuration
 files created by older versions of ``cabal``.
 
+Environment variables
+---------------------
+
+Various environment variables affect ``cabal-install``.
+
+``CABAL_CONFIG``
+   The variable to find global configuration file.
+
+``CABAL_DIR``
+   Default content directory for ``cabal-install`` files.
+   Default value is ``getAppUserDataDirectory "cabal"``, which is
+   ``$HOME/.cabal`` on unix systems and ``%APPDATA%\cabal`` in Windows.
+
+   .. note::
+
+       The CABAL_DIR might be dropped in the future, when
+       ``cabal-install`` starts to use XDG Directory specification.
+
+``CABAL_BUILDDIR``
+    The override for default ``dist`` build directory.
+    Note, the nix-style builds build directory (``dist-newstyle``)
+    is not affected by this environment variable.
+
+``CABAL_SANDBOX_PACKAGE_PATH``
+   Variable related to deprecated sandbox functionality.
+
+``CABAL_SANDBOX_CONFIG``
+   Variable related to deprecated sandbox functionality.
+
+Configuration file discovery
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+1. If ``$CABAL_CONFIG`` is set use it,
+2. otherwise if ``$CABAL_DIR`` is set use ``$CABAL_DIR/config``
+3. otherwise use ``getAppUserDirectory "cabal"``
+
+If the configuration file doesn't exist ``cabal-install``
+will generate the default one, with directories based on
+``$CABAL_DIR`` (if set) or ``getAppUserDirectory "cabal"`` prefix.
+
+.. note:
+
+    If ``$CABAL_CONFIG`` is set, but the file doesn't exist,
+    one will be generated with ``$CABAL_DIR`` or ``getAppUserDirectory "cabal"``
+    based prefixes. In other words not the prefixes based on a
+    directory part of ``$CABAL_CONFIG`` path.
+
 Repository specification
 ------------------------
 
-An important part of the configuration if the specification of the
+An important part of the configuration is the specification of the
 repository. When ``cabal`` creates a default config file, it configures
 the repository to be the central Hackage server:
 
@@ -53,7 +104,7 @@ The name of the repository is given on the first line, and can be
 anything; packages downloaded from this repository will be cached under
 ``~/.cabal/packages/hackage.haskell.org`` (or whatever name you specify;
 you can change the prefix by changing the value of
-``remote-repo-cache``). If you want, you can configure multiple
+:cfg-field:`remote-repo-cache`). If you want, you can configure multiple
 repositories, and ``cabal`` will combine them and be able to download
 packages from any of them.
 
@@ -86,14 +137,44 @@ You can, but are not recommended to, omit these two fields. In that case
 ``cabal`` will download the ``root.json`` field and use it without
 verification. Although this bootstrapping step is then unsafe, all
 subsequent access is secure (provided that the downloaded ``root.json``
-was not tempered with). Of course, adding ``root-keys`` and
+was not tampered with). Of course, adding ``root-keys`` and
 ``key-threshold`` to your repository specification only shifts the
 problem, because now you somehow need to make sure that the key IDs you
 received were the right ones. How that is done is however outside the
 scope of ``cabal`` proper.
 
 More information about the security infrastructure can be found at
-https://github.com/well-typed/hackage-security.
+https://github.com/haskell/hackage-security.
+
+Local no-index repositories
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+It's possible to use a directory of `.tar.gz` package files as a local package
+repository.
+
+::
+
+    repository my-local-repository
+      url: file+noindex:///absolute/path/to/directory
+
+``cabal`` will construct the index automatically from the
+``package-name-version.tar.gz`` files in the directory, and will use optional
+corresponding ``package-name-version.cabal`` files as new revisions.
+
+The index is cached inside the given directory. If the directory is not
+writable, you can append ``#shared-cache`` fragment to the URI,
+then the cache will be stored inside the :cfg-field:`remote-repo-cache` directory.
+The part of the path will be used to determine the cache key part.
+
+.. note::
+    ``cabal-install`` creates a ``.cache`` file, and will aggressively use
+    it contents if it exists. Therefore if you change the contents of
+    the directory, remember to wipe the cache too.
+
+.. note::
+    The URI scheme ``file:`` is interpreted as a remote repository,
+    as described in the previous sections, thus requiring manual construction
+    of ``01-index.tar`` file.
 
 Legacy repositories
 ^^^^^^^^^^^^^^^^^^^
@@ -116,7 +197,7 @@ although, in (and only in) the specific case of Hackage, the URL
 ``http://hackage.haskell.org/packages/archive`` will be silently
 translated to ``http://hackage.haskell.org/``.
 
-The second kind of legacy repositories are so-called “local”
+The second kind of legacy repositories are so-called “(legacy) local”
 repositories:
 
 ::
@@ -231,6 +312,11 @@ Hackage_ web site.
 Developing with sandboxes
 -------------------------
 
+.. warning::
+
+   This functionality is deprecated.
+   Please migrate to use nix-style builds.
+
 By default, any dependencies of the package are installed into the
 global or user package databases (e.g. using
 ``cabal install --only-dependencies``). If you're building several
@@ -336,7 +422,7 @@ supported, via the ``-w`` option:
     $ cabal build
 
 It can be occasionally useful to run the compiler-specific package
-manager tool (e.g. ``ghc-pkg``) tool on the sandbox package DB directly
+manager tool (e.g. ``ghc-pkg``) on the sandbox package DB directly
 (for example, you may need to unregister some packages). The
 ``cabal sandbox hc-pkg`` command is a convenient wrapper that runs the
 compiler-specific package manager tool with the arguments:
@@ -470,9 +556,16 @@ passed the :option:`--with-hc-pkg`, :option:`--prefix`, :option:`--bindir`,
 :option:`--with-compiler` option is passed in a :option:`--with-hc-pkg` option
 and all options specified with :option:`--configure-option` are passed on.
 
+.. note::
+   `GNU autoconf places restrictions on paths, including the directory
+   that the package is built from.
+   <https://www.gnu.org/software/autoconf/manual/autoconf.html#File-System-Conventions>`_
+   The errors produced when this happens can be obscure; Cabal attempts to
+   detect and warn in this situation, but it is not perfect.
+
 In Cabal 2.0, support for a single positional argument was added to
-``setup configure`` This makes Cabal configure a the specific component
-to be configured. Specified names can be qualified with ``lib:`` or
+``setup configure`` This makes Cabal configure the specific component to
+be configured. Specified names can be qualified with ``lib:`` or
 ``exe:`` in case just a name is ambiguous (as would be the case for a
 package named ``p`` which has a library and an executable named ``p``.)
 This has the following effects:
@@ -1149,13 +1242,27 @@ Miscellaneous options
 
 .. option:: --enable-executable-dynamic
 
-    Link executables dynamically. The executable's library dependencies
-    should be built as shared objects. This implies :option:`--enable-shared`
+    Link dependent Haskell libraries into executables dynamically.
+    The executable's library dependencies must have been
+    built as shared objects. This implies :option:`--enable-shared`
     unless :option:`--disable-shared` is explicitly specified.
 
 .. option:: --disable-executable-dynamic
 
-   (default) Link executables statically.
+   (default) Link dependent Haskell libraries into executables statically.
+   Non-Haskell (C) libraries are still linked dynamically, including libc,
+   so the result is still not a fully static executable
+   unless :option:`--enable-executable-static` is given.
+
+.. option:: --enable-executable-static
+
+    Build fully static executables.
+    This link all dependent libraries into executables statically,
+    including libc.
+
+.. option:: --disable-executable-static
+
+   (default) Do not build fully static executables.
 
 .. option:: --configure-option=str
 
@@ -1203,7 +1310,8 @@ Miscellaneous options
 
     Specify that a particular dependency should used for a particular
     package name. In particular, it declares that any reference to
-    *pkgname* in a ``build-depends`` should be resolved to *ipid*.
+    *pkgname* in a :pkg-field:`build-depends` should be resolved to
+    *ipid*.
 
 .. option:: --exact-configuration
 
@@ -1289,8 +1397,8 @@ Miscellaneous options
 
         $ cabal install --constraint="bar == 2.1"
 
-    Version bounds have the same syntax as ``build-depends``. As
-    a special case, the following prevents ``bar`` from being
+    Version bounds have the same syntax as :pkg-field:`build-depends`.
+    As a special case, the following prevents ``bar`` from being
     used at all:
 
     ::
@@ -1329,11 +1437,11 @@ Miscellaneous options
         $ cabal install --constraint="bar test" --constraint="bar bench"
 
     By default, constraints only apply to build dependencies
-    (``build-depends``), build dependencies of build
+    (:pkg-field:`build-depends`), build dependencies of build
     dependencies, and so on. Constraints normally do not apply to
     dependencies of the ``Setup.hs`` script of any package
-    (``setup-depends``) nor do they apply to build tools
-    (``build-tool-depends``) or the dependencies of build
+    (:pkg-field:`setup-depends`) nor do they apply to build tools
+    (:pkg-field:`build-tool-depends`) or the dependencies of build
     tools. To explicitly apply a constraint to a setup or build
     tool dependency, you can add a qualifier to the constraint as
     follows:
@@ -1646,6 +1754,8 @@ This command takes the following options:
     Keeps the configuration information so it is not necessary to run
     the configure step again before building.
 
+.. _setup-test:
+
 setup test
 ----------
 
@@ -1690,7 +1800,34 @@ the package.
 
 .. option:: --test-option=option
 
-    give an extra option to the test executables. There is no need to
+    Give an extra option to the test executables. There is no need to
+    quote options containing spaces because a single option is assumed,
+    so options will not be split on spaces.
+
+.. option:: --test-wrapper=path
+
+   The wrapper script/application used to setup and tear down the test
+   execution context. The text executable path and test arguments are
+   passed as arguments to the wrapper and it is expected that the wrapper
+   will return the test's return code, as well as a copy of stdout/stderr.
+
+.. _setup-bench:
+
+setup bench
+-----------
+
+Run the benchmarks specified in the package description file. Aside
+from the following flags, Cabal accepts the name of one or more benchmarks
+on the command line after ``bench``. When supplied, Cabal will run
+only the named benchmarks, otherwise, Cabal will run all benchmarks in
+the package.
+
+.. option:: --benchmark-options=options
+    Give extra options to the benchmark executables.
+
+.. option:: --benchmark-option=option
+
+    Give an extra option to the benchmark executables. There is no need to
     quote options containing spaces because a single option is assumed,
     so options will not be split on spaces.
 

@@ -1,5 +1,6 @@
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE OverloadedStrings #-}
 
 module Distribution.Types.BuildType (
     BuildType(..),
@@ -11,11 +12,10 @@ import Distribution.Compat.Prelude
 
 import Distribution.CabalSpecVersion (CabalSpecVersion (..))
 import Distribution.Pretty
-import Distribution.Parsec.Class
-import Distribution.Text
+import Distribution.Parsec
+import Distribution.FieldGrammar.Described
 
 import qualified Distribution.Compat.CharParsing as P
-import qualified Distribution.Compat.ReadP as Parse
 import qualified Text.PrettyPrint as Disp
 
 -- | The type of build system used by this package.
@@ -29,7 +29,7 @@ data BuildType
                 deriving (Generic, Show, Read, Eq, Typeable, Data)
 
 instance Binary BuildType
-
+instance Structured BuildType
 instance NFData BuildType where rnf = genericRnf
 
 knownBuildTypes :: [BuildType]
@@ -48,20 +48,12 @@ instance Parsec BuildType where
       "Make"      -> return Make
       "Default"   -> do
           v <- askCabalSpecVersion
-          if v <= CabalSpecOld
+          if v <= CabalSpecV1_18 -- oldest version needing this, based on hackage-tests
           then do
               parsecWarning PWTBuildTypeDefault "build-type: Default is parsed as Custom for legacy reasons. See https://github.com/haskell/cabal/issues/5020"
               return Custom
           else fail ("unknown build-type: '" ++ name ++ "'")
       _           -> fail ("unknown build-type: '" ++ name ++ "'")
-
-instance Text BuildType where
-  parse = do
-    name <- Parse.munch1 isAlphaNum
-    case name of
-      "Simple"    -> return Simple
-      "Configure" -> return Configure
-      "Custom"    -> return Custom
-      "Make"      -> return Make
-      "Default"   -> return Custom
-      _           -> fail ("unknown build-type: '" ++ name ++ "'")
+      
+instance Described BuildType where
+    describe _ = REUnion ["Simple","Configure","Custom","Make","Default"]

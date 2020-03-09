@@ -2,6 +2,11 @@
 
 . ./travis-common.sh
 
+# Get the binaries
+S3_URL=$(curl -X POST "https://s3-bouncer.herokuapp.com/get/$(cat s3-object.txt)")
+curl "$S3_URL" > binaries.tgz
+tar xzf binaries.tgz
+
 # --hide-successes uses terminal control characters which mess up
 # Travis's log viewer.  So just print them all!
 TEST_OPTIONS=""
@@ -20,7 +25,12 @@ ln -s $TRAVIS_BUILD_DIR $UPSTREAM_BUILD_DIR
 (cd Cabal && timed ./parser-tests $TEST_OPTIONS) || exit $?
 
 # Test we can parse Hackage
-(cd Cabal && timed ./parser-hackage-tests $TEST_OPTIONS) | tail || exit $?
+# Note: no $TEST_OPTIONS as this isn't tasty suite
+
+# fetch 01-index.tar,
+# `hackage-tests parsec` tries to parse all of cabal files in the index.
+cabal update
+(cd Cabal && timed ./hackage-tests parsec) || exit $?
 
 if [ "x$CABAL_LIB_ONLY" = "xYES" ]; then
     exit 0;

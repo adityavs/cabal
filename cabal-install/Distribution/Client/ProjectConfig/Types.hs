@@ -20,35 +20,44 @@ module Distribution.Client.ProjectConfig.Types (
     MapMappend(..),
   ) where
 
+import Distribution.Client.Compat.Prelude
+import Prelude ()
+
 import Distribution.Client.Types
-         ( RemoteRepo, AllowNewer(..), AllowOlder(..) )
+         ( RemoteRepo, LocalRepo, AllowNewer(..), AllowOlder(..)
+         , WriteGhcEnvironmentFilesPolicy )
 import Distribution.Client.Dependency.Types
          ( PreSolver )
 import Distribution.Client.Targets
          ( UserConstraint )
 import Distribution.Client.BuildReports.Types
          ( ReportLevel(..) )
+import Distribution.Client.SourceRepo (SourceRepoList)
 
 import Distribution.Client.IndexUtils.Timestamp
          ( IndexState )
+
+import Distribution.Client.CmdInstall.ClientInstallFlags
+         ( ClientInstallFlags(..) )
 
 import Distribution.Solver.Types.Settings
 import Distribution.Solver.Types.ConstraintSource
 
 import Distribution.Package
          ( PackageName, PackageId, UnitId )
-import Distribution.Types.Dependency
+import Distribution.Types.PackageVersionConstraint
+         ( PackageVersionConstraint )
 import Distribution.Version
          ( Version )
 import Distribution.System
          ( Platform )
 import Distribution.PackageDescription
-         ( FlagAssignment, SourceRepo(..) )
+         ( FlagAssignment )
 import Distribution.Simple.Compiler
          ( Compiler, CompilerFlavor
          , OptimisationLevel(..), ProfDetailLevel, DebugInfoLevel(..) )
 import Distribution.Simple.Setup
-         ( Flag, HaddockTarget(..) )
+         ( Flag, HaddockTarget(..), TestShowDetails(..) )
 import Distribution.Simple.InstallDirs
          ( PathTemplate )
 import Distribution.Utils.NubList
@@ -56,14 +65,7 @@ import Distribution.Utils.NubList
 import Distribution.Verbosity
          ( Verbosity )
 
-import Data.Map (Map)
 import qualified Data.Map as Map
-import Data.Set (Set)
-import Distribution.Compat.Binary (Binary)
-import Distribution.Compat.Semigroup
-import GHC.Generics (Generic)
-import Data.Typeable
-
 
 -------------------------------
 -- Project config types
@@ -102,10 +104,10 @@ data ProjectConfig
        projectPackagesOptional      :: [String],
 
        -- | Packages in this project from remote source repositories.
-       projectPackagesRepo          :: [SourceRepo],
+       projectPackagesRepo          :: [SourceRepoList],
 
        -- | Packages in this project from hackage repositories.
-       projectPackagesNamed         :: [Dependency],
+       projectPackagesNamed         :: [PackageVersionConstraint],
 
        -- See respective types for an explanation of what these
        -- values are about:
@@ -148,7 +150,7 @@ data ProjectConfigBuildOnly
        projectConfigIgnoreExpiry          :: Flag Bool,
        projectConfigCacheDir              :: Flag FilePath,
        projectConfigLogsDir               :: Flag FilePath,
-       projectConfigStoreDir              :: Flag FilePath
+       projectConfigClientInstallFlags    :: ClientInstallFlags
      }
   deriving (Eq, Show, Generic)
 
@@ -177,20 +179,27 @@ data ProjectConfigShared
        -- configuration used both by the solver and other phases
        projectConfigRemoteRepos       :: NubList RemoteRepo,     -- ^ Available Hackage servers.
        projectConfigLocalRepos        :: NubList FilePath,
+       projectConfigLocalNoIndexRepos :: NubList LocalRepo,
        projectConfigIndexState        :: Flag IndexState,
+       projectConfigStoreDir          :: Flag FilePath,
 
        -- solver configuration
        projectConfigConstraints       :: [(UserConstraint, ConstraintSource)],
-       projectConfigPreferences       :: [Dependency],
+       projectConfigPreferences       :: [PackageVersionConstraint],
        projectConfigCabalVersion      :: Flag Version,  --TODO: [required eventually] unused
        projectConfigSolver            :: Flag PreSolver,
        projectConfigAllowOlder        :: Maybe AllowOlder,
        projectConfigAllowNewer        :: Maybe AllowNewer,
+       projectConfigWriteGhcEnvironmentFilesPolicy
+                                      :: Flag WriteGhcEnvironmentFilesPolicy,
        projectConfigMaxBackjumps      :: Flag Int,
        projectConfigReorderGoals      :: Flag ReorderGoals,
        projectConfigCountConflicts    :: Flag CountConflicts,
+       projectConfigFineGrainedConflicts :: Flag FineGrainedConflicts,
+       projectConfigMinimizeConflictSet :: Flag MinimizeConflictSet,
        projectConfigStrongFlags       :: Flag StrongFlags,
        projectConfigAllowBootLibInstalls :: Flag AllowBootLibInstalls,
+       projectConfigOnlyConstrained   :: Flag OnlyConstrained,
        projectConfigPerComponent      :: Flag Bool,
        projectConfigIndependentGoals  :: Flag IndependentGoals,
 
@@ -236,6 +245,7 @@ data PackageConfig
        packageConfigSharedLib           :: Flag Bool,
        packageConfigStaticLib           :: Flag Bool,
        packageConfigDynExe              :: Flag Bool,
+       packageConfigFullyStaticExe      :: Flag Bool,
        packageConfigProf                :: Flag Bool, --TODO: [code cleanup] sort out
        packageConfigProfLib             :: Flag Bool, --      this duplication
        packageConfigProfExe             :: Flag Bool, --      and consistency
@@ -260,6 +270,7 @@ data PackageConfig
        packageConfigDebugInfo           :: Flag DebugInfoLevel,
        packageConfigRunTests            :: Flag Bool, --TODO: [required eventually] use this
        packageConfigDocumentation       :: Flag Bool, --TODO: [required eventually] use this
+       -- Haddock options
        packageConfigHaddockHoogle       :: Flag Bool, --TODO: [required eventually] use this
        packageConfigHaddockHtml         :: Flag Bool, --TODO: [required eventually] use this
        packageConfigHaddockHtmlLocation :: Flag String, --TODO: [required eventually] use this
@@ -269,10 +280,21 @@ data PackageConfig
        packageConfigHaddockBenchmarks   :: Flag Bool, --TODO: [required eventually] use this
        packageConfigHaddockInternal     :: Flag Bool, --TODO: [required eventually] use this
        packageConfigHaddockCss          :: Flag FilePath, --TODO: [required eventually] use this
-       packageConfigHaddockHscolour     :: Flag Bool, --TODO: [required eventually] use this
+       packageConfigHaddockLinkedSource :: Flag Bool, --TODO: [required eventually] use this
+       packageConfigHaddockQuickJump    :: Flag Bool, --TODO: [required eventually] use this
        packageConfigHaddockHscolourCss  :: Flag FilePath, --TODO: [required eventually] use this
        packageConfigHaddockContents     :: Flag PathTemplate, --TODO: [required eventually] use this
-       packageConfigHaddockForHackage   :: Flag HaddockTarget
+       packageConfigHaddockForHackage   :: Flag HaddockTarget,
+       -- Test options
+       packageConfigTestHumanLog        :: Flag PathTemplate,
+       packageConfigTestMachineLog      :: Flag PathTemplate,
+       packageConfigTestShowDetails     :: Flag TestShowDetails,
+       packageConfigTestKeepTix         :: Flag Bool,
+       packageConfigTestWrapper         :: Flag FilePath,
+       packageConfigTestFailWhenNoTestSuites :: Flag Bool,
+       packageConfigTestTestOptions     :: [PathTemplate],
+       -- Benchmark options
+       packageConfigBenchmarkOptions    :: [PathTemplate]
      }
   deriving (Eq, Show, Generic)
 
@@ -282,11 +304,18 @@ instance Binary ProjectConfigShared
 instance Binary ProjectConfigProvenance
 instance Binary PackageConfig
 
+instance Structured ProjectConfig
+instance Structured ProjectConfigBuildOnly
+instance Structured ProjectConfigShared
+instance Structured ProjectConfigProvenance
+instance Structured PackageConfig
 
 -- | Newtype wrapper for 'Map' that provides a 'Monoid' instance that takes
 -- the last value rather than the first value for overlapping keys.
 newtype MapLast k v = MapLast { getMapLast :: Map k v }
   deriving (Eq, Show, Functor, Generic, Binary, Typeable)
+
+instance (Structured k, Structured v) => Structured (MapLast k v)
 
 instance Ord k => Monoid (MapLast k v) where
   mempty  = MapLast Map.empty
@@ -301,6 +330,8 @@ instance Ord k => Semigroup (MapLast k v) where
 -- 'mappend's values of overlapping keys rather than taking the first.
 newtype MapMappend k v = MapMappend { getMapMappend :: Map k v }
   deriving (Eq, Show, Functor, Generic, Binary, Typeable)
+
+instance (Structured k, Structured v) => Structured (MapMappend k v)
 
 instance (Semigroup v, Ord k) => Monoid (MapMappend k v) where
   mempty  = MapMappend Map.empty
@@ -358,8 +389,9 @@ data SolverSettings
    = SolverSettings {
        solverSettingRemoteRepos       :: [RemoteRepo],     -- ^ Available Hackage servers.
        solverSettingLocalRepos        :: [FilePath],
+       solverSettingLocalNoIndexRepos :: [LocalRepo],
        solverSettingConstraints       :: [(UserConstraint, ConstraintSource)],
-       solverSettingPreferences       :: [Dependency],
+       solverSettingPreferences       :: [PackageVersionConstraint],
        solverSettingFlagAssignment    :: FlagAssignment, -- ^ For all local packages
        solverSettingFlagAssignments   :: Map PackageName FlagAssignment,
        solverSettingCabalVersion      :: Maybe Version,  --TODO: [required eventually] unused
@@ -369,8 +401,11 @@ data SolverSettings
        solverSettingMaxBackjumps      :: Maybe Int,
        solverSettingReorderGoals      :: ReorderGoals,
        solverSettingCountConflicts    :: CountConflicts,
+       solverSettingFineGrainedConflicts :: FineGrainedConflicts,
+       solverSettingMinimizeConflictSet :: MinimizeConflictSet,
        solverSettingStrongFlags       :: StrongFlags,
        solverSettingAllowBootLibInstalls :: AllowBootLibInstalls,
+       solverSettingOnlyConstrained   :: OnlyConstrained,
        solverSettingIndexState        :: Maybe IndexState,
        solverSettingIndependentGoals  :: IndependentGoals
        -- Things that only make sense for manual mode, not --local mode
@@ -384,6 +419,7 @@ data SolverSettings
   deriving (Eq, Show, Generic, Typeable)
 
 instance Binary SolverSettings
+instance Structured SolverSettings
 
 
 -- | Resolved configuration for things that affect how we build and not the
@@ -414,6 +450,7 @@ data BuildTimeSettings
        buildSettingKeepTempFiles         :: Bool,
        buildSettingRemoteRepos           :: [RemoteRepo],
        buildSettingLocalRepos            :: [FilePath],
+       buildSettingLocalNoIndexRepos     :: [LocalRepo],
        buildSettingCacheDir              :: FilePath,
        buildSettingHttpTransport         :: Maybe String,
        buildSettingIgnoreExpiry          :: Bool,

@@ -16,6 +16,8 @@ module Distribution.Solver.Modular.Dependency (
   , FlaggedDep(..)
   , LDep(..)
   , Dep(..)
+  , PkgComponent(..)
+  , ExposedComponent(..)
   , DependencyReason(..)
   , showDependencyReason
   , flattenFlaggedDeps
@@ -30,14 +32,17 @@ module Distribution.Solver.Modular.Dependency (
   , QGoalReason
   , goalToVar
   , varToConflictSet
-  , goalReasonToCS
-  , dependencyReasonToCS
+  , goalReasonToConflictSet
+  , goalReasonToConflictSetWithConflict
+  , dependencyReasonToConflictSet
+  , dependencyReasonToConflictSetWithVersionConstraintConflict
+  , dependencyReasonToConflictSetWithVersionConflict
   ) where
 
 import Prelude ()
 import qualified Data.Map as M
 import qualified Data.Set as S
-import Distribution.Client.Compat.Prelude hiding (pi)
+import Distribution.Solver.Compat.Prelude hiding (pi)
 
 import Language.Haskell.Extension (Extension(..), Language(..))
 
@@ -50,6 +55,7 @@ import qualified Distribution.Solver.Modular.ConflictSet as CS
 
 import Distribution.Solver.Types.ComponentDeps (Component(..))
 import Distribution.Solver.Types.PackagePath
+import Distribution.Types.PkgconfigVersionRange
 import Distribution.Types.UnqualComponentName
 
 {-------------------------------------------------------------------------------
@@ -112,11 +118,21 @@ data LDep qpn = LDep (DependencyReason qpn) (Dep qpn)
 -- | A dependency (constraint) associates a package name with a constrained
 -- instance. It can also represent other types of dependencies, such as
 -- dependencies on language extensions.
-data Dep qpn = Dep (Maybe UnqualComponentName) qpn CI  -- ^ dependency on a package (possibly for executable)
-             | Ext  Extension                          -- ^ dependency on a language extension
-             | Lang Language                           -- ^ dependency on a language version
-             | Pkg  PkgconfigName VR                   -- ^ dependency on a pkg-config package
+data Dep qpn = Dep (PkgComponent qpn) CI  -- ^ dependency on a package component
+             | Ext Extension              -- ^ dependency on a language extension
+             | Lang Language              -- ^ dependency on a language version
+             | Pkg PkgconfigName PkgconfigVersionRange  -- ^ dependency on a pkg-config package
   deriving Functor
+
+-- | An exposed component within a package. This type is used to represent
+-- build-depends and build-tool-depends dependencies.
+data PkgComponent qpn = PkgComponent qpn ExposedComponent
+  deriving (Eq, Ord, Functor, Show)
+
+-- | A component that can be depended upon by another package, i.e., a library
+-- or an executable.
+data ExposedComponent = ExposedLib | ExposedExe UnqualComponentName
+  deriving (Eq, Ord, Show)
 
 -- | The reason that a dependency is active. It identifies the package and any
 -- flag and stanza choices that introduced the dependency. It contains
@@ -169,7 +185,7 @@ qualifyDeps QO{..} (Q pp@(PackagePath ns q) pn) = go
     -- Suppose package B has a setup dependency on package A.
     -- This will be recorded as something like
     --
-    -- > LDep (DependencyReason "B") (Dep Nothing "A" (Constrained AnyVersion))
+    -- > LDep (DependencyReason "B") (Dep (PkgComponent "A" ExposedLib) (Constrained AnyVersion))
     --
     -- Observe that when we qualify this dependency, we need to turn that
     -- @"A"@ into @"B-setup.A"@, but we should not apply that same qualifier
@@ -181,11 +197,12 @@ qualifyDeps QO{..} (Q pp@(PackagePath ns q) pn) = go
     goD (Ext  ext)    _    = Ext  ext
     goD (Lang lang)   _    = Lang lang
     goD (Pkg pkn vr)  _    = Pkg pkn vr
-    goD (Dep mExe dep ci) comp
-      | isJust mExe = Dep mExe (Q (PackagePath ns (QualExe   pn dep)) dep) ci
-      | qBase  dep  = Dep mExe (Q (PackagePath ns (QualBase  pn    )) dep) ci
-      | qSetup comp = Dep mExe (Q (PackagePath ns (QualSetup pn    )) dep) ci
-      | otherwise   = Dep mExe (Q (PackagePath ns inheritedQ        ) dep) ci
+    goD (Dep dep@(PkgComponent qpn (ExposedExe _)) ci) _ =
+        Dep (Q (PackagePath ns (QualExe pn qpn)) <$> dep) ci
+    goD (Dep dep@(PkgComponent qpn ExposedLib) ci) comp
+      | qBase qpn   = Dep (Q (PackagePath ns (QualBase  pn)) <$> dep) ci
+      | qSetup comp = Dep (Q (PackagePath ns (QualSetup pn)) <$> dep) ci
+      | otherwise   = Dep (Q (PackagePath ns inheritedQ    ) <$> dep) ci
 
     -- If P has a setup dependency on Q, and Q has a regular dependency on R, then
     -- we say that the 'Setup' qualifier is inherited: P has an (indirect) setup
@@ -265,14 +282,30 @@ goalToVar (Goal v _) = v
 varToConflictSet :: Var QPN -> ConflictSet
 varToConflictSet = CS.singleton
 
-goalReasonToCS :: GoalReason QPN -> ConflictSet
-goalReasonToCS UserGoal            = CS.empty
-goalReasonToCS (DependencyGoal dr) = dependencyReasonToCS dr
+-- | Convert a 'GoalReason' to a 'ConflictSet' that can be used when the goal
+-- leads to a conflict.
+goalReasonToConflictSet :: GoalReason QPN -> ConflictSet
+goalReasonToConflictSet UserGoal            = CS.empty
+goalReasonToConflictSet (DependencyGoal dr) = dependencyReasonToConflictSet dr
+
+-- | Convert a 'GoalReason' to a 'ConflictSet' containing the reason that the
+-- conflict occurred, namely the conflict set variables caused a conflict by
+-- introducing the given package goal. See the documentation for 'GoalConflict'.
+--
+-- This function currently only specifies the reason for the conflict in the
+-- simple case where the 'GoalReason' does not involve any flags or stanzas.
+-- Otherwise, it falls back to calling 'goalReasonToConflictSet'.
+goalReasonToConflictSetWithConflict :: QPN -> GoalReason QPN -> ConflictSet
+goalReasonToConflictSetWithConflict goal (DependencyGoal (DependencyReason qpn flags stanzas))
+  | M.null flags && S.null stanzas =
+      CS.singletonWithConflict (P qpn) $ CS.GoalConflict goal
+goalReasonToConflictSetWithConflict _    gr = goalReasonToConflictSet gr
 
 -- | This function returns the solver variables responsible for the dependency.
--- It drops the flag and stanza values, which are only needed for log messages.
-dependencyReasonToCS :: DependencyReason QPN -> ConflictSet
-dependencyReasonToCS (DependencyReason qpn flags stanzas) =
+-- It drops the values chosen for flag and stanza variables, which are only
+-- needed for log messages.
+dependencyReasonToConflictSet :: DependencyReason QPN -> ConflictSet
+dependencyReasonToConflictSet (DependencyReason qpn flags stanzas) =
     CS.fromList $ P qpn : flagVars ++ map stanzaToVar (S.toList stanzas)
   where
     -- Filter out any flags that introduced the dependency with both values.
@@ -283,3 +316,40 @@ dependencyReasonToCS (DependencyReason qpn flags stanzas) =
 
     stanzaToVar :: Stanza -> Var QPN
     stanzaToVar = S . SN qpn
+
+-- | Convert a 'DependencyReason' to a 'ConflictSet' specifying that the
+-- conflict occurred because the conflict set variables introduced a problematic
+-- version constraint. See the documentation for 'VersionConstraintConflict'.
+--
+-- This function currently only specifies the reason for the conflict in the
+-- simple case where the 'DependencyReason' does not involve any flags or
+-- stanzas. Otherwise, it falls back to calling 'dependencyReasonToConflictSet'.
+dependencyReasonToConflictSetWithVersionConstraintConflict :: QPN
+                                                           -> Ver
+                                                           -> DependencyReason QPN
+                                                           -> ConflictSet
+dependencyReasonToConflictSetWithVersionConstraintConflict
+    dependency excludedVersion dr@(DependencyReason qpn flags stanzas)
+  | M.null flags && S.null stanzas =
+    CS.singletonWithConflict (P qpn) $
+    CS.VersionConstraintConflict dependency excludedVersion
+  | otherwise = dependencyReasonToConflictSet dr
+
+-- | Convert a 'DependencyReason' to a 'ConflictSet' specifying that the
+-- conflict occurred because the conflict set variables introduced a version of
+-- a package that was excluded by a version constraint. See the documentation
+-- for 'VersionConflict'.
+--
+-- This function currently only specifies the reason for the conflict in the
+-- simple case where the 'DependencyReason' does not involve any flags or
+-- stanzas. Otherwise, it falls back to calling 'dependencyReasonToConflictSet'.
+dependencyReasonToConflictSetWithVersionConflict :: QPN
+                                                 -> CS.OrderedVersionRange
+                                                 -> DependencyReason QPN
+                                                 -> ConflictSet
+dependencyReasonToConflictSetWithVersionConflict
+    pkgWithVersionConstraint constraint dr@(DependencyReason qpn flags stanzas)
+  | M.null flags && S.null stanzas =
+    CS.singletonWithConflict (P qpn) $
+    CS.VersionConflict pkgWithVersionConstraint constraint
+  | otherwise = dependencyReasonToConflictSet dr

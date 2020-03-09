@@ -1,4 +1,10 @@
-{-# LANGUAGE CPP, RecordWildCards, NamedFieldPuns, DeriveDataTypeable #-}
+{-# LANGUAGE BangPatterns       #-}
+{-# LANGUAGE CPP                #-}
+{-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE DeriveGeneric      #-}
+{-# LANGUAGE LambdaCase         #-}
+{-# LANGUAGE NamedFieldPuns     #-}
+{-# LANGUAGE RecordWildCards    #-}
 
 -- | Handling project configuration.
 --
@@ -22,6 +28,8 @@ module Distribution.Client.ProjectConfig (
     readProjectConfig,
     readGlobalConfig,
     readProjectLocalFreezeConfig,
+    withProjectOrGlobalConfig,
+    withProjectOrGlobalConfigIgn,
     writeProjectLocalExtraConfig,
     writeProjectLocalFreezeConfig,
     writeProjectConfigFile,
@@ -33,7 +41,7 @@ module Distribution.Client.ProjectConfig (
     BadPackageLocation(..),
     BadPackageLocationMatch(..),
     findProjectPackages,
-    readSourcePackage,
+    fetchAndReadSourcePackages,
 
     -- * Resolving configuration
     lookupLocalPackageConfig,
@@ -57,6 +65,9 @@ import Distribution.Client.ProjectConfig.Legacy
 import Distribution.Client.RebuildMonad
 import Distribution.Client.Glob
          ( isTrivialFilePathGlob )
+import Distribution.Client.VCS
+         ( validateSourceRepos, SourceRepoProblem(..)
+         , VCS(..), knownVCSs, configureVCS, syncSourceRepos )
 
 import Distribution.Client.Types
 import Distribution.Client.DistDirLayout
@@ -67,6 +78,10 @@ import Distribution.Client.BuildReports.Types
          ( ReportLevel(..) )
 import Distribution.Client.Config
          ( loadConfig, getConfigFilePath )
+import Distribution.Client.HttpUtils
+         ( HttpTransport, configureTransport, transportCheckHttps
+         , downloadURI )
+import Distribution.Client.Utils.Parsec (renderParseError)
 
 import Distribution.Solver.Types.SourcePackage
 import Distribution.Solver.Types.Settings
@@ -75,13 +90,21 @@ import Distribution.Solver.Types.PackageConstraint
 
 import Distribution.Package
          ( PackageName, PackageId, packageId, UnitId )
-import Distribution.Types.Dependency
+import Distribution.Types.PackageVersionConstraint
+         ( PackageVersionConstraint(..) )
 import Distribution.System
          ( Platform )
-import Distribution.PackageDescription
-         ( SourceRepo(..) )
+import Distribution.Types.GenericPackageDescription
+         ( GenericPackageDescription )
 import Distribution.PackageDescription.Parsec
-         ( readGenericPackageDescription )
+         ( parseGenericPackageDescription )
+import Distribution.Fields
+         ( runParseResult, PError, PWarning, showPWarning)
+import Distribution.Pretty (prettyShow)
+import Distribution.Types.SourceRepo
+         ( RepoType(..) )
+import Distribution.Client.SourceRepo
+         ( SourceRepoList, SourceRepositoryPackage (..), srpFanOut )
 import Distribution.Simple.Compiler
          ( Compiler, compilerInfo )
 import Distribution.Simple.Program
@@ -95,27 +118,42 @@ import Distribution.Simple.InstallDirs
          ( PathTemplate, fromPathTemplate
          , toPathTemplate, substPathTemplate, initialPathTemplateEnv )
 import Distribution.Simple.Utils
-         ( die', warn )
+         ( die', warn, notice, info, createDirectoryIfMissingVerbose )
 import Distribution.Client.Utils
          ( determineNumJobs )
 import Distribution.Utils.NubList
          ( fromNubList )
 import Distribution.Verbosity
          ( Verbosity, modifyVerbosity, verbose )
-import Distribution.Text
-import Distribution.ParseUtils
+import Distribution.Version
+         ( Version )
+import Distribution.Deprecated.Text
+import qualified Distribution.Deprecated.ParseUtils as OldParser
          ( ParseResult(..), locatedErrorMsg, showPWarning )
+
+import qualified Codec.Archive.Tar       as Tar
+import qualified Codec.Archive.Tar.Entry as Tar
+import qualified Distribution.Client.Tar as Tar
+import qualified Distribution.Client.GZipUtils as GZipUtils
 
 import Control.Monad
 import Control.Monad.Trans (liftIO)
 import Control.Exception
 import Data.Either
+import qualified Data.ByteString       as BS
+import qualified Data.ByteString.Lazy  as LBS
 import qualified Data.Map as Map
-import Data.Set (Set)
+import qualified Data.List.NonEmpty as NE
 import qualified Data.Set as Set
+import qualified Data.Hashable as Hashable
+import Numeric (showHex)
+
 import System.FilePath hiding (combine)
+import System.IO
+         ( withBinaryFile, IOMode(ReadMode) )
 import System.Directory
-import Network.URI (URI(..), URIAuth(..), parseAbsoluteURI)
+import Network.URI
+         ( URI(..), URIAuth(..), parseAbsoluteURI, uriToString )
 
 
 ----------------------------------------
@@ -126,10 +164,10 @@ import Network.URI (URI(..), URIAuth(..), parseAbsoluteURI)
 -- 'PackageName'. This returns the configuration that applies to all local
 -- packages plus any package-specific configuration for this package.
 --
-lookupLocalPackageConfig :: (Semigroup a, Monoid a)
-                         => (PackageConfig -> a)
-                         -> ProjectConfig
-                         -> PackageName -> a
+lookupLocalPackageConfig
+  :: (Semigroup a, Monoid a)
+  => (PackageConfig -> a) -> ProjectConfig -> PackageName
+  -> a
 lookupLocalPackageConfig field ProjectConfig {
                            projectConfigLocalPackages,
                            projectConfigSpecificPackage
@@ -149,6 +187,7 @@ projectConfigWithBuilderRepoContext verbosity BuildTimeSettings{..} =
       verbosity
       buildSettingRemoteRepos
       buildSettingLocalRepos
+      buildSettingLocalNoIndexRepos
       buildSettingCacheDir
       buildSettingHttpTransport
       (Just buildSettingIgnoreExpiry)
@@ -160,10 +199,10 @@ projectConfigWithBuilderRepoContext verbosity BuildTimeSettings{..} =
 -- that doesn't have an http transport. And that avoids having to have access
 -- to the 'BuildTimeSettings'
 --
-projectConfigWithSolverRepoContext :: Verbosity
-                                   -> ProjectConfigShared
-                                   -> ProjectConfigBuildOnly
-                                   -> (RepoContext -> IO a) -> IO a
+projectConfigWithSolverRepoContext
+  :: Verbosity -> ProjectConfigShared -> ProjectConfigBuildOnly
+  -> (RepoContext -> IO a)
+  -> IO a
 projectConfigWithSolverRepoContext verbosity
                                    ProjectConfigShared{..}
                                    ProjectConfigBuildOnly{..} =
@@ -171,8 +210,11 @@ projectConfigWithSolverRepoContext verbosity
       verbosity
       (fromNubList projectConfigRemoteRepos)
       (fromNubList projectConfigLocalRepos)
-      (fromFlagOrDefault (error "projectConfigWithSolverRepoContext: projectConfigCacheDir")
-                         projectConfigCacheDir)
+      (fromNubList projectConfigLocalNoIndexRepos)
+      (fromFlagOrDefault
+                   (error
+                    "projectConfigWithSolverRepoContext: projectConfigCacheDir")
+                   projectConfigCacheDir)
       (flagToMaybe projectConfigHttpTransport)
       (flagToMaybe projectConfigIgnoreExpiry)
       (fromNubList projectConfigProgPathExtra)
@@ -193,6 +235,7 @@ resolveSolverSettings ProjectConfig{
     -- the flag assignments need checking.
     solverSettingRemoteRepos       = fromNubList projectConfigRemoteRepos
     solverSettingLocalRepos        = fromNubList projectConfigLocalRepos
+    solverSettingLocalNoIndexRepos = fromNubList projectConfigLocalNoIndexRepos
     solverSettingConstraints       = projectConfigConstraints
     solverSettingPreferences       = projectConfigPreferences
     solverSettingFlagAssignment    = packageConfigFlagAssignment projectConfigLocalPackages
@@ -207,8 +250,11 @@ resolveSolverSettings ProjectConfig{
                                          | otherwise -> Just n
     solverSettingReorderGoals      = fromFlag projectConfigReorderGoals
     solverSettingCountConflicts    = fromFlag projectConfigCountConflicts
+    solverSettingFineGrainedConflicts = fromFlag projectConfigFineGrainedConflicts
+    solverSettingMinimizeConflictSet = fromFlag projectConfigMinimizeConflictSet
     solverSettingStrongFlags       = fromFlag projectConfigStrongFlags
     solverSettingAllowBootLibInstalls = fromFlag projectConfigAllowBootLibInstalls
+    solverSettingOnlyConstrained   = fromFlag projectConfigOnlyConstrained
     solverSettingIndexState        = flagToMaybe projectConfigIndexState
     solverSettingIndependentGoals  = fromFlag projectConfigIndependentGoals
   --solverSettingShadowPkgs        = fromFlag projectConfigShadowPkgs
@@ -226,8 +272,11 @@ resolveSolverSettings ProjectConfig{
        projectConfigMaxBackjumps      = Flag defaultMaxBackjumps,
        projectConfigReorderGoals      = Flag (ReorderGoals False),
        projectConfigCountConflicts    = Flag (CountConflicts True),
+       projectConfigFineGrainedConflicts = Flag (FineGrainedConflicts True),
+       projectConfigMinimizeConflictSet = Flag (MinimizeConflictSet False),
        projectConfigStrongFlags       = Flag (StrongFlags False),
        projectConfigAllowBootLibInstalls = Flag (AllowBootLibInstalls False),
+       projectConfigOnlyConstrained   = Flag OnlyConstrainedNone,
        projectConfigIndependentGoals  = Flag (IndependentGoals False)
      --projectConfigShadowPkgs        = Flag False,
      --projectConfigReinstall         = Flag False,
@@ -252,6 +301,7 @@ resolveBuildTimeSettings verbosity
                            projectConfigShared = ProjectConfigShared {
                              projectConfigRemoteRepos,
                              projectConfigLocalRepos,
+                             projectConfigLocalNoIndexRepos,
                              projectConfigProgPathExtra
                            },
                            projectConfigBuildOnly
@@ -272,6 +322,7 @@ resolveBuildTimeSettings verbosity
     buildSettingKeepTempFiles = fromFlag    projectConfigKeepTempFiles
     buildSettingRemoteRepos   = fromNubList projectConfigRemoteRepos
     buildSettingLocalRepos    = fromNubList projectConfigLocalRepos
+    buildSettingLocalNoIndexRepos = fromNubList projectConfigLocalNoIndexRepos
     buildSettingCacheDir      = fromFlag    projectConfigCacheDir
     buildSettingHttpTransport = flagToMaybe projectConfigHttpTransport
     buildSettingIgnoreExpiry  = fromFlag    projectConfigIgnoreExpiry
@@ -411,45 +462,81 @@ renderBadProjectRoot :: BadProjectRoot -> String
 renderBadProjectRoot (BadProjectRootExplicitFile projectFile) =
     "The given project file '" ++ projectFile ++ "' does not exist."
 
+-- | Like 'withProjectOrGlobalConfig', with an additional boolean
+-- which tells to ignore local project.
+--
+-- Used to implement -z / --ignore-project behaviour
+--
+withProjectOrGlobalConfigIgn
+    :: Bool -- ^ whether to ignore local project
+    -> Verbosity
+    -> Flag FilePath
+    -> IO a
+    -> (ProjectConfig -> IO a)
+    -> IO a
+withProjectOrGlobalConfigIgn True  verbosity gcf _with without = do
+    globalConfig <- runRebuild "" $ readGlobalConfig verbosity gcf
+    without globalConfig
+withProjectOrGlobalConfigIgn False verbosity gcf with without =
+    withProjectOrGlobalConfig verbosity gcf with without
+
+withProjectOrGlobalConfig :: Verbosity
+                          -> Flag FilePath
+                          -> IO a
+                          -> (ProjectConfig -> IO a)
+                          -> IO a
+withProjectOrGlobalConfig verbosity globalConfigFlag with without = do
+  globalConfig <- runRebuild "" $ readGlobalConfig verbosity globalConfigFlag
+
+  let
+    res' = catch with
+      $ \case
+        (BadPackageLocations prov locs)
+          | prov == Set.singleton Implicit
+          , let
+            isGlobErr (BadLocGlobEmptyMatch _) = True
+            isGlobErr _ = False
+          , any isGlobErr locs ->
+            without globalConfig
+        err -> throwIO err
+
+  catch res'
+    $ \case
+      (BadProjectRootExplicitFile "") -> without globalConfig
+      err -> throwIO err
 
 -- | Read all the config relevant for a project. This includes the project
 -- file if any, plus other global config.
 --
-readProjectConfig :: Verbosity -> Flag FilePath -> DistDirLayout -> Rebuild ProjectConfig
+readProjectConfig :: Verbosity
+                  -> Flag FilePath
+                  -> DistDirLayout
+                  -> Rebuild ProjectConfig
 readProjectConfig verbosity configFileFlag distDirLayout = do
-    global <- readGlobalConfig             verbosity configFileFlag
-    local  <- readProjectLocalConfig       verbosity distDirLayout
-    freeze <- readProjectLocalFreezeConfig verbosity distDirLayout
-    extra  <- readProjectLocalExtraConfig  verbosity distDirLayout
+    global <- readGlobalConfig                verbosity configFileFlag
+    local  <- readProjectLocalConfigOrDefault verbosity distDirLayout
+    freeze <- readProjectLocalFreezeConfig    verbosity distDirLayout
+    extra  <- readProjectLocalExtraConfig     verbosity distDirLayout
     return (global <> local <> freeze <> extra)
 
 
 -- | Reads an explicit @cabal.project@ file in the given project root dir,
 -- or returns the default project config for an implicitly defined project.
 --
-readProjectLocalConfig :: Verbosity -> DistDirLayout -> Rebuild ProjectConfig
-readProjectLocalConfig verbosity DistDirLayout{distProjectFile} = do
+readProjectLocalConfigOrDefault :: Verbosity
+                                -> DistDirLayout
+                                -> Rebuild ProjectConfig
+readProjectLocalConfigOrDefault verbosity distDirLayout = do
   usesExplicitProjectRoot <- liftIO $ doesFileExist projectFile
   if usesExplicitProjectRoot
     then do
-      monitorFiles [monitorFileHashed projectFile]
-      addProjectFileProvenance <$> liftIO readProjectFile
+      readProjectFile verbosity distDirLayout "" "project file"
     else do
       monitorFiles [monitorNonExistentFile projectFile]
       return defaultImplicitProjectConfig
 
   where
-    projectFile = distProjectFile ""
-    readProjectFile =
-          reportParseResult verbosity "project file" projectFile
-        . parseProjectConfig
-      =<< readFile projectFile
-
-    addProjectFileProvenance config =
-      config {
-        projectConfigProvenance =
-          Set.insert (Explicit projectFile) (projectConfigProvenance config)
-      }
+    projectFile = distProjectFile distDirLayout ""
 
     defaultImplicitProjectConfig :: ProjectConfig
     defaultImplicitProjectConfig =
@@ -470,7 +557,7 @@ readProjectLocalConfig verbosity DistDirLayout{distProjectFile} = do
 readProjectLocalExtraConfig :: Verbosity -> DistDirLayout
                             -> Rebuild ProjectConfig
 readProjectLocalExtraConfig verbosity distDirLayout =
-    readProjectExtensionFile verbosity distDirLayout "local"
+    readProjectFile verbosity distDirLayout "local"
                              "project local configuration file"
 
 -- | Reads a @cabal.project.freeze@ file in the given project root dir,
@@ -480,19 +567,22 @@ readProjectLocalExtraConfig verbosity distDirLayout =
 readProjectLocalFreezeConfig :: Verbosity -> DistDirLayout
                              -> Rebuild ProjectConfig
 readProjectLocalFreezeConfig verbosity distDirLayout =
-    readProjectExtensionFile verbosity distDirLayout "freeze"
+    readProjectFile verbosity distDirLayout "freeze"
                              "project freeze file"
 
 -- | Reads a named config file in the given project root dir, or returns empty.
 --
-readProjectExtensionFile :: Verbosity -> DistDirLayout -> String -> FilePath
-                         -> Rebuild ProjectConfig
-readProjectExtensionFile verbosity DistDirLayout{distProjectFile}
+readProjectFile :: Verbosity
+                -> DistDirLayout
+                -> String
+                -> String
+                -> Rebuild ProjectConfig
+readProjectFile verbosity DistDirLayout{distProjectFile}
                          extensionName extensionDescription = do
     exists <- liftIO $ doesFileExist extensionFile
     if exists
       then do monitorFiles [monitorFileHashed extensionFile]
-              liftIO readExtensionFile
+              addProjectFileProvenance <$> liftIO readExtensionFile
       else do monitorFiles [monitorNonExistentFile extensionFile]
               return mempty
   where
@@ -503,13 +593,19 @@ readProjectExtensionFile verbosity DistDirLayout{distProjectFile}
         . parseProjectConfig
       =<< readFile extensionFile
 
+    addProjectFileProvenance config =
+      config {
+        projectConfigProvenance =
+          Set.insert (Explicit extensionFile) (projectConfigProvenance config)
+      }
+
 
 -- | Parse the 'ProjectConfig' format.
 --
 -- For the moment this is implemented in terms of parsers for legacy
 -- configuration types, plus a conversion.
 --
-parseProjectConfig :: String -> ParseResult ProjectConfig
+parseProjectConfig :: String -> OldParser.ParseResult ProjectConfig
 parseProjectConfig content =
     convertLegacyProjectConfig <$>
       parseLegacyProjectConfig content
@@ -555,20 +651,20 @@ readGlobalConfig verbosity configFileFlag = do
     monitorFiles [monitorFileHashed configFile]
     return (convertLegacyGlobalConfig config)
 
-reportParseResult :: Verbosity -> String -> FilePath -> ParseResult a -> IO a
-reportParseResult verbosity _filetype filename (ParseOk warnings x) = do
+reportParseResult :: Verbosity -> String -> FilePath -> OldParser.ParseResult a -> IO a
+reportParseResult verbosity _filetype filename (OldParser.ParseOk warnings x) = do
     unless (null warnings) $
-      let msg = unlines (map (showPWarning filename) warnings)
+      let msg = unlines (map (OldParser.showPWarning filename) warnings)
        in warn verbosity msg
     return x
-reportParseResult verbosity filetype filename (ParseFailed err) =
-    let (line, msg) = locatedErrorMsg err
+reportParseResult verbosity filetype filename (OldParser.ParseFailed err) =
+    let (line, msg) = OldParser.locatedErrorMsg err
      in die' verbosity $ "Error parsing " ++ filetype ++ " " ++ filename
            ++ maybe "" (\n -> ':' : show n) line ++ ":\n" ++ msg
 
 
 ---------------------------------------------
--- Reading packages in the project
+-- Finding packages in the project
 --
 
 -- | The location of a package as part of a project. Local file paths are
@@ -580,8 +676,8 @@ data ProjectPackageLocation =
    | ProjectPackageLocalDirectory FilePath FilePath -- dir and .cabal file
    | ProjectPackageLocalTarball   FilePath
    | ProjectPackageRemoteTarball  URI
-   | ProjectPackageRemoteRepo     SourceRepo
-   | ProjectPackageNamed          Dependency
+   | ProjectPackageRemoteRepo     SourceRepoList
+   | ProjectPackageNamed          PackageVersionConstraint
   deriving Show
 
 
@@ -885,35 +981,436 @@ mplusMaybeT ma mb = do
     Just x  -> return (Just x)
 
 
--- | Read the @.cabal@ file of the given package.
+-------------------------------------------------
+-- Fetching and reading packages in the project
+--
+
+-- | Read the @.cabal@ files for a set of packages. For remote tarballs and
+-- VCS source repos this also fetches them if needed.
 --
 -- Note here is where we convert from project-root relative paths to absolute
 -- paths.
 --
-readSourcePackage :: Verbosity -> ProjectPackageLocation
-                  -> Rebuild (PackageSpecifier UnresolvedSourcePackage)
-readSourcePackage verbosity (ProjectPackageLocalCabalFile cabalFile) =
-    readSourcePackage verbosity (ProjectPackageLocalDirectory dir cabalFile)
-  where
-    dir = takeDirectory cabalFile
+fetchAndReadSourcePackages
+  :: Verbosity
+  -> DistDirLayout
+  -> ProjectConfigShared
+  -> ProjectConfigBuildOnly
+  -> [ProjectPackageLocation]
+  -> Rebuild [PackageSpecifier (SourcePackage UnresolvedPkgLoc)]
+fetchAndReadSourcePackages verbosity distDirLayout
+                           projectConfigShared
+                           projectConfigBuildOnly
+                           pkgLocations = do
 
-readSourcePackage verbosity (ProjectPackageLocalDirectory dir cabalFile) = do
+    pkgsLocalDirectory <-
+      sequence
+        [ readSourcePackageLocalDirectory verbosity dir cabalFile
+        | location <- pkgLocations
+        , (dir, cabalFile) <- projectPackageLocal location ]
+
+    pkgsLocalTarball <-
+      sequence
+        [ readSourcePackageLocalTarball verbosity path
+        | ProjectPackageLocalTarball path <- pkgLocations ]
+
+    pkgsRemoteTarball <- do
+      getTransport <- delayInitSharedResource $
+                      configureTransport verbosity progPathExtra
+                                         preferredHttpTransport
+      sequence
+        [ fetchAndReadSourcePackageRemoteTarball verbosity distDirLayout
+                                                 getTransport uri
+        | ProjectPackageRemoteTarball uri <- pkgLocations ]
+
+    pkgsRemoteRepo <-
+      syncAndReadSourcePackagesRemoteRepos
+        verbosity distDirLayout
+        projectConfigShared
+        [ repo | ProjectPackageRemoteRepo repo <- pkgLocations ]
+
+    let pkgsNamed =
+          [ NamedPackage pkgname [PackagePropertyVersion verrange]
+          | ProjectPackageNamed (PackageVersionConstraint pkgname verrange) <- pkgLocations ]
+
+    return $ concat
+      [ pkgsLocalDirectory
+      , pkgsLocalTarball
+      , pkgsRemoteTarball
+      , pkgsRemoteRepo
+      , pkgsNamed
+      ]
+  where
+    projectPackageLocal (ProjectPackageLocalDirectory dir file) = [(dir, file)]
+    projectPackageLocal (ProjectPackageLocalCabalFile     file) = [(dir, file)]
+                                                where dir = takeDirectory file
+    projectPackageLocal _ = []
+
+    progPathExtra = fromNubList (projectConfigProgPathExtra projectConfigShared)
+    preferredHttpTransport =
+      flagToMaybe (projectConfigHttpTransport projectConfigBuildOnly)
+
+-- | A helper for 'fetchAndReadSourcePackages' to handle the case of
+-- 'ProjectPackageLocalDirectory' and 'ProjectPackageLocalCabalFile'.
+-- We simply read the @.cabal@ file.
+--
+readSourcePackageLocalDirectory
+  :: Verbosity
+  -> FilePath  -- ^ The package directory
+  -> FilePath  -- ^ The package @.cabal@ file
+  -> Rebuild (PackageSpecifier (SourcePackage UnresolvedPkgLoc))
+readSourcePackageLocalDirectory verbosity dir cabalFile = do
     monitorFiles [monitorFileHashed cabalFile]
     root <- askRoot
-    pkgdesc <- liftIO $ readGenericPackageDescription verbosity (root </> cabalFile)
-    return $ SpecificSourcePackage SourcePackage {
-      packageInfoId        = packageId pkgdesc,
-      packageDescription   = pkgdesc,
-      packageSource        = LocalUnpackedPackage (root </> dir),
+    let location = LocalUnpackedPackage (root </> dir)
+    liftIO $ fmap (mkSpecificSourcePackage location)
+           . readSourcePackageCabalFile verbosity cabalFile
+         =<< BS.readFile (root </> cabalFile)
+
+
+-- | A helper for 'fetchAndReadSourcePackages' to handle the case of
+-- 'ProjectPackageLocalTarball'. We scan through the @.tar.gz@ file to find
+-- the @.cabal@ file and read that.
+--
+readSourcePackageLocalTarball
+  :: Verbosity
+  -> FilePath
+  -> Rebuild (PackageSpecifier (SourcePackage UnresolvedPkgLoc))
+readSourcePackageLocalTarball verbosity tarballFile = do
+    monitorFiles [monitorFile tarballFile]
+    root <- askRoot
+    let location = LocalTarballPackage (root </> tarballFile)
+    liftIO $ fmap (mkSpecificSourcePackage location)
+           . uncurry (readSourcePackageCabalFile verbosity)
+         =<< extractTarballPackageCabalFile (root </> tarballFile)
+
+-- | A helper for 'fetchAndReadSourcePackages' to handle the case of
+-- 'ProjectPackageRemoteTarball'. We download the tarball to the dist src dir
+-- and after that handle it like the local tarball case.
+--
+fetchAndReadSourcePackageRemoteTarball
+  :: Verbosity
+  -> DistDirLayout
+  -> Rebuild HttpTransport
+  -> URI
+  -> Rebuild (PackageSpecifier (SourcePackage UnresolvedPkgLoc))
+fetchAndReadSourcePackageRemoteTarball verbosity
+                                       DistDirLayout {
+                                         distDownloadSrcDirectory
+                                       }
+                                       getTransport
+                                       tarballUri =
+    -- The tarball download is expensive so we use another layer of file
+    -- monitor to avoid it whenever possible.
+    rerunIfChanged verbosity monitor tarballUri $ do
+
+      -- Download
+      transport <- getTransport
+      liftIO $ do
+        transportCheckHttps verbosity transport tarballUri
+        notice verbosity ("Downloading " ++ show tarballUri)
+        createDirectoryIfMissingVerbose verbosity True
+                                        distDownloadSrcDirectory
+        _ <- downloadURI transport verbosity tarballUri tarballFile
+        return ()
+
+      -- Read
+      monitorFiles [monitorFile tarballFile]
+      let location = RemoteTarballPackage tarballUri tarballFile
+      liftIO $ fmap (mkSpecificSourcePackage location)
+             . uncurry (readSourcePackageCabalFile verbosity)
+           =<< extractTarballPackageCabalFile tarballFile
+  where
+    tarballStem = distDownloadSrcDirectory
+              </> localFileNameForRemoteTarball tarballUri
+    tarballFile = tarballStem <.> "tar.gz"
+
+    monitor :: FileMonitor URI (PackageSpecifier (SourcePackage UnresolvedPkgLoc))
+    monitor = newFileMonitor (tarballStem <.> "cache")
+
+
+-- | A helper for 'fetchAndReadSourcePackages' to handle all the cases of
+-- 'ProjectPackageRemoteRepo'.
+--
+syncAndReadSourcePackagesRemoteRepos
+  :: Verbosity
+  -> DistDirLayout
+  -> ProjectConfigShared
+  -> [SourceRepoList]
+  -> Rebuild [PackageSpecifier (SourcePackage UnresolvedPkgLoc)]
+syncAndReadSourcePackagesRemoteRepos verbosity
+                                     DistDirLayout{distDownloadSrcDirectory}
+                                     ProjectConfigShared {
+                                       projectConfigProgPathExtra
+                                     }
+                                    repos = do
+
+    repos' <- either reportSourceRepoProblems return $
+              validateSourceRepos repos
+
+    -- All 'SourceRepo's grouped by referring to the "same" remote repo
+    -- instance. So same location but can differ in commit/tag/branch/subdir.
+    let reposByLocation :: Map (RepoType, String)
+                               [(SourceRepoList, RepoType)]
+        reposByLocation = Map.fromListWith (++)
+                            [ ((rtype, rloc), [(repo, vcsRepoType vcs)])
+                            | (repo, rloc, rtype, vcs) <- repos' ]
+
+    --TODO: pass progPathExtra on to 'configureVCS'
+    let _progPathExtra = fromNubList projectConfigProgPathExtra
+    getConfiguredVCS <- delayInitSharedResources $ \repoType ->
+                          let vcs = Map.findWithDefault (error $ "Unknown VCS: " ++ prettyShow repoType) repoType knownVCSs in
+                          configureVCS verbosity {-progPathExtra-} vcs
+
+    concat <$> sequence
+      [ rerunIfChanged verbosity monitor repoGroup' $ do
+          vcs' <- getConfiguredVCS repoType
+          syncRepoGroupAndReadSourcePackages vcs' pathStem repoGroup'
+      | repoGroup@((primaryRepo, repoType):_) <- Map.elems reposByLocation
+      , let repoGroup' = map fst repoGroup
+            pathStem = distDownloadSrcDirectory
+                   </> localFileNameForRemoteRepo primaryRepo
+            monitor :: FileMonitor
+                         [SourceRepoList]
+                         [PackageSpecifier (SourcePackage UnresolvedPkgLoc)]
+            monitor  = newFileMonitor (pathStem <.> "cache")
+      ]
+  where
+    syncRepoGroupAndReadSourcePackages
+      :: VCS ConfiguredProgram
+      -> FilePath
+      -> [SourceRepoList]
+      -> Rebuild [PackageSpecifier (SourcePackage UnresolvedPkgLoc)]
+    syncRepoGroupAndReadSourcePackages vcs pathStem repoGroup = do
+        liftIO $ createDirectoryIfMissingVerbose verbosity False
+                                                 distDownloadSrcDirectory
+
+        -- For syncing we don't care about different 'SourceRepo' values that
+        -- are just different subdirs in the same repo.
+        syncSourceRepos verbosity vcs
+          [ (repo, repoPath)
+          | (repo, _, repoPath) <- repoGroupWithPaths ]
+
+        -- But for reading we go through each 'SourceRepo' including its subdir
+        -- value and have to know which path each one ended up in.
+        sequence
+          [ readPackageFromSourceRepo repoWithSubdir repoPath
+          | (_, reposWithSubdir, repoPath) <- repoGroupWithPaths
+          , repoWithSubdir <- NE.toList reposWithSubdir ]
+      where
+        -- So to do both things above, we pair them up here.
+        repoGroupWithPaths
+          :: [(SourceRepositoryPackage Proxy, NonEmpty (SourceRepositoryPackage Maybe), FilePath)]
+        repoGroupWithPaths =
+          zipWith (\(x, y) z -> (x,y,z))
+                  (mapGroup
+                      [ (repo { srpSubdir = Proxy }, repo)
+                      | repo <- foldMap (NE.toList . srpFanOut) repoGroup
+                      ])
+                  repoPaths
+
+        mapGroup :: Ord k => [(k, v)] -> [(k, NonEmpty v)]
+        mapGroup = Map.toList . Map.fromListWith (<>) . map (\(k, v) -> (k, pure v))
+
+        -- The repos in a group are given distinct names by simple enumeration
+        -- foo, foo-2, foo-3 etc
+        repoPaths :: [FilePath]
+        repoPaths = pathStem
+                  : [ pathStem ++ "-" ++ show (i :: Int) | i <- [2..] ]
+
+    readPackageFromSourceRepo
+        :: SourceRepositoryPackage Maybe -> FilePath
+        -> Rebuild (PackageSpecifier (SourcePackage UnresolvedPkgLoc))
+    readPackageFromSourceRepo repo repoPath = do
+        let packageDir = maybe repoPath (repoPath </>) (srpSubdir repo)
+        entries <- liftIO $ getDirectoryContents packageDir
+        --TODO: wrap exceptions
+        case filter (\e -> takeExtension e == ".cabal") entries of
+          []       -> liftIO $ throwIO $ NoCabalFileFound packageDir
+          (_:_:_)  -> liftIO $ throwIO $ MultipleCabalFilesFound packageDir
+          [cabalFileName] -> do
+            monitorFiles [monitorFileHashed cabalFilePath]
+            liftIO $ fmap (mkSpecificSourcePackage location)
+                   . readSourcePackageCabalFile verbosity cabalFilePath
+                 =<< BS.readFile cabalFilePath
+            where
+              cabalFilePath = packageDir </> cabalFileName
+              location      = RemoteSourceRepoPackage repo packageDir
+
+
+    reportSourceRepoProblems :: [(SourceRepoList, SourceRepoProblem)] -> Rebuild a
+    reportSourceRepoProblems = liftIO . die' verbosity . renderSourceRepoProblems
+
+    renderSourceRepoProblems :: [(SourceRepoList, SourceRepoProblem)] -> String
+    renderSourceRepoProblems = unlines . map show -- "TODO: the repo problems"
+
+
+-- | Utility used by all the helpers of 'fetchAndReadSourcePackages' to make an
+-- appropriate @'PackageSpecifier' ('SourcePackage' (..))@ for a given package
+-- from a given location.
+--
+mkSpecificSourcePackage :: PackageLocation FilePath
+                        -> GenericPackageDescription
+                        -> PackageSpecifier
+                             (SourcePackage (PackageLocation (Maybe FilePath)))
+mkSpecificSourcePackage location pkg =
+    SpecificSourcePackage SourcePackage {
+      packageInfoId        = packageId pkg,
+      packageDescription   = pkg,
+      --TODO: it is silly that we still have to use a Maybe FilePath here
+      packageSource        = fmap Just location,
       packageDescrOverride = Nothing
     }
 
-readSourcePackage _ (ProjectPackageNamed (Dependency pkgname verrange)) =
-    return $ NamedPackage pkgname [PackagePropertyVersion verrange]
 
-readSourcePackage _verbosity _ =
-    fail $ "TODO: add support for fetching and reading local tarballs, remote "
-        ++ "tarballs, remote repos and passing named packages through"
+-- | Errors reported upon failing to parse a @.cabal@ file.
+--
+data CabalFileParseError = CabalFileParseError
+    FilePath           -- ^ @.cabal@ file path
+    BS.ByteString      -- ^ @.cabal@ file contents
+    (NonEmpty PError)  -- ^ errors
+    (Maybe Version)    -- ^ We might discover the spec version the package needs
+    [PWarning]         -- ^ warnings
+  deriving (Typeable)
+
+-- | Manual instance which skips file contentes
+instance Show CabalFileParseError where
+    showsPrec d (CabalFileParseError fp _ es mv ws) = showParen (d > 10)
+        $ showString "CabalFileParseError"
+        . showChar ' ' . showsPrec 11 fp
+        . showChar ' ' . showsPrec 11 ("" :: String)
+        . showChar ' ' . showsPrec 11 es
+        . showChar ' ' . showsPrec 11 mv
+        . showChar ' ' . showsPrec 11 ws
+
+instance Exception CabalFileParseError
+#if MIN_VERSION_base(4,8,0)
+  where
+  displayException = renderCabalFileParseError
+#endif
+
+renderCabalFileParseError :: CabalFileParseError -> String
+renderCabalFileParseError (CabalFileParseError filePath contents errors _ warnings) =
+    renderParseError filePath contents errors warnings
+
+-- | Wrapper for the @.cabal@ file parser. It reports warnings on higher
+-- verbosity levels and throws 'CabalFileParseError' on failure.
+--
+readSourcePackageCabalFile :: Verbosity
+                           -> FilePath
+                           -> BS.ByteString
+                           -> IO GenericPackageDescription
+readSourcePackageCabalFile verbosity pkgfilename content =
+    case runParseResult (parseGenericPackageDescription content) of
+      (warnings, Right pkg) -> do
+        unless (null warnings) $
+          info verbosity (formatWarnings warnings)
+        return pkg
+
+      (warnings, Left (mspecVersion, errors)) ->
+        throwIO $ CabalFileParseError pkgfilename content errors mspecVersion warnings
+  where
+    formatWarnings warnings =
+        "The package description file " ++ pkgfilename
+     ++ " has warnings: "
+     ++ unlines (map (showPWarning pkgfilename) warnings)
+
+
+-- | When looking for a package's @.cabal@ file we can find none, or several,
+-- both of which are failures.
+--
+data CabalFileSearchFailure
+   = NoCabalFileFound FilePath
+   | MultipleCabalFilesFound FilePath
+  deriving (Show, Typeable)
+
+instance Exception CabalFileSearchFailure
+
+
+-- | Find the @.cabal@ file within a tarball file and return it by value.
+--
+-- Can fail with a 'Tar.FormatError' or 'CabalFileSearchFailure' exception.
+--
+extractTarballPackageCabalFile :: FilePath -> IO (FilePath, BS.ByteString)
+extractTarballPackageCabalFile tarballFile =
+    withBinaryFile tarballFile ReadMode $ \hnd -> do
+      content <- LBS.hGetContents hnd
+      case extractTarballPackageCabalFilePure tarballFile content of
+        Left (Left  e) -> throwIO e
+        Left (Right e) -> throwIO e
+        Right (fileName, fileContent) ->
+          (,) fileName <$> evaluate (LBS.toStrict fileContent)
+
+
+-- | Scan through a tar file stream and collect the @.cabal@ file, or fail.
+--
+extractTarballPackageCabalFilePure :: FilePath
+                                   -> LBS.ByteString
+                                   -> Either (Either Tar.FormatError
+                                                     CabalFileSearchFailure)
+                                             (FilePath, LBS.ByteString)
+extractTarballPackageCabalFilePure tarballFile =
+      check
+    . accumEntryMap
+    . Tar.filterEntries isCabalFile
+    . Tar.read
+    . GZipUtils.maybeDecompress
+  where
+    accumEntryMap = Tar.foldlEntries
+                      (\m e -> Map.insert (Tar.entryTarPath e) e m)
+                      Map.empty
+
+    check (Left (e, _m)) = Left (Left e)
+    check (Right m) = case Map.elems m of
+        []     -> Left (Right $ NoCabalFileFound tarballFile)
+        [file] -> case Tar.entryContent file of
+          Tar.NormalFile content _ -> Right (Tar.entryPath file, content)
+          _                        -> Left (Right $ NoCabalFileFound tarballFile)
+        _files -> Left (Right $ MultipleCabalFilesFound tarballFile)
+
+    isCabalFile e = case splitPath (Tar.entryPath e) of
+      [     _dir, file] -> takeExtension file == ".cabal"
+      [".", _dir, file] -> takeExtension file == ".cabal"
+      _                 -> False
+
+
+-- | The name to use for a local file for a remote tarball 'SourceRepo'.
+-- This is deterministic based on the remote tarball URI, and is intended
+-- to produce non-clashing file names for different tarballs.
+--
+localFileNameForRemoteTarball :: URI -> FilePath
+localFileNameForRemoteTarball uri =
+    mangleName uri
+ ++ "-" ++  showHex locationHash ""
+  where
+    mangleName = truncateString 10 . dropExtension . dropExtension
+               . takeFileName . dropTrailingPathSeparator . uriPath
+
+    locationHash :: Word
+    locationHash = fromIntegral (Hashable.hash (uriToString id uri ""))
+
+
+-- | The name to use for a local file or dir for a remote 'SourceRepo'.
+-- This is deterministic based on the source repo identity details, and
+-- intended to produce non-clashing file names for different repos.
+--
+localFileNameForRemoteRepo :: SourceRepoList -> FilePath
+localFileNameForRemoteRepo SourceRepositoryPackage {srpType, srpLocation} =
+    mangleName srpLocation ++ "-" ++ showHex locationHash ""
+  where
+    mangleName = truncateString 10 . dropExtension
+               . takeFileName . dropTrailingPathSeparator
+
+    -- just the parts that make up the "identity" of the repo
+    locationHash :: Word
+    locationHash =
+      fromIntegral (Hashable.hash (show srpType, srpLocation))
+
+
+-- | Truncate a string, with a visual indication that it is truncated.
+truncateString :: Int -> String -> String
+truncateString n s | length s <= n = s
+                   | otherwise     = take (n-1) s ++ "_"
 
 
 -- TODO: add something like this, here or in the project planning

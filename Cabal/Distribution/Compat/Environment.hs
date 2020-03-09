@@ -18,19 +18,18 @@ import Foreign.C.Error (throwErrnoIf_)
 #endif
 
 import qualified System.Environment as System
-#if __GLASGOW_HASKELL__ >= 706
 import System.Environment (lookupEnv)
 #if __GLASGOW_HASKELL__ >= 708
 import System.Environment (unsetEnv)
-#endif
-#else
-import Distribution.Compat.Exception (catchIO)
 #endif
 
 import Distribution.Compat.Stack
 
 #ifdef mingw32_HOST_OS
 import Foreign.C
+#if __GLASGOW_HASKELL__ < 708
+import Foreign.Ptr (nullPtr)
+#endif
 import GHC.Windows
 #else
 import Foreign.C.Types
@@ -39,7 +38,7 @@ import Foreign.C.Error (throwErrnoIfMinus1_)
 import System.Posix.Internals ( withFilePath )
 #endif /* mingw32_HOST_OS */
 
-getEnvironment :: NoCallStackIO [(String, String)]
+getEnvironment :: IO [(String, String)]
 #ifdef mingw32_HOST_OS
 -- On Windows, the names of environment variables are case-insensitive, but are
 -- often given in mixed-case (e.g. "PATH" is "Path"), so we have to normalise
@@ -51,13 +50,6 @@ getEnvironment = fmap upcaseVars System.getEnvironment
 #else
 getEnvironment = System.getEnvironment
 #endif
-
-#if __GLASGOW_HASKELL__ < 706
--- | @lookupEnv var@ returns the value of the environment variable @var@, or
--- @Nothing@ if there is no such value.
-lookupEnv :: String -> IO (Maybe String)
-lookupEnv name = (Just `fmap` System.getEnv name) `catchIO` const (return Nothing)
-#endif /* __GLASGOW_HASKELL__ < 706 */
 
 -- | @setEnv name value@ sets the specified environment variable to @value@.
 --
@@ -123,6 +115,12 @@ unsetEnv key = withCWString key $ \k -> do
     err <- c_GetLastError
     unless (err == eRROR_ENVVAR_NOT_FOUND) $ do
       throwGetLastError "unsetEnv"
+
+eRROR_ENVVAR_NOT_FOUND :: DWORD
+eRROR_ENVVAR_NOT_FOUND = 203
+
+foreign import WINDOWS_CCONV unsafe "windows.h GetLastError"
+    c_GetLastError:: IO DWORD
 #else
 unsetEnv key = withFilePath key (throwErrnoIf_ (/= 0) "unsetEnv" . c_unsetenv)
 #if __GLASGOW_HASKELL__ > 706

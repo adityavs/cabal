@@ -1,5 +1,4 @@
 {-# LANGUAGE NamedFieldPuns #-}
-{-# LANGUAGE ViewPatterns   #-}
 
 -- | cabal-install CLI command: haddock
 --
@@ -18,11 +17,10 @@ import Distribution.Client.ProjectOrchestration
 import Distribution.Client.CmdErrorMessages
 
 import Distribution.Client.Setup
-         ( GlobalFlags, ConfigFlags(..), ConfigExFlags, InstallFlags
-         , applyFlagDefaults )
+         ( GlobalFlags, ConfigFlags(..), ConfigExFlags, InstallFlags )
 import qualified Distribution.Client.Setup as Client
 import Distribution.Simple.Setup
-         ( HaddockFlags(..), fromFlagOrDefault, fromFlag )
+         ( HaddockFlags(..), TestFlags, BenchmarkFlags(..), fromFlagOrDefault )
 import Distribution.Simple.Command
          ( CommandUI(..), usageAlternatives )
 import Distribution.Verbosity
@@ -33,12 +31,13 @@ import Distribution.Simple.Utils
 import Control.Monad (when)
 
 
-haddockCommand :: CommandUI (ConfigFlags, ConfigExFlags, InstallFlags
-                            ,HaddockFlags)
+haddockCommand :: CommandUI ( ConfigFlags, ConfigExFlags, InstallFlags
+                            , HaddockFlags, TestFlags, BenchmarkFlags
+                            )
 haddockCommand = Client.installCommand {
-  commandName         = "new-haddock",
+  commandName         = "v2-haddock",
   commandSynopsis     = "Build Haddock documentation",
-  commandUsage        = usageAlternatives "new-haddock" [ "[FLAGS] TARGET" ],
+  commandUsage        = usageAlternatives "v2-haddock" [ "[FLAGS] TARGET" ],
   commandDescription  = Just $ \_ -> wrapText $
         "Build Haddock documentation for the specified packages within the "
      ++ "project.\n\n"
@@ -58,7 +57,7 @@ haddockCommand = Client.installCommand {
      ++ "'cabal.project.local' and other files.",
   commandNotes        = Just $ \pname ->
         "Examples:\n"
-     ++ "  " ++ pname ++ " new-haddock pkgname"
+     ++ "  " ++ pname ++ " v2-haddock pkgname"
      ++ "    Build documentation for the package named pkgname\n\n"
 
      ++ cmdCommonHelpTextNewBuildBeta
@@ -71,15 +70,17 @@ haddockCommand = Client.installCommand {
 -- For more details on how this works, see the module
 -- "Distribution.Client.ProjectOrchestration"
 --
-haddockAction :: (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags)
+haddockAction :: ( ConfigFlags, ConfigExFlags, InstallFlags
+                 , HaddockFlags, TestFlags, BenchmarkFlags )
                  -> [String] -> GlobalFlags -> IO ()
-haddockAction (applyFlagDefaults -> (configFlags, configExFlags, installFlags, haddockFlags))
+haddockAction ( configFlags, configExFlags, installFlags
+              , haddockFlags, testFlags, benchmarkFlags )
                 targetStrings globalFlags = do
 
-    baseCtx <- establishProjectBaseContext verbosity cliConfig
+    baseCtx <- establishProjectBaseContext verbosity cliConfig HaddockCommand
 
     targetSelectors <- either (reportTargetSelectorProblems verbosity) return
-                   =<< readTargetSelectors (localPackages baseCtx) targetStrings
+                   =<< readTargetSelectors (localPackages baseCtx) Nothing targetStrings
 
     buildCtx <-
       runProjectPreBuildPhase verbosity baseCtx $ \elaboratedPlan -> do
@@ -96,6 +97,7 @@ haddockAction (applyFlagDefaults -> (configFlags, configExFlags, installFlags, h
                          selectComponentTarget
                          TargetProblemCommon
                          elaboratedPlan
+                         Nothing
                          targetSelectors
 
             let elaboratedPlan' = pruneInstallPlanToTargets
@@ -112,7 +114,9 @@ haddockAction (applyFlagDefaults -> (configFlags, configExFlags, installFlags, h
     verbosity = fromFlagOrDefault normal (configVerbosity configFlags)
     cliConfig = commandLineFlagsToProjectConfig
                   globalFlags configFlags configExFlags
-                  installFlags haddockFlags
+                  installFlags
+                  mempty -- ClientInstallFlags, not needed here
+                  haddockFlags testFlags benchmarkFlags
 
 -- | This defines what a 'TargetSelector' means for the @haddock@ command.
 -- It selects the 'AvailableTarget's that the 'TargetSelector' refers to,
@@ -153,10 +157,17 @@ selectPackageTargets haddockFlags targetSelector targets
     isRequested (TargetAllPackages (Just _)) _ = True
     isRequested _ LibKind    = True
 --  isRequested _ SubLibKind = True --TODO: what about sublibs?
-    isRequested _ FLibKind   = fromFlag (haddockForeignLibs haddockFlags)
-    isRequested _ ExeKind    = fromFlag (haddockExecutables haddockFlags)
-    isRequested _ TestKind   = fromFlag (haddockTestSuites  haddockFlags)
-    isRequested _ BenchKind  = fromFlag (haddockBenchmarks  haddockFlags)
+
+    -- TODO/HACK, we encode some defaults here as v2-haddock's logic;
+    -- make sure this matches the defaults applied in
+    -- "Distribution.Client.ProjectPlanning"; this may need more work
+    -- to be done properly
+    --
+    -- See also https://github.com/haskell/cabal/pull/4886
+    isRequested _ FLibKind   = fromFlagOrDefault False (haddockForeignLibs haddockFlags)
+    isRequested _ ExeKind    = fromFlagOrDefault False (haddockExecutables haddockFlags)
+    isRequested _ TestKind   = fromFlagOrDefault False (haddockTestSuites  haddockFlags)
+    isRequested _ BenchKind  = fromFlagOrDefault False (haddockBenchmarks  haddockFlags)
 
 
 -- | For a 'TargetComponent' 'TargetSelector', check if the component can be

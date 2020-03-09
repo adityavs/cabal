@@ -1,3 +1,4 @@
+{-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE RankNTypes #-}
@@ -38,6 +39,7 @@ module Distribution.Simple.Program.Types (
 import Prelude ()
 import Distribution.Compat.Prelude
 
+import Distribution.PackageDescription
 import Distribution.Simple.Program.Find
 import Distribution.Version
 import Distribution.Verbosity
@@ -74,10 +76,14 @@ data Program = Program {
        -- | A function to do any additional configuration after we have
        -- located the program (and perhaps identified its version). For example
        -- it could add args, or environment vars.
-       programPostConf :: Verbosity -> ConfiguredProgram -> IO ConfiguredProgram
+       programPostConf :: Verbosity -> ConfiguredProgram -> IO ConfiguredProgram,
+       -- | A function that filters any arguments that don't impact the output
+       -- from a commandline. Used to limit the volatility of dependency hashes
+       -- when using new-build.
+       programNormaliseArgs :: Maybe Version -> PackageDescription -> [String] -> [String]
      }
 instance Show Program where
-  show (Program name _ _ _) = "Program: " ++ name
+  show (Program name _ _ _ _) = "Program: " ++ name
 
 type ProgArg = String
 
@@ -128,6 +134,7 @@ data ConfiguredProgram = ConfiguredProgram {
   deriving (Eq, Generic, Read, Show, Typeable)
 
 instance Binary ConfiguredProgram
+instance Structured ConfiguredProgram
 
 -- | Where a program was found. Also tells us whether it's specified by user or
 -- not.  This includes not just the path, but the program as well.
@@ -137,9 +144,10 @@ data ProgramLocation
       -- eg. --ghc-path=\/usr\/bin\/ghc-6.6
     | FoundOnSystem { locationPath :: FilePath }
       -- ^The program was found automatically.
-      deriving (Eq, Generic, Read, Show)
+      deriving (Eq, Generic, Read, Show, Typeable)
 
 instance Binary ProgramLocation
+instance Structured ProgramLocation
 
 -- | The full path of a configured program.
 programPath :: ConfiguredProgram -> FilePath
@@ -161,7 +169,8 @@ simpleProgram name = Program {
     programName         = name,
     programFindLocation = \v p -> findProgramOnSearchPath v p name,
     programFindVersion  = \_ _ -> return Nothing,
-    programPostConf     = \_ p -> return p
+    programPostConf     = \_ p -> return p,
+    programNormaliseArgs   = \_ _ -> id
   }
 
 -- | Make a simple 'ConfiguredProgram'.

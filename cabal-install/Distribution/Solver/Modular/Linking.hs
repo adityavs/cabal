@@ -1,5 +1,8 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
+
+-- TODO: remove this
+{-# OPTIONS -fno-warn-incomplete-uni-patterns #-}
 module Distribution.Solver.Modular.Linking (
     validateLinking
   ) where
@@ -12,7 +15,6 @@ import Control.Monad.Reader
 import Control.Monad.State
 import Data.Function (on)
 import Data.Map ((!))
-import Data.Set (Set)
 import qualified Data.Map         as M
 import qualified Data.Set         as S
 import qualified Data.Traversable as T
@@ -29,7 +31,7 @@ import qualified Distribution.Solver.Modular.WeightedPSQ as W
 
 import Distribution.Solver.Types.OptionalStanza
 import Distribution.Solver.Types.PackagePath
-import Distribution.Types.GenericPackageDescription (unFlagName)
+import Distribution.Types.Flag (unFlagName)
 
 {-------------------------------------------------------------------------------
   Validation
@@ -245,11 +247,11 @@ linkDeps target = \deps -> do
 
     go1 :: FlaggedDep QPN -> FlaggedDep QPN -> UpdateState ()
     go1 dep rdep = case (dep, rdep) of
-      (Simple (LDep dr1 (Dep _ qpn _)) _, ~(Simple (LDep dr2 (Dep _ qpn' _)) _)) -> do
+      (Simple (LDep dr1 (Dep (PkgComponent qpn _) _)) _, ~(Simple (LDep dr2 (Dep (PkgComponent qpn' _) _)) _)) -> do
         vs <- get
         let lg   = M.findWithDefault (lgSingleton qpn  Nothing) qpn  $ vsLinks vs
             lg'  = M.findWithDefault (lgSingleton qpn' Nothing) qpn' $ vsLinks vs
-        lg'' <- lift' $ lgMerge ((CS.union `on` dependencyReasonToCS) dr1 dr2) lg lg'
+        lg'' <- lift' $ lgMerge ((CS.union `on` dependencyReasonToConflictSet) dr1 dr2) lg lg'
         updateLinkGroup lg''
       (Flagged fn _ t f, ~(Flagged _ _ t' f')) -> do
         vs <- get

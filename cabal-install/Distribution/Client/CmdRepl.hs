@@ -1,5 +1,8 @@
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE NamedFieldPuns #-}
-{-# LANGUAGE ViewPatterns   #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE RecordWildCards #-}
 
 -- | cabal-install CLI command: repl
 --
@@ -14,41 +17,144 @@ module Distribution.Client.CmdRepl (
     selectComponentTarget
   ) where
 
-import Distribution.Client.ProjectOrchestration
-import Distribution.Client.CmdErrorMessages
+import Prelude ()
+import Distribution.Client.Compat.Prelude
 
+import Distribution.Compat.Lens
+import qualified Distribution.Types.Lens as L
+
+import Distribution.Client.CmdErrorMessages
+import Distribution.Client.CmdInstall
+         ( establishDummyProjectBaseContext )
+import qualified Distribution.Client.InstallPlan as InstallPlan
+import Distribution.Client.ProjectBuilding
+         ( rebuildTargetsDryRun, improveInstallPlanWithUpToDatePackages )
+import Distribution.Client.ProjectConfig
+         ( ProjectConfig(..), withProjectOrGlobalConfigIgn
+         , projectConfigConfigFile )
+import Distribution.Client.ProjectOrchestration
+import Distribution.Client.ProjectPlanning 
+       ( ElaboratedSharedConfig(..), ElaboratedInstallPlan )
+import Distribution.Client.ProjectPlanning.Types
+       ( elabOrderExeDependencies )
 import Distribution.Client.Setup
-         ( GlobalFlags, ConfigFlags(..), ConfigExFlags, InstallFlags
-         , applyFlagDefaults )
+         ( GlobalFlags, ConfigFlags(..), ConfigExFlags, InstallFlags )
 import qualified Distribution.Client.Setup as Client
+import Distribution.Client.Types
+         ( PackageLocation(..), PackageSpecifier(..), UnresolvedSourcePackage )
 import Distribution.Simple.Setup
-         ( HaddockFlags, fromFlagOrDefault )
+         ( HaddockFlags, TestFlags, BenchmarkFlags
+         , fromFlagOrDefault, replOptions
+         , Flag(..), toFlag, trueArg, falseArg )
 import Distribution.Simple.Command
-         ( CommandUI(..), usageAlternatives )
+         ( CommandUI(..), liftOption, usageAlternatives, option
+         , ShowOrParseArgs, OptionField, reqArg )
+import Distribution.Compiler
+         ( CompilerFlavor(GHC) )
+import Distribution.Simple.Compiler
+         ( compilerCompatVersion )
 import Distribution.Package
-         ( packageName )
+         ( Package(..), packageName, UnitId, installedUnitId )
+import Distribution.PackageDescription.PrettyPrint
+import Distribution.Parsec
+         ( Parsec(..), parsecCommaList )
+import Distribution.Pretty
+         ( prettyShow )
+import Distribution.ReadE
+         ( ReadE, parsecToReadE )
+import qualified Distribution.SPDX.License as SPDX
+import Distribution.Solver.Types.SourcePackage
+         ( SourcePackage(..) )
+import Distribution.Types.BuildInfo
+         ( BuildInfo(..), emptyBuildInfo )
 import Distribution.Types.ComponentName
          ( componentNameString )
-import Distribution.Text
+import Distribution.Types.CondTree
+         ( CondTree(..), traverseCondTreeC )
+import Distribution.Types.Dependency
+         ( Dependency(..) )
+import Distribution.Types.GenericPackageDescription
+         ( emptyGenericPackageDescription )
+import Distribution.Types.LibraryName
+         ( LibraryName(..) )
+import Distribution.Types.PackageDescription
+         ( PackageDescription(..), emptyPackageDescription )
+import Distribution.Types.PackageName.Magic
+         ( fakePackageId )
+import Distribution.Types.Library
+         ( Library(..), emptyLibrary )
+import Distribution.Types.Version
+         ( mkVersion )
+import Distribution.Types.VersionRange
+         ( anyVersion )
+import Distribution.Deprecated.Text
          ( display )
+import Distribution.Utils.Generic
+         ( safeHead )
 import Distribution.Verbosity
-         ( Verbosity, normal )
+         ( Verbosity, normal, lessVerbose )
 import Distribution.Simple.Utils
-         ( wrapText, die', ordNub )
+         ( wrapText, die', debugNoWrap, ordNub, createTempDirectory, handleDoesNotExist )
+import Language.Haskell.Extension
+         ( Language(..) )
 
+import Data.List
+         ( (\\) )
 import qualified Data.Map as Map
 import qualified Data.Set as Set
-import Control.Monad (when)
+import System.Directory
+         ( getCurrentDirectory, getTemporaryDirectory, removeDirectoryRecursive )
+import System.FilePath
+         ( (</>) )
 
+type ReplFlags = [String]
 
-replCommand :: CommandUI (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags)
+data EnvFlags = EnvFlags 
+  { envPackages :: [Dependency]
+  , envIncludeTransitive :: Flag Bool
+  , envIgnoreProject :: Flag Bool
+  }
+
+defaultEnvFlags :: EnvFlags
+defaultEnvFlags = EnvFlags
+  { envPackages = []
+  , envIncludeTransitive = toFlag True
+  , envIgnoreProject = toFlag False
+  }
+
+envOptions :: ShowOrParseArgs -> [OptionField EnvFlags]
+envOptions _ =
+  [ option ['b'] ["build-depends"]
+    "Include an additional package in the environment presented to GHCi."
+    envPackages (\p flags -> flags { envPackages = p ++ envPackages flags })
+    (reqArg "DEPENDENCY" dependencyReadE (fmap prettyShow :: [Dependency] -> [String]))
+  , option [] ["no-transitive-deps"]
+    "Don't automatically include transitive dependencies of requested packages."
+    envIncludeTransitive (\p flags -> flags { envIncludeTransitive = p })
+    falseArg
+  , option ['z'] ["ignore-project"]
+    "Only include explicitly specified packages (and 'base')."
+    envIgnoreProject (\p flags -> flags { envIgnoreProject = p })
+    trueArg
+  ]
+  where
+    dependencyReadE :: ReadE [Dependency]
+    dependencyReadE =
+      parsecToReadE
+        ("couldn't parse dependency: " ++)
+        (parsecCommaList parsec)
+
+replCommand :: CommandUI ( ConfigFlags, ConfigExFlags, InstallFlags
+                         , HaddockFlags, TestFlags, BenchmarkFlags
+                         , ReplFlags, EnvFlags
+                         )
 replCommand = Client.installCommand {
-  commandName         = "new-repl",
+  commandName         = "v2-repl",
   commandSynopsis     = "Open an interactive session for the given component.",
-  commandUsage        = usageAlternatives "new-repl" [ "[TARGET] [FLAGS]" ],
+  commandUsage        = usageAlternatives "v2-repl" [ "[TARGET] [FLAGS]" ],
   commandDescription  = Just $ \_ -> wrapText $
         "Open an interactive session for a component within the project. The "
-     ++ "available targets are the same as for the 'new-build' command: "
+     ++ "available targets are the same as for the 'v2-build' command: "
      ++ "individual components within packages in the project, including "
      ++ "libraries, executables, test-suites or benchmarks. Packages can "
      ++ "also be specified in which case the library component in the "
@@ -61,20 +167,49 @@ replCommand = Client.installCommand {
      ++ "'cabal.project.local' and other files.",
   commandNotes        = Just $ \pname ->
         "Examples, open an interactive session:\n"
-     ++ "  " ++ pname ++ " new-repl\n"
+     ++ "  " ++ pname ++ " v2-repl\n"
      ++ "    for the default component in the package in the current directory\n"
-     ++ "  " ++ pname ++ " new-repl pkgname\n"
+     ++ "  " ++ pname ++ " v2-repl pkgname\n"
      ++ "    for the default component in the package named 'pkgname'\n"
-     ++ "  " ++ pname ++ " new-repl ./pkgfoo\n"
+     ++ "  " ++ pname ++ " v2-repl ./pkgfoo\n"
      ++ "    for the default component in the package in the ./pkgfoo directory\n"
-     ++ "  " ++ pname ++ " new-repl cname\n"
+     ++ "  " ++ pname ++ " v2-repl cname\n"
      ++ "    for the component named 'cname'\n"
-     ++ "  " ++ pname ++ " new-repl pkgname:cname\n"
+     ++ "  " ++ pname ++ " v2-repl pkgname:cname\n"
      ++ "    for the component 'cname' in the package 'pkgname'\n\n"
+     ++ "  " ++ pname ++ " v2-repl --build-depends lens\n"
+     ++ "    add the latest version of the library 'lens' to the default component "
+        ++ "(or no componentif there is no project present)\n"
+     ++ "  " ++ pname ++ " v2-repl --build-depends \"lens >= 4.15 && < 4.18\"\n"
+     ++ "    add a version (constrained between 4.15 and 4.18) of the library 'lens' "
+        ++ "to the default component (or no component if there is no project present)\n"
 
-     ++ cmdCommonHelpTextNewBuildBeta
+     ++ cmdCommonHelpTextNewBuildBeta,
+  commandDefaultFlags = ( configFlags, configExFlags, installFlags
+                        , haddockFlags, testFlags, benchmarkFlags
+                        , [], defaultEnvFlags
+                        ),
+  commandOptions = \showOrParseArgs ->
+        map liftOriginal (commandOptions Client.installCommand showOrParseArgs)
+        ++ map liftReplOpts (replOptions showOrParseArgs)
+        ++ map liftEnvOpts  (envOptions  showOrParseArgs)
    }
+  where
+    (configFlags,configExFlags,installFlags,haddockFlags,testFlags,benchmarkFlags)
+      = commandDefaultFlags Client.installCommand
 
+    liftOriginal = liftOption projectOriginal updateOriginal
+    liftReplOpts = liftOption projectReplOpts updateReplOpts
+    liftEnvOpts  = liftOption projectEnvOpts  updateEnvOpts
+
+    projectOriginal              (a,b,c,d,e,f,_,_) = (a,b,c,d,e,f)
+    updateOriginal (a,b,c,d,e,f) (_,_,_,_,_,_,g,h) = (a,b,c,d,e,f,g,h)
+
+    projectReplOpts  (_,_,_,_,_,_,g,_) = g
+    updateReplOpts g (a,b,c,d,e,f,_,h) = (a,b,c,d,e,f,g,h)
+
+    projectEnvOpts  (_,_,_,_,_,_,_,h) = h
+    updateEnvOpts h (a,b,c,d,e,f,g,_) = (a,b,c,d,e,f,g,h)
 
 -- | The @repl@ command is very much like @build@. It brings the install plan
 -- up to date, selects that part of the plan needed by the given or implicit
@@ -87,56 +222,252 @@ replCommand = Client.installCommand {
 -- For more details on how this works, see the module
 -- "Distribution.Client.ProjectOrchestration"
 --
-replAction :: (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags)
+replAction :: ( ConfigFlags, ConfigExFlags, InstallFlags
+              , HaddockFlags, TestFlags, BenchmarkFlags
+              , ReplFlags, EnvFlags )
            -> [String] -> GlobalFlags -> IO ()
-replAction (applyFlagDefaults -> (configFlags, configExFlags, installFlags, haddockFlags))
+replAction ( configFlags, configExFlags, installFlags
+           , haddockFlags, testFlags, benchmarkFlags
+           , replFlags, envFlags )
            targetStrings globalFlags = do
+    let
+      ignoreProject = fromFlagOrDefault False (envIgnoreProject envFlags)
+      with           = withProject    cliConfig             verbosity targetStrings
+      without config = withoutProject (config <> cliConfig) verbosity targetStrings
+    
+    (baseCtx, targetSelectors, finalizer, replType) <-
+      withProjectOrGlobalConfigIgn ignoreProject verbosity globalConfigFlag with without
 
-    baseCtx <- establishProjectBaseContext verbosity cliConfig
+    when (buildSettingOnlyDeps (buildSettings baseCtx)) $
+      die' verbosity $ "The repl command does not support '--only-dependencies'. "
+          ++ "You may wish to use 'build --only-dependencies' and then "
+          ++ "use 'repl'."
 
-    targetSelectors <- either (reportTargetSelectorProblems verbosity) return
-                   =<< readTargetSelectors (localPackages baseCtx) targetStrings
+    (originalComponent, baseCtx') <- if null (envPackages envFlags)
+      then return (Nothing, baseCtx)
+      else
+        -- Unfortunately, the best way to do this is to let the normal solver
+        -- help us resolve the targets, but that isn't ideal for performance,
+        -- especially in the no-project case.
+        withInstallPlan (lessVerbose verbosity) baseCtx $ \elaboratedPlan _ -> do
+          -- targets should be non-empty map, but there's no NonEmptyMap yet.
+          targets <- validatedTargets elaboratedPlan targetSelectors
+          
+          let
+            (unitId, _) = fromMaybe (error "panic: targets should be non-empty") $ safeHead $ Map.toList targets
+            originalDeps = installedUnitId <$> InstallPlan.directDeps elaboratedPlan unitId
+            oci = OriginalComponentInfo unitId originalDeps
+            pkgId = fromMaybe (error $ "cannot find " ++ prettyShow unitId) $ packageId <$> InstallPlan.lookup elaboratedPlan unitId 
+            baseCtx' = addDepsToProjectTarget (envPackages envFlags) pkgId baseCtx
 
-    buildCtx <-
-      runProjectPreBuildPhase verbosity baseCtx $ \elaboratedPlan -> do
+          return (Just oci, baseCtx')
+          
+    -- Now, we run the solver again with the added packages. While the graph 
+    -- won't actually reflect the addition of transitive dependencies,
+    -- they're going to be available already and will be offered to the REPL
+    -- and that's good enough.
+    --
+    -- In addition, to avoid a *third* trip through the solver, we are 
+    -- replicating the second half of 'runProjectPreBuildPhase' by hand
+    -- here.
+    (buildCtx, replFlags'') <- withInstallPlan verbosity baseCtx' $
+      \elaboratedPlan elaboratedShared' -> do
+        let ProjectBaseContext{..} = baseCtx'
+          
+        -- Recalculate with updated project.
+        targets <- validatedTargets elaboratedPlan targetSelectors
 
-            when (buildSettingOnlyDeps (buildSettings baseCtx)) $
-              die' verbosity $ "The repl command does not support '--only-dependencies'. "
-                 ++ "You may wish to use 'build --only-dependencies' and then "
-                 ++ "use 'repl'."
+        let 
+          elaboratedPlan' = pruneInstallPlanToTargets
+                              TargetActionRepl
+                              targets
+                              elaboratedPlan
+          includeTransitive = fromFlagOrDefault True (envIncludeTransitive envFlags)
+        
+        pkgsBuildStatus <- rebuildTargetsDryRun distDirLayout elaboratedShared'
+                                          elaboratedPlan'
 
-            -- Interpret the targets on the command line as repl targets
-            -- (as opposed to say build or haddock targets).
-            targets <- either (reportTargetProblems verbosity) return
-                     $ resolveTargets
-                         selectPackageTargets
-                         selectComponentTarget
-                         TargetProblemCommon
-                         elaboratedPlan
-                         targetSelectors
+        let elaboratedPlan'' = improveInstallPlanWithUpToDatePackages
+                                pkgsBuildStatus elaboratedPlan'
+        debugNoWrap verbosity (InstallPlan.showInstallPlan elaboratedPlan'')
 
-            -- Reject multiple targets, or at least targets in different
-            -- components. It is ok to have two module/file targets in the
-            -- same component, but not two that live in different components.
-            when (Set.size (distinctTargetComponents targets) > 1) $
-              reportTargetProblems verbosity
-                [TargetProblemMultipleTargets targets]
+        let 
+          buildCtx = ProjectBuildContext 
+            { elaboratedPlanOriginal = elaboratedPlan
+            , elaboratedPlanToExecute = elaboratedPlan''
+            , elaboratedShared = elaboratedShared'
+            , pkgsBuildStatus
+            , targetsMap = targets
+            }
+          
+          ElaboratedSharedConfig { pkgConfigCompiler = compiler } = elaboratedShared'
+          
+          -- First version of GHC where GHCi supported the flag we need.
+          -- https://downloads.haskell.org/~ghc/7.6.1/docs/html/users_guide/release-7-6-1.html
+          minGhciScriptVersion = mkVersion [7, 6]
 
-            let elaboratedPlan' = pruneInstallPlanToTargets
-                                    TargetActionRepl
-                                    targets
-                                    elaboratedPlan
-            return (elaboratedPlan', targets)
+          replFlags' = case originalComponent of 
+            Just oci -> generateReplFlags includeTransitive elaboratedPlan' oci
+            Nothing  -> []
+          replFlags'' = case replType of
+            GlobalRepl scriptPath 
+              | Just version <- compilerCompatVersion GHC compiler
+              , version >= minGhciScriptVersion -> ("-ghci-script" ++ scriptPath) : replFlags'
+            _                                   -> replFlags'
 
-    printPlan verbosity baseCtx buildCtx
+        return (buildCtx, replFlags'')
 
-    buildOutcomes <- runProjectBuildPhase verbosity baseCtx buildCtx
-    runProjectPostBuildPhase verbosity baseCtx buildCtx buildOutcomes
+    let buildCtx' = buildCtx
+          { elaboratedShared = (elaboratedShared buildCtx)
+                { pkgConfigReplOptions = replFlags ++ replFlags'' }
+          }
+    printPlan verbosity baseCtx' buildCtx'
+
+    buildOutcomes <- runProjectBuildPhase verbosity baseCtx' buildCtx'
+    runProjectPostBuildPhase verbosity baseCtx' buildCtx' buildOutcomes
+    finalizer
   where
     verbosity = fromFlagOrDefault normal (configVerbosity configFlags)
     cliConfig = commandLineFlagsToProjectConfig
                   globalFlags configFlags configExFlags
-                  installFlags haddockFlags
+                  installFlags
+                  mempty -- ClientInstallFlags, not needed here
+                  haddockFlags testFlags benchmarkFlags
+    globalConfigFlag = projectConfigConfigFile (projectConfigShared cliConfig)
+    
+    validatedTargets elaboratedPlan targetSelectors = do
+      -- Interpret the targets on the command line as repl targets
+      -- (as opposed to say build or haddock targets).
+      targets <- either (reportTargetProblems verbosity) return
+          $ resolveTargets
+              selectPackageTargets
+              selectComponentTarget
+              TargetProblemCommon
+              elaboratedPlan
+              Nothing
+              targetSelectors
+
+      -- Reject multiple targets, or at least targets in different
+      -- components. It is ok to have two module/file targets in the
+      -- same component, but not two that live in different components.
+      when (Set.size (distinctTargetComponents targets) > 1) $
+        reportTargetProblems verbosity
+          [TargetProblemMultipleTargets targets]
+
+      return targets
+
+data OriginalComponentInfo = OriginalComponentInfo
+  { ociUnitId :: UnitId
+  , ociOriginalDeps :: [UnitId]
+  }
+  deriving (Show)
+
+-- | Tracks what type of GHCi instance we're creating.
+data ReplType = ProjectRepl 
+              | GlobalRepl FilePath -- ^ The 'FilePath' argument is path to a GHCi
+                                    --   script responsible for changing to the
+                                    --   correct directory. Only works on GHC geq
+                                    --   7.6, though. 🙁
+              deriving (Show, Eq)
+
+withProject :: ProjectConfig -> Verbosity -> [String]
+            -> IO (ProjectBaseContext, [TargetSelector], IO (), ReplType)
+withProject cliConfig verbosity targetStrings = do
+  baseCtx <- establishProjectBaseContext verbosity cliConfig OtherCommand
+
+  targetSelectors <- either (reportTargetSelectorProblems verbosity) return
+                 =<< readTargetSelectors (localPackages baseCtx) (Just LibKind) targetStrings
+
+  return (baseCtx, targetSelectors, return (), ProjectRepl)
+
+withoutProject :: ProjectConfig -> Verbosity -> [String]
+               -> IO (ProjectBaseContext, [TargetSelector], IO (), ReplType)
+withoutProject config verbosity extraArgs = do
+  unless (null extraArgs) $
+    die' verbosity $ "'repl' doesn't take any extra arguments when outside a project: " ++ unwords extraArgs
+
+  globalTmp <- getTemporaryDirectory
+  tempDir <- createTempDirectory globalTmp "cabal-repl."
+
+  -- We need to create a dummy package that lives in our dummy project.
+  let
+    sourcePackage = SourcePackage
+      { packageInfoId        = pkgId
+      , packageDescription   = genericPackageDescription
+      , packageSource        = LocalUnpackedPackage tempDir
+      , packageDescrOverride = Nothing
+      }
+    genericPackageDescription = emptyGenericPackageDescription 
+      & L.packageDescription .~ packageDescription
+      & L.condLibrary        .~ Just (CondNode library [baseDep] [])
+    packageDescription = emptyPackageDescription
+      { package = pkgId
+      , specVersionRaw = Left (mkVersion [2, 2])
+      , licenseRaw = Left SPDX.NONE
+      }
+    library = emptyLibrary { libBuildInfo = buildInfo }
+    buildInfo = emptyBuildInfo
+      { targetBuildDepends = [baseDep]
+      , defaultLanguage = Just Haskell2010
+      }
+    baseDep = Dependency "base" anyVersion (Set.singleton LMainLibName)
+    pkgId = fakePackageId
+
+  writeGenericPackageDescription (tempDir </> "fake-package.cabal") genericPackageDescription
+  
+  let ghciScriptPath = tempDir </> "setcwd.ghci"
+  cwd <- getCurrentDirectory
+  writeFile ghciScriptPath (":cd " ++ cwd)
+
+  baseCtx <- 
+    establishDummyProjectBaseContext
+      verbosity
+      config
+      tempDir
+      [SpecificSourcePackage sourcePackage]
+      OtherCommand
+
+  let
+    targetSelectors = [TargetPackage TargetExplicitNamed [pkgId] Nothing]
+    finalizer = handleDoesNotExist () (removeDirectoryRecursive tempDir)
+
+  return (baseCtx, targetSelectors, finalizer, GlobalRepl ghciScriptPath)
+
+addDepsToProjectTarget :: [Dependency]
+                       -> PackageId
+                       -> ProjectBaseContext
+                       -> ProjectBaseContext
+addDepsToProjectTarget deps pkgId ctx = 
+    (\p -> ctx { localPackages = p }) . fmap addDeps . localPackages $ ctx
+  where
+    addDeps :: PackageSpecifier UnresolvedSourcePackage
+            -> PackageSpecifier UnresolvedSourcePackage
+    addDeps (SpecificSourcePackage pkg)
+      | packageId pkg /= pkgId = SpecificSourcePackage pkg
+      | SourcePackage{..} <- pkg =
+        SpecificSourcePackage $ pkg { packageDescription = 
+          packageDescription & (\f -> L.allCondTrees $ traverseCondTreeC f)
+                            %~ (deps ++)
+        }
+    addDeps spec = spec
+
+generateReplFlags :: Bool -> ElaboratedInstallPlan -> OriginalComponentInfo -> ReplFlags
+generateReplFlags includeTransitive elaboratedPlan OriginalComponentInfo{..} = flags
+  where
+    exeDeps :: [UnitId]
+    exeDeps = 
+      foldMap 
+        (InstallPlan.foldPlanPackage (const []) elabOrderExeDependencies)
+        (InstallPlan.dependencyClosure elaboratedPlan [ociUnitId])
+
+    deps, deps', trans, trans' :: [UnitId]
+    flags :: ReplFlags
+    deps   = installedUnitId <$> InstallPlan.directDeps elaboratedPlan ociUnitId
+    deps'  = deps \\ ociOriginalDeps
+    trans  = installedUnitId <$> InstallPlan.dependencyClosure elaboratedPlan deps'
+    trans' = trans \\ ociOriginalDeps
+    flags  = fmap (("-package-id " ++) . prettyShow) . (\\ exeDeps)
+      $ if includeTransitive then trans' else deps'
 
 -- | This defines what a 'TargetSelector' means for the @repl@ command.
 -- It selects the 'AvailableTarget's that the 'TargetSelector' refers to,

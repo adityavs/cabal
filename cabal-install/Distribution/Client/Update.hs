@@ -33,7 +33,7 @@ import Distribution.Client.JobControl
          ( newParallelJobControl, spawnJob, collectJob )
 import Distribution.Client.Setup
          ( RepoContext(..), UpdateFlags(..) )
-import Distribution.Text
+import Distribution.Deprecated.Text
          ( display )
 import Distribution.Verbosity
 
@@ -74,6 +74,7 @@ updateRepo verbosity updateFlags repoCtxt repo = do
   transport <- repoContextGetTransport repoCtxt
   case repo of
     RepoLocal{..} -> return ()
+    RepoLocalNoIndex{..} -> return ()
     RepoRemote{..} -> do
       downloadResult <- downloadIndex transport verbosity repoRemote repoLocalDir
       case downloadResult of

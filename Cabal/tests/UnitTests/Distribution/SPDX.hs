@@ -1,34 +1,101 @@
-{-# OPTIONS_GHC -fno-warn-orphans -fno-warn-deprecations #-}
+{-# LANGUAGE CPP #-}
+{-# OPTIONS_GHC -fno-warn-deprecations #-}
 module UnitTests.Distribution.SPDX (spdxTests) where
 
 import Distribution.Compat.Prelude.Internal
 import Prelude ()
 
 import Distribution.SPDX
-import Distribution.Parsec.Class (eitherParsec)
+import Distribution.Parsec (eitherParsec)
 import Distribution.Pretty (prettyShow)
 
 import Test.Tasty
 import Test.Tasty.QuickCheck
 
+#if MIN_VERSION_binary(0,7,0)
+import qualified Data.Binary as Binary
+import qualified Data.Binary.Get as Binary
+import qualified Data.Binary.Put as Binary
+import qualified Data.ByteString.Lazy as LBS
+import GHC.Generics (to, from)
+#endif
+
+import Test.QuickCheck.Instances.Cabal ()
+
 spdxTests :: [TestTree]
 spdxTests =
     [ testProperty "LicenseId roundtrip" licenseIdRoundtrip
+#if MIN_VERSION_binary(0,7,0)
+    , testProperty "LicenseId Binary.put" licenseIdBinaryPut
+    , testProperty "LicenseId Binary.get" licenseIdBinaryGet
+#endif
     , testProperty "LicenseExceptionId roundtrip" licenseExceptionIdRoundtrip
+#if MIN_VERSION_binary(0,7,0)
+    , testProperty "LicenseExceptionId Binary.put" licenseExceptionIdBinaryPut
+    , testProperty "LicenseExceptionId Binary.get" licenseExceptionIdBinaryGet
+#endif
     , testProperty "LicenseRef roundtrip" licenseRefRoundtrip
     , testProperty "SimpleLicenseExpression roundtrip" simpleLicenseExpressionRoundtrip
     , testProperty "LicenseExpression roundtrip" licenseExpressionRoundtrip
+    , testProperty "isAcceptableLicense l = True"  shouldAcceptProp
+    , testProperty "isAcceptableLicense l = False" shouldRejectProp
     ]
 
 licenseIdRoundtrip :: LicenseId -> Property
-licenseIdRoundtrip x = 
+licenseIdRoundtrip x =
     counterexample (prettyShow x) $
     Right x === eitherParsec (prettyShow x)
+
+#if MIN_VERSION_binary(0,7,0)
+licenseIdBinaryPut :: LicenseId -> Property
+licenseIdBinaryPut x =
+    Binary.runPut (Binary.put x)
+    ===
+    Binary.runPut (Binary.gput (from x))
+
+licenseIdBinaryGet :: Word8 -> Word8 -> Property
+licenseIdBinaryGet w0 w1 =
+    stripMsg id (Binary.runGetOrFail Binary.get bs)
+    ===
+    stripMsg to (Binary.runGetOrFail Binary.gget bs)
+  where
+    bs = LBS.pack [w0, w1]
+
+    stripMsg
+        :: (a -> LicenseId)
+        -> Either (x, y, String) (x, y, a)
+        -> Either (x, y) (x, y, LicenseId)
+    stripMsg _ (Left (x,y,_))  = Left (x,y)
+    stripMsg f (Right (x,y,t)) = Right (x,y,f t)
+#endif
 
 licenseExceptionIdRoundtrip :: LicenseExceptionId -> Property
 licenseExceptionIdRoundtrip x =
     counterexample (prettyShow x) $
     Right x === eitherParsec (prettyShow x)
+
+#if MIN_VERSION_binary(0,7,0)
+licenseExceptionIdBinaryPut :: LicenseExceptionId -> Property
+licenseExceptionIdBinaryPut x =
+    Binary.runPut (Binary.put x)
+    ===
+    Binary.runPut (Binary.gput (from x))
+
+licenseExceptionIdBinaryGet :: Word8 -> Property
+licenseExceptionIdBinaryGet w0 =
+    stripMsg id (Binary.runGetOrFail Binary.get bs)
+    ===
+    stripMsg to (Binary.runGetOrFail Binary.gget bs)
+  where
+    bs = LBS.pack [w0]
+
+    stripMsg
+        :: (a -> LicenseExceptionId)
+        -> Either (x, y, String) (x, y, a)
+        -> Either (x, y) (x, y, LicenseExceptionId)
+    stripMsg _ (Left (x,y,_))  = Left (x,y)
+    stripMsg f (Right (x,y,t)) = Right (x,y,f t)
+#endif
 
 licenseRefRoundtrip :: LicenseRef -> Property
 licenseRefRoundtrip x =
@@ -36,12 +103,12 @@ licenseRefRoundtrip x =
     Right x === eitherParsec (prettyShow x)
 
 simpleLicenseExpressionRoundtrip :: SimpleLicenseExpression -> Property
-simpleLicenseExpressionRoundtrip x = 
+simpleLicenseExpressionRoundtrip x =
     counterexample (prettyShow x) $
     Right x === eitherParsec (prettyShow x)
 
 licenseExpressionRoundtrip :: LicenseExpression -> Property
-licenseExpressionRoundtrip x = 
+licenseExpressionRoundtrip x =
     counterexample (prettyShow x) $
     Right (reassoc x) === eitherParsec (prettyShow x)
 
@@ -56,44 +123,58 @@ reassoc (EAnd a b) = case reassoc a of
 reassoc l = l
 
 -------------------------------------------------------------------------------
--- Instances
+-- isAcceptableLicence
 -------------------------------------------------------------------------------
 
-instance Arbitrary LicenseId where
-    arbitrary = arbitraryBoundedEnum
+shouldAccept :: [License]
+shouldAccept = map License
+    [ simpleLicenseExpression GPL_2_0_only
+    , simpleLicenseExpression GPL_2_0_or_later
+    , simpleLicenseExpression BSD_2_Clause
+    , simpleLicenseExpression BSD_3_Clause
+    , simpleLicenseExpression MIT
+    , simpleLicenseExpression ISC
+    , simpleLicenseExpression MPL_2_0
+    , simpleLicenseExpression Apache_2_0
+    , simpleLicenseExpression CC0_1_0
+    , simpleLicenseExpression BSD_4_Clause `EOr` simpleLicenseExpression MIT
+    ]
 
-instance Arbitrary LicenseExceptionId where
-    arbitrary = arbitraryBoundedEnum
+shouldReject :: [License]
+shouldReject = map License
+    [ simpleLicenseExpression BSD_4_Clause
+    , simpleLicenseExpression BSD_4_Clause `EAnd` simpleLicenseExpression MIT
+    ]
 
-instance Arbitrary LicenseRef where
-    arbitrary = mkLicenseRef' <$> ids' <*> ids
-      where
-        ids = listOf1 $ elements $ ['a'..'z'] ++ ['A' .. 'Z'] ++ ['0'..'9'] ++ "_-"
-        ids' = oneof [ pure Nothing, Just <$> ids ]
+-- | A sketch of what Hackage could accept
+--
+-- * NONE is rejected
+--
+-- * "or later" syntax (+ postfix) is rejected
+--
+-- * "WITH exc" exceptions are rejected
+--
+-- * There should be a way to interpert license as (conjunction of)
+--   OSI-accepted licenses or CC0
+--
+isAcceptableLicense :: License -> Bool
+isAcceptableLicense NONE           = False
+isAcceptableLicense (License expr) = goExpr expr
+  where
+    goExpr (EAnd a b)            = goExpr a && goExpr b
+    goExpr (EOr a b)             = goExpr a || goExpr b
+    goExpr (ELicense _ (Just _)) = False -- Don't allow exceptions
+    goExpr (ELicense s Nothing)  = goSimple s
 
-instance Arbitrary SimpleLicenseExpression where
-    arbitrary = oneof
-        [ ELicenseId <$> arbitrary
-        , ELicenseIdPlus <$> arbitrary
-        , ELicenseRef <$> arbitrary
-        ]
+    goSimple (ELicenseRef _)      = False -- don't allow referenced licenses
+    goSimple (ELicenseIdPlus _)   = False -- don't allow + licenses (use GPL-3.0-or-later e.g.)
+    goSimple (ELicenseId CC0_1_0) = True -- CC0 isn't OSI approved, but we allow it as "PublicDomain", this is eg. PublicDomain in http://hackage.haskell.org/package/string-qq-0.0.2/src/LICENSE
+    goSimple (ELicenseId lid)     = licenseIsOsiApproved lid -- allow only OSI approved licenses.
 
-instance Arbitrary LicenseExpression where
-    arbitrary = sized arb
-      where
-        arb n
-            | n <= 0     = ELicense <$> arbitrary <*> pure Nothing
-            | otherwise = oneof
-                [ ELicense <$> arbitrary <*> arbitrary
-                , EAnd <$> arbA <*> arbB
-                , EOr <$> arbA <*> arbB
-                ]
-              where
-                m = n `div` 2
-                arbA = arb m 
-                arbB = arb (n - m)
+shouldAcceptProp :: Property
+shouldAcceptProp = conjoin $
+    map (\l -> counterexample (prettyShow l) (isAcceptableLicense l)) shouldAccept
 
-    shrink (EAnd a b) = a : b : map (uncurry EAnd) (shrink (a, b))
-    shrink (EOr a b)  = a : b : map (uncurry EOr) (shrink (a, b))
-    shrink _          = []
-
+shouldRejectProp :: Property
+shouldRejectProp = conjoin $
+    map (\l -> counterexample (prettyShow l) (not $ isAcceptableLicense l)) shouldReject

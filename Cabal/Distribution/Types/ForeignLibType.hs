@@ -1,5 +1,6 @@
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE OverloadedStrings #-}
 
 module Distribution.Types.ForeignLibType(
     ForeignLibType(..),
@@ -12,11 +13,10 @@ import Distribution.Compat.Prelude
 import Distribution.PackageDescription.Utils
 
 import Distribution.Pretty
-import Distribution.Parsec.Class
-import Distribution.Text
+import Distribution.Parsec
+import Distribution.FieldGrammar.Described
 
 import qualified Distribution.Compat.CharParsing as P
-import qualified Distribution.Compat.ReadP as Parse
 import qualified Text.PrettyPrint as Disp
 
 -- | What kind of foreign library is to be built?
@@ -43,14 +43,11 @@ instance Parsec ForeignLibType where
       "native-static" -> ForeignLibNativeStatic
       _               -> ForeignLibTypeUnknown
 
-instance Text ForeignLibType where
-  parse = Parse.choice [
-      do _ <- Parse.string "native-shared" ; return ForeignLibNativeShared
-    , do _ <- Parse.string "native-static" ; return ForeignLibNativeStatic
-    ]
+instance Described ForeignLibType where
+  describe _ = REUnion ["native-shared","native-static"]
 
 instance Binary ForeignLibType
-
+instance Structured ForeignLibType
 instance NFData ForeignLibType where rnf = genericRnf
 
 instance Semigroup ForeignLibType where

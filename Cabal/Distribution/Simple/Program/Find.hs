@@ -1,4 +1,5 @@
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE RankNTypes #-}
@@ -67,9 +68,10 @@ type ProgramSearchPath = [ProgramSearchPathEntry]
 data ProgramSearchPathEntry =
          ProgramSearchPathDir FilePath  -- ^ A specific dir
        | ProgramSearchPathDefault       -- ^ The system default
-  deriving (Eq, Generic)
+  deriving (Eq, Generic, Typeable)
 
 instance Binary ProgramSearchPathEntry
+instance Structured ProgramSearchPathEntry
 
 defaultProgramSearchPath :: ProgramSearchPath
 defaultProgramSearchPath = [ProgramSearchPathDefault]
@@ -95,14 +97,14 @@ findProgramOnSearchPath verbosity searchpath prog = do
           where
             alltried = concat (reverse (notfoundat : tried))
 
-    tryPathElem :: ProgramSearchPathEntry -> NoCallStackIO (Maybe FilePath, [FilePath])
+    tryPathElem :: ProgramSearchPathEntry -> IO (Maybe FilePath, [FilePath])
     tryPathElem (ProgramSearchPathDir dir) =
         findFirstExe [ dir </> prog <.> ext | ext <- exeExtensions ]
 
     -- On windows, getSystemSearchPath is not guaranteed 100% correct so we
     -- use findExecutable and then approximate the not-found-at locations.
     tryPathElem ProgramSearchPathDefault | buildOS == Windows = do
-      mExe    <- findExecutable prog
+      mExe    <- firstJustM [ findExecutable (prog <.> ext) | ext <- exeExtensions ]
       syspath <- getSystemSearchPath
       case mExe of
         Nothing ->
@@ -120,7 +122,7 @@ findProgramOnSearchPath verbosity searchpath prog = do
       dirs <- getSystemSearchPath
       findFirstExe [ dir </> prog <.> ext | dir <- dirs, ext <- exeExtensions ]
 
-    findFirstExe :: [FilePath] -> NoCallStackIO (Maybe FilePath, [FilePath])
+    findFirstExe :: [FilePath] -> IO (Maybe FilePath, [FilePath])
     findFirstExe = go []
       where
         go fs' []     = return (Nothing, reverse fs')
@@ -130,10 +132,19 @@ findProgramOnSearchPath verbosity searchpath prog = do
             then return (Just f, reverse fs')
             else go (f:fs') fs
 
+    -- Helper for evaluating actions until the first one returns 'Just'
+    firstJustM :: Monad m => [m (Maybe a)] -> m (Maybe a)
+    firstJustM [] = return Nothing
+    firstJustM (ma:mas) = do
+      a <- ma
+      case a of
+        Just _  -> return a
+        Nothing -> firstJustM mas
+
 -- | Interpret a 'ProgramSearchPath' to construct a new @$PATH@ env var.
 -- Note that this is close but not perfect because on Windows the search
 -- algorithm looks at more than just the @%PATH%@.
-programSearchPathAsPATHVar :: ProgramSearchPath -> NoCallStackIO String
+programSearchPathAsPATHVar :: ProgramSearchPath -> IO String
 programSearchPathAsPATHVar searchpath = do
     ess <- traverse getEntries searchpath
     return (intercalate [searchPathSeparator] (concat ess))
@@ -146,7 +157,7 @@ programSearchPathAsPATHVar searchpath = do
 -- | Get the system search path. On Unix systems this is just the @$PATH@ env
 -- var, but on windows it's a bit more complicated.
 --
-getSystemSearchPath :: NoCallStackIO [FilePath]
+getSystemSearchPath :: IO [FilePath]
 getSystemSearchPath = fmap nub $ do
 #if defined(mingw32_HOST_OS)
     processdir <- takeDirectory `fmap` Win32.getModuleFileName Win32.nullHANDLE
@@ -168,7 +179,7 @@ getSystemSearchPath = fmap nub $ do
 #endif
 #endif
 
-findExecutable :: FilePath -> NoCallStackIO (Maybe FilePath)
+findExecutable :: FilePath -> IO (Maybe FilePath)
 #ifdef HAVE_directory_121
 findExecutable = Directory.findExecutable
 #else

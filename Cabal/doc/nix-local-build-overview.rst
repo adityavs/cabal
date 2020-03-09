@@ -2,18 +2,27 @@ Nix-style Local Builds
 ======================
 
 Nix-style local builds are a new build system implementation inspired by Nix.
-The Nix-style local build system is commonly called "new-build" for short after the ``cabal new-*`` family of commands that control it.
-However those names are only temporary until Nix-style local builds becomes the default.
+The Nix-style local build system is commonly called "v2-build" for short
+after the ``cabal v2-*`` family of commands that control it. However, those
+names are only temporary until Nix-style local builds become the default.
+This is expected to happen soon. For those who do not wish to use the new
+functionality, the classic project style will not be removed immediately,
+but these legacy commands will require the usage of the ``v1-`` prefix as of
+Cabal 3.0 and will be removed in a future release. For a future-proof
+way to use these commands in a script or tutorial that anticipates the
+possibility of another UI paradigm being devised in the future, there
+are also ``v2-`` prefixed versions that will reference the same functionality
+until such a point as it is completely removed from Cabal.
 
 Nix-style local builds combine the best of non-sandboxed and sandboxed Cabal:
 
 1. Like sandboxed Cabal today, we build sets of independent local
    packages deterministically and independent of any global state.
-   new-build will never tell you that it can't build your package
+   v2-build will never tell you that it can't build your package
    because it would result in a "dangerous reinstall." Given a
    particular state of the Hackage index, your build is completely
    reproducible. For example, you no longer need to compile packages
-   with profiling ahead of time; just request profiling and new-build
+   with profiling ahead of time; just request profiling and v2-build
    will rebuild all its dependencies with profiling automatically.
 
 2. Like non-sandboxed Cabal today, builds of external packages are

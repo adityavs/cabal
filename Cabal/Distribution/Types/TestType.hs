@@ -1,5 +1,6 @@
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveGeneric      #-}
+{-# LANGUAGE OverloadedStrings  #-}
 
 module Distribution.Types.TestType (
     TestType(..),
@@ -10,10 +11,10 @@ import Distribution.Compat.Prelude
 import Distribution.Version
 import Prelude ()
 
-import Distribution.Parsec.Class
+import Distribution.FieldGrammar.Described
+import Distribution.Parsec
 import Distribution.Pretty
-import Distribution.Text
-import Text.PrettyPrint          (char, text)
+import Text.PrettyPrint                    (char, text)
 
 -- | The \"test-type\" field in the test suite stanza.
 --
@@ -23,6 +24,7 @@ data TestType = TestTypeExe Version     -- ^ \"type: exitcode-stdio-x.y\"
     deriving (Generic, Show, Read, Eq, Typeable, Data)
 
 instance Binary TestType
+instance Structured TestType
 
 instance NFData TestType where rnf = genericRnf
 
@@ -41,8 +43,5 @@ instance Parsec TestType where
       "detailed"       -> TestTypeLib ver
       _                -> TestTypeUnknown name ver
 
-instance Text TestType where
-  parse = stdParse $ \ver name -> case name of
-    "exitcode-stdio" -> TestTypeExe ver
-    "detailed"       -> TestTypeLib ver
-    _                -> TestTypeUnknown name ver
+instance Described TestType where
+    describe _ = REUnion ["exitcode-stdio-1.0", "detailed-0.9"]

@@ -5,7 +5,8 @@ module Distribution.Solver.Types.ConstraintSource
     ) where
 
 import GHC.Generics (Generic)
-import Distribution.Compat.Binary (Binary(..))
+import Distribution.Compat.Binary (Binary)
+import Distribution.Utils.Structured (Structured)
 
 -- | Source of a 'PackageConstraint'.
 data ConstraintSource =
@@ -49,9 +50,14 @@ data ConstraintSource =
   -- | An internal constraint due to compatibility issues with the Setup.hs
   -- command line interface requires a minimum lower bound on Cabal
   | ConstraintSetupCabalMinVersion
+
+  -- | An internal constraint due to compatibility issues with the Setup.hs
+  -- command line interface requires a maximum upper bound on Cabal
+  | ConstraintSetupCabalMaxVersion
   deriving (Eq, Show, Generic)
 
 instance Binary ConstraintSource
+instance Structured ConstraintSource
 
 -- | Description of a 'ConstraintSource'.
 showConstraintSource :: ConstraintSource -> String
@@ -74,3 +80,5 @@ showConstraintSource ConstraintSourceConfigFlagOrTarget =
 showConstraintSource ConstraintSourceUnknown = "unknown source"
 showConstraintSource ConstraintSetupCabalMinVersion =
     "minimum version of Cabal used by Setup.hs"
+showConstraintSource ConstraintSetupCabalMaxVersion =
+    "maximum version of Cabal used by Setup.hs"

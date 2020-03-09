@@ -35,6 +35,8 @@ module Distribution.Utils.Generic (
         toUTF8BS,
         toUTF8LBS,
 
+        validateUTF8,
+
         -- ** File I/O
         readUTF8File,
         withUTF8FileContents,
@@ -62,13 +64,18 @@ module Distribution.Utils.Generic (
         ordNub,
         ordNubBy,
         ordNubRight,
+        safeHead,
         safeTail,
+        safeLast,
+        safeInit,
         unintersperse,
         wrapText,
         wrapLine,
         unfoldrM,
         spanMaybe,
         breakMaybe,
+        unsnoc,
+        unsnocNE,
 
         -- * FilePath stuff
         isAbsoluteOnAnyPlatform,
@@ -80,6 +87,7 @@ import Distribution.Compat.Prelude
 
 import Distribution.Utils.String
 
+import Data.Bits ((.&.), (.|.), shiftL)
 import Data.List
     ( isInfixOf )
 import Data.Ord
@@ -135,7 +143,7 @@ wrapLine width = wrap 0 []
 -- The file is read lazily but if it is not fully consumed by the action then
 -- the remaining input is truncated and the file is closed.
 --
-withFileContents :: FilePath -> (String -> NoCallStackIO a) -> NoCallStackIO a
+withFileContents :: FilePath -> (String -> IO a) -> IO a
 withFileContents name action =
   withFile name ReadMode
            (\hnd -> hGetContents hnd >>= action)
@@ -148,7 +156,7 @@ withFileContents name action =
 -- On windows it is not possible to delete a file that is open by a process.
 -- This case will give an IO exception but the atomic property is not affected.
 --
-writeFileAtomic :: FilePath -> BS.ByteString -> NoCallStackIO ()
+writeFileAtomic :: FilePath -> BS.ByteString -> IO ()
 writeFileAtomic targetPath content = do
   let (targetDir, targetFile) = splitFileName targetPath
   Exception.bracketOnError
@@ -189,6 +197,46 @@ toUTF8BS = SBS.pack . encodeStringUtf8
 toUTF8LBS :: String -> BS.ByteString
 toUTF8LBS = BS.pack . encodeStringUtf8
 
+-- | Check that strict 'ByteString' is valid UTF8. Returns 'Just offset' if it's not.
+validateUTF8 :: SBS.ByteString -> Maybe Int
+validateUTF8 = go 0 where
+    go off bs = case SBS.uncons bs of
+        Nothing -> Nothing
+        Just (c, bs')
+            | c <= 0x7F -> go (off + 1) bs'
+            | c <= 0xBF -> Just off
+            | c <= 0xDF -> twoBytes off c bs'
+            | c <= 0xEF -> moreBytes off 3 0x800     bs' (fromIntegral $ c .&. 0xF)
+            | c <= 0xF7 -> moreBytes off 4 0x10000   bs' (fromIntegral $ c .&. 0x7)
+            | c <= 0xFB -> moreBytes off 5 0x200000  bs' (fromIntegral $ c .&. 0x3)
+            | c <= 0xFD -> moreBytes off 6 0x4000000 bs' (fromIntegral $ c .&. 0x1)
+            | otherwise -> Just off
+
+    twoBytes off c0 bs = case SBS.uncons bs of
+        Nothing        -> Just off
+        Just (c1, bs')
+            | c1 .&. 0xC0 == 0x80 ->
+                if d >= (0x80 :: Int)
+                then go (off + 2) bs'
+                else Just off
+            | otherwise -> Just off
+          where
+            d = (fromIntegral (c0 .&. 0x1F) `shiftL` 6) .|. fromIntegral (c1 .&. 0x3F)
+
+    moreBytes :: Int -> Int -> Int -> SBS.ByteString -> Int -> Maybe Int
+    moreBytes off 1 overlong cs' acc
+      | overlong <= acc, acc <= 0x10FFFF, acc < 0xD800 || 0xDFFF < acc
+      = go (off + 1) cs'
+
+      | otherwise
+      = Just off
+
+    moreBytes off byteCount overlong bs acc = case SBS.uncons bs of
+        Just (cn, bs') | cn .&. 0xC0 == 0x80 ->
+            moreBytes (off + 1) (byteCount-1) overlong bs' ((acc `shiftL` 6) .|. fromIntegral cn .&. 0x3F)
+        _ -> Just off
+        
+
 -- | Ignore a Unicode byte order mark (BOM) at the beginning of the input
 --
 ignoreBOM :: String -> String
@@ -199,7 +247,7 @@ ignoreBOM string            = string
 --
 -- Reads lazily using ordinary 'readFile'.
 --
-readUTF8File :: FilePath -> NoCallStackIO String
+readUTF8File :: FilePath -> IO String
 readUTF8File f = (ignoreBOM . fromUTF8LBS) <$> BS.readFile f
 
 -- | Reads a UTF8 encoded text file as a Unicode String
@@ -215,7 +263,7 @@ withUTF8FileContents name action =
 --
 -- Uses 'writeFileAtomic', so provides the same guarantees.
 --
-writeUTF8File :: FilePath -> String -> NoCallStackIO ()
+writeUTF8File :: FilePath -> String -> IO ()
 writeUTF8File path = writeFileAtomic path . BS.pack . encodeStringUtf8
 
 -- | Fix different systems silly line ending conventions
@@ -237,11 +285,11 @@ normaliseLineEndings (  c :s)      =   c  : normaliseLineEndings s
 --
 -- Example:
 --
--- >>> tail $ Data.List.dropWhileEnd (<3) [undefined, 5, 4, 3, 2, 1]
+-- >>> safeTail $ Data.List.dropWhileEnd (<3) [undefined, 5, 4, 3, 2, 1]
 -- *** Exception: Prelude.undefined
 -- ...
 --
--- >>> tail $ dropWhileEndLE (<3) [undefined, 5, 4, 3, 2, 1]
+-- >>> safeTail $ dropWhileEndLE (<3) [undefined, 5, 4, 3, 2, 1]
 -- [5,4,3]
 --
 -- >>> take 3 $ Data.List.dropWhileEnd (<3) [5, 4, 3, 2, 1, undefined]
@@ -320,10 +368,34 @@ listUnionRight a b = ordNubRight (filter (`Set.notMember` bSet) a) ++ b
   where
     bSet = Set.fromList b
 
+-- | A total variant of 'head'.
+--
+-- @since 3.2.0.0
+safeHead :: [a] -> Maybe a
+safeHead []    = Nothing
+safeHead (x:_) = Just x
+
 -- | A total variant of 'tail'.
+--
+-- @since 3.2.0.0
 safeTail :: [a] -> [a]
 safeTail []     = []
 safeTail (_:xs) = xs
+
+-- | A total variant of 'last'.
+--
+-- @since 3.2.0.0
+safeLast :: [a] -> Maybe a
+safeLast []     = Nothing
+safeLast (x:xs) = Just (foldl (\_ a -> a) x xs)
+
+-- | A total variant of 'init'.
+--
+-- @since 3.2.0.0
+safeInit :: [a] -> [a]
+safeInit []     = []
+safeInit [_]    = []
+safeInit (x:xs) = x : safeInit xs
 
 equating :: Eq a => (b -> a) -> b -> b -> Bool
 equating p x y = p x == p y
@@ -410,6 +482,39 @@ unfoldrM f = go where
         case m of
             Nothing      -> return []
             Just (a, b') -> liftM (a :) (go b')
+
+-- | The opposite of 'snoc', which is the reverse of 'cons'
+--
+-- Example:
+--
+-- >>> unsnoc [1, 2, 3]
+-- Just ([1,2],3)
+--
+-- >>> unsnoc []
+-- Nothing
+--
+-- @since 3.2.0.0
+--
+unsnoc :: [a] -> Maybe ([a], a)
+unsnoc []     = Nothing
+unsnoc (x:xs) = Just (unsnocNE (x :| xs))
+
+-- | Like 'unsnoc', but for 'NonEmpty' so without the 'Maybe'
+--
+-- Example:
+--
+-- >>> unsnocNE (1 :| [2, 3])
+-- ([1,2],3)
+--
+-- >>> unsnocNE (1 :| [])
+-- ([],1)
+--
+-- @since 3.2.0.0
+--
+unsnocNE :: NonEmpty a -> ([a], a)
+unsnocNE (x:|xs) = go x xs where
+    go y []     = ([], y)
+    go y (z:zs) = let ~(ws, w) = go z zs in (y : ws, w)
 
 -- ------------------------------------------------------------
 -- * FilePath stuff

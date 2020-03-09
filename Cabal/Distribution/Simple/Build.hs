@@ -19,41 +19,42 @@
 --
 
 module Distribution.Simple.Build (
-    build, repl,
+    build, showBuildInfo, repl,
     startInterpreter,
 
     initialBuildSteps,
+    createInternalPackageDB,
     componentInitialBuildSteps,
     writeAutogenFiles,
   ) where
 
 import Prelude ()
 import Distribution.Compat.Prelude
+import Distribution.Utils.Generic
 
-import Distribution.Types.Dependency
-import Distribution.Types.LocalBuildInfo
-import Distribution.Types.TargetInfo
+import Distribution.Types.ComponentLocalBuildInfo
 import Distribution.Types.ComponentRequestedSpec
+import Distribution.Types.Dependency
+import Distribution.Types.ExecutableScope
 import Distribution.Types.ForeignLib
+import Distribution.Types.LibraryVisibility
+import Distribution.Types.LocalBuildInfo
 import Distribution.Types.MungedPackageId
 import Distribution.Types.MungedPackageName
+import Distribution.Types.TargetInfo
 import Distribution.Types.UnqualComponentName
-import Distribution.Types.ComponentLocalBuildInfo
-import Distribution.Types.ExecutableScope
 
 import Distribution.Package
 import Distribution.Backpack
 import Distribution.Backpack.DescribeUnitId
 import qualified Distribution.Simple.GHC   as GHC
 import qualified Distribution.Simple.GHCJS as GHCJS
-import qualified Distribution.Simple.JHC   as JHC
-import qualified Distribution.Simple.LHC   as LHC
 import qualified Distribution.Simple.UHC   as UHC
 import qualified Distribution.Simple.HaskellSuite as HaskellSuite
 import qualified Distribution.Simple.PackageIndex as Index
 
-import qualified Distribution.Simple.Build.Macros      as Build.Macros
-import qualified Distribution.Simple.Build.PathsModule as Build.PathsModule
+import Distribution.Simple.Build.Macros      (generateCabalMacrosHeader)
+import Distribution.Simple.Build.PathsModule (generatePathsModule)
 import qualified Distribution.Simple.Program.HcPkg as HcPkg
 
 import Distribution.Simple.Compiler hiding (Flag)
@@ -69,14 +70,16 @@ import Distribution.Simple.PreProcess
 import Distribution.Simple.LocalBuildInfo
 import Distribution.Simple.Program.Types
 import Distribution.Simple.Program.Db
+import Distribution.Simple.ShowBuildInfo
 import Distribution.Simple.BuildPaths
 import Distribution.Simple.Configure
 import Distribution.Simple.Register
 import Distribution.Simple.Test.LibV09
 import Distribution.Simple.Utils
+import Distribution.Simple.Utils.Json
 
 import Distribution.System
-import Distribution.Text
+import Distribution.Pretty
 import Distribution.Verbosity
 
 import Distribution.Compat.Graph (IsNode(..))
@@ -128,6 +131,18 @@ build pkg_descr lbi flags suffixes = do
   verbosity = fromFlag (buildVerbosity flags)
 
 
+showBuildInfo :: PackageDescription  -- ^ Mostly information from the .cabal file
+  -> LocalBuildInfo      -- ^ Configuration information
+  -> BuildFlags          -- ^ Flags that the user passed to build
+  -> IO String
+showBuildInfo pkg_descr lbi flags = do
+  let verbosity = fromFlag (buildVerbosity flags)
+  targets <- readTargetInfos verbosity pkg_descr lbi (buildArgs flags)
+  let targetsToBuild = neededTargetsInBuildOrder' pkg_descr lbi (map nodeKey targets)
+      doc = mkBuildInfo pkg_descr lbi flags targetsToBuild
+  return $ renderJson doc ""
+
+
 repl     :: PackageDescription  -- ^ Mostly information from the .cabal file
          -> LocalBuildInfo      -- ^ Configuration information
          -> ReplFlags           -- ^ Flags that the user passed to build
@@ -140,7 +155,9 @@ repl pkg_descr lbi flags suffixes args = do
 
   target <- readTargetInfos verbosity pkg_descr lbi args >>= \r -> case r of
     -- This seems DEEPLY questionable.
-    []       -> return (head (allTargetsInBuildOrder' pkg_descr lbi))
+    []       -> case allTargetsInBuildOrder' pkg_descr lbi of
+      (target:_) -> return target
+      []         -> die' verbosity $ "Failed to determine target."
     [target] -> return target
     _        -> die' verbosity $ "The 'repl' command does not support multiple targets at once."
   let componentsToBuild = neededTargetsInBuildOrder' pkg_descr lbi [nodeKey target]
@@ -166,14 +183,15 @@ repl pkg_descr lbi flags suffixes args = do
          componentInitialBuildSteps distPref pkg_descr lbi clbi verbosity
          buildComponent verbosity NoFlag
                         pkg_descr lbi' suffixes comp clbi distPref
-    | subtarget <- init componentsToBuild ]
+    | subtarget <- safeInit componentsToBuild ]
 
   -- REPL for target components
   let clbi = targetCLBI target
       comp = targetComponent target
       lbi' = lbiForComponent comp lbi
+      replFlags = replReplOptions flags
   componentInitialBuildSteps distPref pkg_descr lbi clbi verbosity
-  replComponent verbosity pkg_descr lbi' suffixes comp clbi distPref
+  replComponent replFlags verbosity pkg_descr lbi' suffixes comp clbi distPref
 
 
 -- | Start an interpreter without loading any package files.
@@ -201,7 +219,13 @@ buildComponent verbosity numJobs pkg_descr lbi suffixes
     setupMessage' verbosity "Building" (packageId pkg_descr)
       (componentLocalName clbi) (maybeComponentInstantiatedWith clbi)
     let libbi = libBuildInfo lib
-        lib' = lib { libBuildInfo = addExtraCxxSources (addExtraCSources libbi extras) extras }
+        lib' = lib { libBuildInfo = flip addExtraAsmSources extras
+                                  $ flip addExtraCmmSources extras
+                                  $ flip addExtraCxxSources extras
+                                  $ flip addExtraCSources   extras
+                                  $ libbi
+                   }
+
     buildLib verbosity numJobs pkg_descr lbi lib' clbi
 
     let oneComponentRequested (OneComponentRequestedSpec _) = True
@@ -300,27 +324,27 @@ buildComponent verbosity numJobs pkg_descr lbi0 suffixes
 buildComponent verbosity _ _ _ _
                (CTest TestSuite { testInterface = TestSuiteUnsupported tt })
                _ _ =
-    die' verbosity $ "No support for building test suite type " ++ display tt
+    die' verbosity $ "No support for building test suite type " ++ prettyShow tt
 
 
 buildComponent verbosity numJobs pkg_descr lbi suffixes
                comp@(CBench bm@Benchmark { benchmarkInterface = BenchmarkExeV10 {} })
-               clbi _ = do
-    let (exe, exeClbi) = benchmarkExeV10asExe bm clbi
+               clbi _distPref = do
+    let exe = benchmarkExeV10asExe bm
     preprocessComponent pkg_descr comp lbi clbi False verbosity suffixes
     extras <- preprocessExtras verbosity comp lbi
     setupMessage' verbosity "Building" (packageId pkg_descr)
       (componentLocalName clbi) (maybeComponentInstantiatedWith clbi)
     let ebi = buildInfo exe
         exe' = exe { buildInfo = addExtraCSources ebi extras }
-    buildExe verbosity numJobs pkg_descr lbi exe' exeClbi
+    buildExe verbosity numJobs pkg_descr lbi exe' clbi
     return Nothing
 
 
 buildComponent verbosity _ _ _ _
                (CBench Benchmark { benchmarkInterface = BenchmarkUnsupported tt })
                _ _ =
-    die' verbosity $ "No support for building benchmark type " ++ display tt
+    die' verbosity $ "No support for building benchmark type " ++ prettyShow tt
 
 
 -- | Add extra C sources generated by preprocessing to build
@@ -341,7 +365,26 @@ addExtraCxxSources bi extras = bi { cxxSources = new }
         exs = Set.fromList extras
 
 
-replComponent :: Verbosity
+-- | Add extra C-- sources generated by preprocessing to build
+-- information.
+addExtraCmmSources :: BuildInfo -> [FilePath] -> BuildInfo
+addExtraCmmSources bi extras = bi { cmmSources = new }
+  where new = Set.toList $ old `Set.union` exs
+        old = Set.fromList $ cmmSources bi
+        exs = Set.fromList extras
+
+
+-- | Add extra ASM sources generated by preprocessing to build
+-- information.
+addExtraAsmSources :: BuildInfo -> [FilePath] -> BuildInfo
+addExtraAsmSources bi extras = bi { asmSources = new }
+  where new = Set.toList $ old `Set.union` exs
+        old = Set.fromList $ asmSources bi
+        exs = Set.fromList extras
+
+
+replComponent :: [String]
+              -> Verbosity
               -> PackageDescription
               -> LocalBuildInfo
               -> [PPSuffixHandler]
@@ -349,29 +392,29 @@ replComponent :: Verbosity
               -> ComponentLocalBuildInfo
               -> FilePath
               -> IO ()
-replComponent verbosity pkg_descr lbi suffixes
+replComponent replFlags verbosity pkg_descr lbi suffixes
                comp@(CLib lib) clbi _ = do
     preprocessComponent pkg_descr comp lbi clbi False verbosity suffixes
     extras <- preprocessExtras verbosity comp lbi
     let libbi = libBuildInfo lib
         lib' = lib { libBuildInfo = libbi { cSources = cSources libbi ++ extras } }
-    replLib verbosity pkg_descr lbi lib' clbi
+    replLib replFlags verbosity pkg_descr lbi lib' clbi
 
-replComponent verbosity pkg_descr lbi suffixes
+replComponent replFlags verbosity pkg_descr lbi suffixes
                comp@(CFLib flib) clbi _ = do
     preprocessComponent pkg_descr comp lbi clbi False verbosity suffixes
-    replFLib verbosity pkg_descr lbi flib clbi
+    replFLib replFlags verbosity pkg_descr lbi flib clbi
 
-replComponent verbosity pkg_descr lbi suffixes
+replComponent replFlags verbosity pkg_descr lbi suffixes
                comp@(CExe exe) clbi _ = do
     preprocessComponent pkg_descr comp lbi clbi False verbosity suffixes
     extras <- preprocessExtras verbosity comp lbi
     let ebi = buildInfo exe
         exe' = exe { buildInfo = ebi { cSources = cSources ebi ++ extras } }
-    replExe verbosity pkg_descr lbi exe' clbi
+    replExe replFlags verbosity pkg_descr lbi exe' clbi
 
 
-replComponent verbosity pkg_descr lbi suffixes
+replComponent replFlags verbosity pkg_descr lbi suffixes
                comp@(CTest test@TestSuite { testInterface = TestSuiteExeV10{} })
                clbi _distPref = do
     let exe = testSuiteExeV10AsExe test
@@ -379,10 +422,10 @@ replComponent verbosity pkg_descr lbi suffixes
     extras <- preprocessExtras verbosity comp lbi
     let ebi = buildInfo exe
         exe' = exe { buildInfo = ebi { cSources = cSources ebi ++ extras } }
-    replExe verbosity pkg_descr lbi exe' clbi
+    replExe replFlags verbosity pkg_descr lbi exe' clbi
 
 
-replComponent verbosity pkg_descr lbi0 suffixes
+replComponent replFlags verbosity pkg_descr lbi0 suffixes
                comp@(CTest
                  test@TestSuite { testInterface = TestSuiteLibV09{} })
                clbi distPref = do
@@ -393,30 +436,30 @@ replComponent verbosity pkg_descr lbi0 suffixes
     extras <- preprocessExtras verbosity comp lbi
     let libbi = libBuildInfo lib
         lib' = lib { libBuildInfo = libbi { cSources = cSources libbi ++ extras } }
-    replLib verbosity pkg lbi lib' libClbi
+    replLib replFlags verbosity pkg lbi lib' libClbi
 
 
-replComponent verbosity _ _ _
+replComponent _ verbosity _ _ _
               (CTest TestSuite { testInterface = TestSuiteUnsupported tt })
               _ _ =
-    die' verbosity $ "No support for building test suite type " ++ display tt
+    die' verbosity $ "No support for building test suite type " ++ prettyShow tt
 
 
-replComponent verbosity pkg_descr lbi suffixes
+replComponent replFlags verbosity pkg_descr lbi suffixes
                comp@(CBench bm@Benchmark { benchmarkInterface = BenchmarkExeV10 {} })
-               clbi _ = do
-    let (exe, exeClbi) = benchmarkExeV10asExe bm clbi
+               clbi _distPref = do
+    let exe = benchmarkExeV10asExe bm
     preprocessComponent pkg_descr comp lbi clbi False verbosity suffixes
     extras <- preprocessExtras verbosity comp lbi
     let ebi = buildInfo exe
         exe' = exe { buildInfo = ebi { cSources = cSources ebi ++ extras } }
-    replExe verbosity pkg_descr lbi exe' exeClbi
+    replExe replFlags verbosity pkg_descr lbi exe' clbi
 
 
-replComponent verbosity _ _ _
+replComponent _ verbosity _ _ _
               (CBench Benchmark { benchmarkInterface = BenchmarkUnsupported tt })
               _ _ =
-    die' verbosity $ "No support for building benchmark type " ++ display tt
+    die' verbosity $ "No support for building benchmark type " ++ prettyShow tt
 
 ----------------------------------------------------
 -- Shared code for buildComponent and replComponent
@@ -432,6 +475,17 @@ testSuiteExeV10AsExe test@TestSuite { testInterface = TestSuiteExeV10 _ mainFile
       buildInfo  = testBuildInfo test
     }
 testSuiteExeV10AsExe TestSuite{} = error "testSuiteExeV10AsExe: wrong kind"
+
+-- | Translate a exe-style 'Benchmark' component into an exe for building
+benchmarkExeV10asExe :: Benchmark -> Executable
+benchmarkExeV10asExe bm@Benchmark { benchmarkInterface = BenchmarkExeV10 _ mainFile } =
+    Executable {
+      exeName    = benchmarkName bm,
+      modulePath = mainFile,
+      exeScope   = ExecutablePublic,
+      buildInfo  = benchmarkBuildInfo bm
+    }
+benchmarkExeV10asExe Benchmark{} = error "benchmarkExeV10asExe: wrong kind"
 
 -- | Translate a lib-style 'TestSuite' component into a lib + exe for building
 testSuiteLibV09AsLibAndExe :: PackageDescription
@@ -452,24 +506,26 @@ testSuiteLibV09AsLibAndExe pkg_descr
   where
     bi  = testBuildInfo test
     lib = Library {
-            libName = Nothing,
+            libName = LMainLibName,
             exposedModules = [ m ],
             reexportedModules = [],
             signatures = [],
             libExposed     = True,
+            libVisibility  = LibraryVisibilityPrivate,
             libBuildInfo   = bi
           }
     -- This is, like, the one place where we use a CTestName for a library.
     -- Should NOT use library name, since that could conflict!
     PackageIdentifier pkg_name pkg_ver = package pkg_descr
-    compat_name = computeCompatPackageName pkg_name (Just (testName test))
+    -- Note: we do make internal library from the test!
+    compat_name = MungedPackageName pkg_name (LSubLibName (testName test))
     compat_key = computeCompatPackageKey (compiler lbi) compat_name pkg_ver (componentUnitId clbi)
     libClbi = LibComponentLocalBuildInfo
                 { componentPackageDeps = componentPackageDeps clbi
                 , componentInternalDeps = componentInternalDeps clbi
                 , componentIsIndefinite_ = False
                 , componentExeDeps = componentExeDeps clbi
-                , componentLocalName = CSubLibName (testName test)
+                , componentLocalName = CLibName $ LSubLibName $ testName test
                 , componentIsPublic = False
                 , componentIncludes = componentIncludes clbi
                 , componentUnitId = componentUnitId clbi
@@ -480,8 +536,7 @@ testSuiteLibV09AsLibAndExe pkg_descr
                 , componentExposedModules = [IPI.ExposedModule m Nothing]
                 }
     pkg = pkg_descr {
-            package      = (package pkg_descr) { pkgName = mkPackageName $ unMungedPackageName compat_name }
-          , buildDepends = targetBuildDepends $ testBuildInfo test
+            package      = (package pkg_descr) { pkgName = mkPackageName $ prettyShow compat_name }
           , executables  = []
           , testSuites   = []
           , subLibraries = [lib]
@@ -503,7 +558,7 @@ testSuiteLibV09AsLibAndExe pkg_descr
     -- | The stub executable needs a new 'ComponentLocalBuildInfo'
     -- that exposes the relevant test suite library.
     deps = (IPI.installedUnitId ipi, mungedId ipi)
-         : (filter (\(_, x) -> let name = unMungedPackageName $ mungedName x
+         : (filter (\(_, x) -> let name = prettyShow $ mungedName x
                                in name == "Cabal" || name == "base")
                    (componentPackageDeps clbi))
     exeClbi = ExeComponentLocalBuildInfo {
@@ -523,30 +578,6 @@ testSuiteLibV09AsLibAndExe pkg_descr
               }
 testSuiteLibV09AsLibAndExe _ TestSuite{} _ _ _ _ = error "testSuiteLibV09AsLibAndExe: wrong kind"
 
-
--- | Translate a exe-style 'Benchmark' component into an exe for building
-benchmarkExeV10asExe :: Benchmark -> ComponentLocalBuildInfo
-                     -> (Executable, ComponentLocalBuildInfo)
-benchmarkExeV10asExe bm@Benchmark { benchmarkInterface = BenchmarkExeV10 _ f }
-                     clbi =
-    (exe, exeClbi)
-  where
-    exe = Executable {
-            exeName    = benchmarkName bm,
-            modulePath = f,
-            exeScope   = ExecutablePublic,
-            buildInfo  = benchmarkBuildInfo bm
-          }
-    exeClbi = ExeComponentLocalBuildInfo {
-                componentUnitId = componentUnitId clbi,
-                componentComponentId = componentComponentId clbi,
-                componentLocalName = CExeName (benchmarkName bm),
-                componentInternalDeps = componentInternalDeps clbi,
-                componentExeDeps = componentExeDeps clbi,
-                componentPackageDeps = componentPackageDeps clbi,
-                componentIncludes = componentIncludes clbi
-              }
-benchmarkExeV10asExe Benchmark{} _ = error "benchmarkExeV10asExe: wrong kind"
 
 -- | Initialize a new package db file for libraries defined
 -- internally to the package.
@@ -569,7 +600,7 @@ addInternalBuildTools pkg lbi bi progs =
       [ simpleConfiguredProgram toolName' (FoundOnSystem toolLocation)
       | toolName <- getAllInternalToolDependencies pkg bi
       , let toolName' = unUnqualComponentName toolName
-      , let toolLocation = buildDir lbi </> toolName' </> toolName' <.> exeExtension ]
+      , let toolLocation = buildDir lbi </> toolName' </> toolName' <.> exeExtension (hostPlatform lbi) ]
 
 
 -- TODO: build separate libs in separate dirs so that we can build
@@ -581,8 +612,6 @@ buildLib verbosity numJobs pkg_descr lbi lib clbi =
   case compilerFlavor (compiler lbi) of
     GHC   -> GHC.buildLib   verbosity numJobs pkg_descr lbi lib clbi
     GHCJS -> GHCJS.buildLib verbosity numJobs pkg_descr lbi lib clbi
-    JHC   -> JHC.buildLib   verbosity         pkg_descr lbi lib clbi
-    LHC   -> LHC.buildLib   verbosity         pkg_descr lbi lib clbi
     UHC   -> UHC.buildLib   verbosity         pkg_descr lbi lib clbi
     HaskellSuite {} -> HaskellSuite.buildLib verbosity pkg_descr lbi lib clbi
     _    -> die' verbosity "Building is not supported with this compiler."
@@ -606,34 +635,35 @@ buildExe verbosity numJobs pkg_descr lbi exe clbi =
   case compilerFlavor (compiler lbi) of
     GHC   -> GHC.buildExe   verbosity numJobs pkg_descr lbi exe clbi
     GHCJS -> GHCJS.buildExe verbosity numJobs pkg_descr lbi exe clbi
-    JHC   -> JHC.buildExe   verbosity         pkg_descr lbi exe clbi
-    LHC   -> LHC.buildExe   verbosity         pkg_descr lbi exe clbi
     UHC   -> UHC.buildExe   verbosity         pkg_descr lbi exe clbi
     _     -> die' verbosity "Building is not supported with this compiler."
 
-replLib :: Verbosity -> PackageDescription -> LocalBuildInfo
-                     -> Library            -> ComponentLocalBuildInfo -> IO ()
-replLib verbosity pkg_descr lbi lib clbi =
+replLib :: [String]        -> Verbosity -> PackageDescription
+        -> LocalBuildInfo  -> Library   -> ComponentLocalBuildInfo
+        -> IO ()
+replLib replFlags verbosity pkg_descr lbi lib clbi =
   case compilerFlavor (compiler lbi) of
     -- 'cabal repl' doesn't need to support 'ghc --make -j', so we just pass
     -- NoFlag as the numJobs parameter.
-    GHC   -> GHC.replLib   verbosity NoFlag pkg_descr lbi lib clbi
-    GHCJS -> GHCJS.replLib verbosity NoFlag pkg_descr lbi lib clbi
+    GHC   -> GHC.replLib   replFlags verbosity NoFlag pkg_descr lbi lib clbi
+    GHCJS -> GHCJS.replLib replFlags verbosity NoFlag pkg_descr lbi lib clbi
     _     -> die' verbosity "A REPL is not supported for this compiler."
 
-replExe :: Verbosity -> PackageDescription -> LocalBuildInfo
-                     -> Executable         -> ComponentLocalBuildInfo -> IO ()
-replExe verbosity pkg_descr lbi exe clbi =
+replExe :: [String]        -> Verbosity  -> PackageDescription
+        -> LocalBuildInfo  -> Executable -> ComponentLocalBuildInfo
+        -> IO ()
+replExe replFlags verbosity pkg_descr lbi exe clbi =
   case compilerFlavor (compiler lbi) of
-    GHC   -> GHC.replExe   verbosity NoFlag pkg_descr lbi exe clbi
-    GHCJS -> GHCJS.replExe verbosity NoFlag pkg_descr lbi exe clbi
+    GHC   -> GHC.replExe   replFlags verbosity NoFlag pkg_descr lbi exe clbi
+    GHCJS -> GHCJS.replExe replFlags verbosity NoFlag pkg_descr lbi exe clbi
     _     -> die' verbosity "A REPL is not supported for this compiler."
 
-replFLib :: Verbosity -> PackageDescription -> LocalBuildInfo
-                      -> ForeignLib         -> ComponentLocalBuildInfo -> IO ()
-replFLib verbosity pkg_descr lbi exe clbi =
+replFLib :: [String]        -> Verbosity  -> PackageDescription
+         -> LocalBuildInfo  -> ForeignLib -> ComponentLocalBuildInfo
+         -> IO ()
+replFLib replFlags verbosity pkg_descr lbi exe clbi =
   case compilerFlavor (compiler lbi) of
-    GHC -> GHC.replFLib verbosity NoFlag pkg_descr lbi exe clbi
+    GHC -> GHC.replFLib replFlags verbosity NoFlag pkg_descr lbi exe clbi
     _   -> die' verbosity "A REPL is not supported for this compiler."
 
 -- | Runs 'componentInitialBuildSteps' on every configured component.
@@ -673,7 +703,7 @@ writeAutogenFiles verbosity pkg lbi clbi = do
       pathsModuleDir = takeDirectory pathsModulePath
   -- Ensure that the directory exists!
   createDirectoryIfMissingVerbose verbosity True pathsModuleDir
-  rewriteFileEx verbosity pathsModulePath (Build.PathsModule.generate pkg lbi clbi)
+  rewriteFileEx verbosity pathsModulePath (generatePathsModule pkg lbi clbi)
 
   --TODO: document what we're doing here, and move it to its own function
   case clbi of
@@ -689,9 +719,10 @@ writeAutogenFiles verbosity pkg lbi clbi = do
                       </> ModuleName.toFilePath mod_name <.> "hsig"
             createDirectoryIfMissingVerbose verbosity True (takeDirectory sigPath)
             rewriteFileEx verbosity sigPath $
+                "{-# OPTIONS_GHC -w #-}\n" ++
                 "{-# LANGUAGE NoImplicitPrelude #-}\n" ++
-                "signature " ++ display mod_name ++ " where"
+                "signature " ++ prettyShow mod_name ++ " where"
     _ -> return ()
 
   let cppHeaderPath = autogenComponentModulesDir lbi clbi </> cppHeaderName
-  rewriteFileEx verbosity cppHeaderPath (Build.Macros.generate pkg lbi clbi)
+  rewriteFileEx verbosity cppHeaderPath (generateCabalMacrosHeader pkg lbi clbi)

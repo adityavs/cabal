@@ -52,14 +52,12 @@ module Distribution.License (
 import Distribution.Compat.Prelude
 import Prelude ()
 
-import Distribution.Parsec.Class
+import Distribution.Parsec
 import Distribution.Pretty
-import Distribution.Text
 import Distribution.Version
 
 import qualified Distribution.Compat.CharParsing as P
-import qualified Distribution.Compat.Map.Strict  as Map
-import qualified Distribution.Compat.ReadP       as Parse
+import qualified Data.Map.Strict                 as Map
 import qualified Distribution.SPDX               as SPDX
 import qualified Text.PrettyPrint                as Disp
 
@@ -130,7 +128,7 @@ data License =
   deriving (Generic, Read, Show, Eq, Typeable, Data)
 
 instance Binary License
-
+instance Structured License
 instance NFData License where rnf = genericRnf
 
 -- | The list of all currently recognised licenses.
@@ -152,11 +150,11 @@ knownLicenses = [ GPL  unversioned, GPL  (version [2]),    GPL  (version [3])
 -- @since 2.2.0.0
 licenseToSPDX :: License -> SPDX.License
 licenseToSPDX l = case l of
-    GPL v | v == version [2]      -> spdx SPDX.GPL_2_0
-    GPL v | v == version [3]      -> spdx SPDX.GPL_3_0
-    LGPL v | v == version [2,1]   -> spdx SPDX.LGPL_2_1
-    LGPL v | v == version [3]     -> spdx SPDX.LGPL_3_0
-    AGPL v | v == version [3]     -> spdx SPDX.AGPL_3_0
+    GPL v | v == version [2]      -> spdx SPDX.GPL_2_0_only
+    GPL v | v == version [3]      -> spdx SPDX.GPL_3_0_only
+    LGPL v | v == version [2,1]   -> spdx SPDX.LGPL_2_1_only
+    LGPL v | v == version [3]     -> spdx SPDX.LGPL_3_0_only
+    AGPL v | v == version [3]     -> spdx SPDX.AGPL_3_0_only
     BSD2                          -> spdx SPDX.BSD_2_Clause
     BSD3                          -> spdx SPDX.BSD_3_Clause
     BSD4                          -> spdx SPDX.BSD_4_Clause
@@ -194,8 +192,8 @@ licenseToSPDX l = case l of
 -- >>> licenseFromSPDX . licenseToSPDX $ AllRightsReserved
 -- AllRightsReserved
 --
--- >>> licenseFromSPDX <$> simpleParsec "BSD-3-Clause OR GPL-3.0"
--- Just (UnknownLicense "BSD3ClauseORGPL30")
+-- >>> licenseFromSPDX <$> simpleParsec "BSD-3-Clause OR GPL-3.0-only"
+-- Just (UnknownLicense "BSD3ClauseORGPL30only")
 --
 -- @since 2.2.0.0
 licenseFromSPDX :: SPDX.License -> License
@@ -244,32 +242,11 @@ instance Parsec License where
       ("AllRightsReserved", Nothing)  -> AllRightsReserved
       ("OtherLicense",      Nothing)  -> OtherLicense
       _                               -> UnknownLicense $ name ++
-                                         maybe "" (('-':) . display) version
-
-instance Text License where
-  parse = do
-    name    <- Parse.munch1 (\c -> isAlphaNum c && c /= '-')
-    version <- Parse.option Nothing (Parse.char '-' >> fmap Just parse)
-    return $! case (name, version :: Maybe Version) of
-      ("GPL",               _      ) -> GPL  version
-      ("LGPL",              _      ) -> LGPL version
-      ("AGPL",              _      ) -> AGPL version
-      ("BSD2",              Nothing) -> BSD2
-      ("BSD3",              Nothing) -> BSD3
-      ("BSD4",              Nothing) -> BSD4
-      ("ISC",               Nothing) -> ISC
-      ("MIT",               Nothing) -> MIT
-      ("MPL",         Just version') -> MPL version'
-      ("Apache",            _      ) -> Apache version
-      ("PublicDomain",      Nothing) -> PublicDomain
-      ("AllRightsReserved", Nothing) -> AllRightsReserved
-      ("OtherLicense",      Nothing) -> OtherLicense
-      _                              -> UnknownLicense $ name ++
-                                        maybe "" (('-':) . display) version
+                                         maybe "" (('-':) . prettyShow) version
 
 dispOptVersion :: Maybe Version -> Disp.Doc
 dispOptVersion Nothing  = Disp.empty
 dispOptVersion (Just v) = dispVersion v
 
 dispVersion :: Version -> Disp.Doc
-dispVersion v = Disp.char '-' <<>> disp v
+dispVersion v = Disp.char '-' <<>> pretty v

@@ -3,8 +3,8 @@
 module Distribution.Client.Utils ( MergeResult(..)
                                  , mergeBy, duplicates, duplicatesBy
                                  , readMaybe
-                                 , inDir, withEnv, logDirChange
-                                 , withExtraPathEnv
+                                 , inDir, withEnv, withEnvOverrides
+                                 , logDirChange, withExtraPathEnv
                                  , determineNumJobs, numberOfProcessors
                                  , removeExistingFile
                                  , withTempFileName
@@ -17,7 +17,9 @@ module Distribution.Client.Utils ( MergeResult(..)
                                  , moreRecentFile, existsAndIsMoreRecentThan
                                  , tryFindAddSourcePackageDesc
                                  , tryFindPackageDesc
-                                 , relaxEncodingErrors)
+                                 , relaxEncodingErrors
+                                 , ProgressPhase (..)
+                                 , progressMessage)
        where
 
 import Prelude ()
@@ -28,11 +30,13 @@ import Distribution.Compat.Exception   ( catchIO )
 import Distribution.Compat.Time ( getModTime )
 import Distribution.Simple.Setup       ( Flag(..) )
 import Distribution.Verbosity
-import Distribution.Simple.Utils       ( die', findPackageDesc )
+import Distribution.Simple.Utils       ( die', findPackageDesc, noticeNoWrap )
 import qualified Data.ByteString.Lazy as BS
 import Data.Bits
          ( (.|.), shiftL, shiftR )
 import System.FilePath
+import Control.Monad
+         ( mapM, mapM_, zipWithM_ )
 import Data.List
          ( groupBy )
 import Foreign.C.Types ( CInt(..) )
@@ -43,18 +47,14 @@ import System.Directory
          , removeFile, setCurrentDirectory )
 import System.IO
          ( Handle, hClose, openTempFile
-#if MIN_VERSION_base(4,4,0)
          , hGetEncoding, hSetEncoding
-#endif
          )
 import System.IO.Unsafe ( unsafePerformIO )
 
-#if MIN_VERSION_base(4,4,0)
 import GHC.IO.Encoding
          ( recover, TextEncoding(TextEncoding) )
 import GHC.IO.Encoding.Failure
          ( recoverEncode, CodingFailureMode(TransliterateCodingFailure) )
-#endif
 
 #if defined(mingw32_HOST_OS) || MIN_VERSION_directory(1,2,3)
 import qualified System.Directory as Dir
@@ -132,6 +132,27 @@ withEnv k v m = do
   m `Exception.finally` (case mb_old of
     Nothing -> unsetEnv k
     Just old -> setEnv k old)
+
+-- | Executes the action with a list of environment variables and
+-- corresponding overrides, where
+--
+-- * @'Just' v@ means \"set the environment variable's value to @v@\".
+-- * 'Nothing' means \"unset the environment variable\".
+--
+-- Warning: This operation is NOT thread-safe, because current
+-- environment is a process-global concept.
+withEnvOverrides :: [(String, Maybe FilePath)] -> IO a -> IO a
+withEnvOverrides overrides m = do
+  mb_olds <- mapM lookupEnv envVars
+  mapM_ (uncurry update) overrides
+  m `Exception.finally` zipWithM_ update envVars mb_olds
+   where
+    envVars :: [String]
+    envVars = map fst overrides
+
+    update :: String -> Maybe FilePath -> IO ()
+    update var Nothing    = unsetEnv var
+    update var (Just val) = setEnv var val
 
 -- | Executes the action, increasing the PATH environment
 -- in some way
@@ -288,14 +309,12 @@ existsAndIsMoreRecentThan a b = do
 -- set. It's a no-op for versions of `base` less than 4.4.
 relaxEncodingErrors :: Handle -> IO ()
 relaxEncodingErrors handle = do
-#if MIN_VERSION_base(4,4,0)
   maybeEncoding <- hGetEncoding handle
   case maybeEncoding of
     Just (TextEncoding name decoder encoder) | not ("UTF" `isPrefixOf` name) ->
       let relax x = x { recover = recoverEncode TransliterateCodingFailure }
       in hSetEncoding handle (TextEncoding name decoder (fmap relax encoder))
     _ ->
-#endif
       return ()
 
 -- |Like 'tryFindPackageDesc', but with error specific to add-source deps.
@@ -313,3 +332,27 @@ tryFindPackageDesc verbosity depPath err = do
     case errOrCabalFile of
         Right file -> return file
         Left _ -> die' verbosity err
+
+-- | Phase of building a dependency. Represents current status of package
+-- dependency processing. See #4040 for details.
+data ProgressPhase
+    = ProgressDownloading
+    | ProgressDownloaded
+    | ProgressStarting
+    | ProgressBuilding
+    | ProgressHaddock
+    | ProgressInstalling
+    | ProgressCompleted
+
+progressMessage :: Verbosity -> ProgressPhase -> String -> IO ()
+progressMessage verbosity phase subject = do
+    noticeNoWrap verbosity $ phaseStr ++ subject ++ "\n"
+  where
+    phaseStr = case phase of
+        ProgressDownloading -> "Downloading  "
+        ProgressDownloaded  -> "Downloaded   "
+        ProgressStarting    -> "Starting     "
+        ProgressBuilding    -> "Building     "
+        ProgressHaddock     -> "Haddock      "
+        ProgressInstalling  -> "Installing   "
+        ProgressCompleted   -> "Completed    "

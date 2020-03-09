@@ -1,5 +1,6 @@
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE OverloadedStrings #-}
 
 module Distribution.Types.ForeignLibOption(
     ForeignLibOption(..)
@@ -9,11 +10,10 @@ import Prelude ()
 import Distribution.Compat.Prelude
 
 import Distribution.Pretty
-import Distribution.Parsec.Class
-import Distribution.Text
+import Distribution.Parsec
+import Distribution.FieldGrammar.Described
 
 import qualified Distribution.Compat.CharParsing as P
-import qualified Distribution.Compat.ReadP as Parse
 import qualified Text.PrettyPrint as Disp
 
 data ForeignLibOption =
@@ -35,11 +35,9 @@ instance Parsec ForeignLibOption where
       "standalone" -> return ForeignLibStandalone
       _            -> fail "unrecognized foreign-library option"
 
-instance Text ForeignLibOption where
-  parse = Parse.choice [
-      do _ <- Parse.string "standalone" ; return ForeignLibStandalone
-    ]
+instance Described ForeignLibOption where
+    describe _ = "standalone"
 
 instance Binary ForeignLibOption
-
+instance Structured ForeignLibOption
 instance NFData ForeignLibOption where rnf = genericRnf

@@ -17,6 +17,7 @@ module Distribution.Client.GenBounds (
 
 import Prelude ()
 import Distribution.Client.Compat.Prelude
+import Distribution.Utils.Generic (safeLast)
 
 import Distribution.Client.Init
          ( incVersion )
@@ -29,7 +30,7 @@ import Distribution.Client.Setup
 import Distribution.Package
          ( Package(..), unPackageName, packageName, packageVersion )
 import Distribution.PackageDescription
-         ( buildDepends )
+         ( enabledBuildDepends )
 import Distribution.PackageDescription.Configuration
          ( finalizePD )
 import Distribution.PackageDescription.Parsec
@@ -45,13 +46,13 @@ import Distribution.Simple.Utils
          ( tryFindPackageDesc )
 import Distribution.System
          ( Platform )
-import Distribution.Text
+import Distribution.Deprecated.Text
          ( display )
 import Distribution.Verbosity
          ( Verbosity )
 import Distribution.Version
          ( Version, alterVersion
-         , LowerBound(..), UpperBound(..), VersionRange(..), asVersionIntervals
+         , LowerBound(..), UpperBound(..), VersionRange, asVersionIntervals
          , orLaterVersion, earlierVersion, intersectVersionRanges )
 import System.Directory
          ( getCurrentDirectory )
@@ -59,9 +60,9 @@ import System.Directory
 -- | Does this version range have an upper bound?
 hasUpperBound :: VersionRange -> Bool
 hasUpperBound vr =
-    case asVersionIntervals vr of
-      [] -> False
-      is -> if snd (last is) == NoUpperBound then False else True
+    case safeLast (asVersionIntervals vr) of
+      Nothing -> False
+      Just l  -> if snd l == NoUpperBound then False else True
 
 -- | Given a version, return an API-compatible (according to PVP) version range.
 --
@@ -112,7 +113,7 @@ genBounds verbosity packageDBs repoCtxt comp platform progdb mSandboxPkgInfo
     let cinfo = compilerInfo comp
 
     cwd <- getCurrentDirectory
-    path <- tryFindPackageDesc cwd
+    path <- tryFindPackageDesc verbosity cwd
     gpd <- readGenericPackageDescription verbosity path
     -- NB: We don't enable tests or benchmarks, since often they
     -- don't really have useful bounds.
@@ -122,7 +123,7 @@ genBounds verbosity packageDBs repoCtxt comp platform progdb mSandboxPkgInfo
       Left _ -> putStrLn "finalizePD failed"
       Right (pd,_) -> do
         let needBounds = filter (not . hasUpperBound . depVersion) $
-                         buildDepends pd
+                         enabledBuildDepends pd defaultComponentRequestedSpec
 
         if (null needBounds)
           then putStrLn
@@ -144,10 +145,10 @@ genBounds verbosity packageDBs repoCtxt comp platform progdb mSandboxPkgInfo
        traverse_ (putStrLn . (++",") . showBounds padTo) thePkgs
 
      depName :: Dependency -> String
-     depName (Dependency pn _) = unPackageName pn
+     depName (Dependency pn _ _) = unPackageName pn
 
      depVersion :: Dependency -> VersionRange
-     depVersion (Dependency _ vr) = vr
+     depVersion (Dependency _ vr _) = vr
 
 -- | The message printed when some dependencies are found to be lacking proper
 -- PVP-mandated bounds.

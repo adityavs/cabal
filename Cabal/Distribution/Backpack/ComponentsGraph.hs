@@ -19,9 +19,9 @@ import Distribution.Types.ComponentRequestedSpec
 import Distribution.Types.UnqualComponentName
 import Distribution.Compat.Graph (Graph, Node(..))
 import qualified Distribution.Compat.Graph as Graph
+import Distribution.Utils.Generic
 
-import Distribution.Text
-    ( Text(disp) )
+import Distribution.Pretty (pretty)
 import Text.PrettyPrint
 
 ------------------------------------------------------------------------------
@@ -42,8 +42,8 @@ type ComponentsWithDeps = [(Component, [ComponentName])]
 --
 dispComponentsWithDeps :: ComponentsWithDeps -> Doc
 dispComponentsWithDeps graph =
-    vcat [ hang (text "component" <+> disp (componentName c)) 4
-                (vcat [ text "dependency" <+> disp cdep | cdep <- cdeps ])
+    vcat [ hang (text "component" <+> pretty (componentName c)) 4
+                (vcat [ text "dependency" <+> pretty cdep | cdep <- cdeps ])
          | (c, cdeps) <- graph ]
 
 -- | Create a 'Graph' of 'Component', or report a cycle if there is a
@@ -66,16 +66,17 @@ mkComponentsGraph enabled pkg_descr =
       (CExeName <$> getAllInternalToolDependencies pkg_descr bi)
 
       ++ [ if pkgname == packageName pkg_descr
-           then CLibName
-           else CSubLibName toolname
-         | Dependency pkgname _ <- targetBuildDepends bi
+           then CLibName LMainLibName
+           else CLibName (LSubLibName toolname)
+         | Dependency pkgname _ _ <- targetBuildDepends bi
          , let toolname = packageNameToUnqualComponentName pkgname
          , toolname `elem` internalPkgDeps ]
       where
         bi = componentBuildInfo component
         internalPkgDeps = map (conv . libName) (allLibraries pkg_descr)
-        conv Nothing = packageNameToUnqualComponentName $ packageName pkg_descr
-        conv (Just s) = s
+
+        conv LMainLibName    = packageNameToUnqualComponentName $ packageName pkg_descr
+        conv (LSubLibName s) = s
 
 -- | Given the package description and a 'PackageDescription' (used
 -- to determine if a package name is internal or not), sort the
@@ -94,4 +95,4 @@ componentCycleMsg cnames =
     text $ "Components in the package depend on each other in a cyclic way:\n  "
        ++ intercalate " depends on "
             [ "'" ++ showComponentName cname ++ "'"
-            | cname <- cnames ++ [head cnames] ]
+            | cname <- cnames ++ maybeToList (safeHead cnames) ]

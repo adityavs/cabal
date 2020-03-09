@@ -1,59 +1,64 @@
+# Read https://hub.zhox.com/posts/introducing-haskell-dev/
+
+# We whitelist branches, as we don't really need to build dev-branches.
+# Remember to add release branches, both here and to .travis.yml.
+branches:
+  only:
+    - master
+    - "3.0"
+    - "2.4"
+    - "2.2"
+    - "2.0"
+    - "1.24"
+    - "1.22"
+    - "1.20"
+    - "1.18"
+
+
+# Do not build feature branch with open Pull Requests
+# prevents PR double builds as branch
+skip_branch_with_pr: true
+
 install:
   # Using '-y' and 'refreshenv' as a workaround to:
   # https://github.com/haskell/cabal/issues/3687
-  - choco install -y ghc --version 8.0.2
+  - choco source add -n mistuke -s https://www.myget.org/F/mistuke/api/v2
+  - choco install -y cabal --version 2.4.1.0
+  - choco install -y ghc --version 8.6.5
   - refreshenv
-  # See http://help.appveyor.com/discussions/problems/6312-curl-command-not-found#comment_42195491
-  # NB: Do this after refreshenv, otherwise it will be clobbered!
-  - set PATH=%APPDATA%\cabal\bin;C:\Program Files\Git\mingw64\bin;%PATH%
-  # TODO: remove --insecure, this is to workaround haskell.org
-  # failing to send intermediate cert; see https://github.com/haskell/cabal/pull/4172
-  - curl -o cabal.zip --insecure --progress-bar https://www.haskell.org/cabal/release/cabal-install-2.0.0.0/cabal-install-2.0.0.0-x86_64-unknown-mingw32.zip
-  - 7z x -bd cabal.zip
+
+before_build:
   - cabal --version
-  - cabal update
-  # Install parsec, text and mtl, also alex and happy
-  - echo "" | appveyor-retry cabal install parsec-3.1.11 text-1.2.2.2 mtl-2.2.1 alex-3.1.7 happy-1.19.5
+  - ghc --version
+  - cabal %CABOPTS% v2-update
+  - cabal %CABOPTS% v1-install happy alex
+
+environment:
+  global:
+    CABOPTS: --store-dir=C:\\SR --http-transport=plain-http
+    # Remove cache, there is no button on the web
+    # https://www.appveyor.com/docs/build-cache/#skipping-cache-operations-for-specific-build
+    APPVEYOR_CACHE_SKIP_RESTORE: true
+
+clone_folder: "c:\\WORK"
+
+cache:
+  - dist-newstyle
+  - "C:\\sr"
 
 build_script:
-  - cd Cabal
-  - ghc --make -threaded -i -i. Setup.hs -Wall -Werror -XRank2Types -XFlexibleContexts
-
-  # 'echo "" |' works around an AppVeyor issue:
-  # https://github.com/commercialhaskell/stack/issues/1097#issuecomment-145747849
-  - echo "" | ..\appveyor-retry ..\cabal install --only-dependencies --enable-tests
-
-  - Setup configure --user --ghc-option=-Werror --enable-tests
-  - Setup build
-  - Setup test --show-details=streaming --test-option=--hide-successes
-  - Setup install
-  # hackage-repo-tool doesn't build on Windows:
-  # https://github.com/well-typed/hackage-security/issues/175
-  # - echo "" | ..\cabal install hackage-repo-tool --allow-newer=Cabal,time --constraint="Cabal == 2.1.0.0"
-  - cd ..\cabal-testsuite
-  - ghc --make -threaded -i Setup.hs -package Cabal-2.1.0.0
-  - echo "" | ..\appveyor-retry ..\cabal install --only-dependencies --enable-tests
-  - Setup configure --user --ghc-option=-Werror --enable-tests
-  - Setup build
-  # Must install the test suite, so that our GHCi invocation picks it up
-  - Setup install
-  # Copy the setup script into the spot cabal-tests expects it
-  - mkdir dist\setup
-  - cp Setup.exe dist\setup
-  - dist\build\cabal-tests\cabal-tests.exe -j3
-  # - Setup test --show-details=streaming --test-option=--hide-successes
-  - cd ..\cabal-install
-  - ghc --make -threaded -i -i. Setup.hs -Wall -Werror
-  - echo "" | ..\appveyor-retry ..\cabal install --only-dependencies --enable-tests -flib
-  - ..\cabal configure --user --ghc-option=-Werror --enable-tests -flib
-  - ..\cabal build
-  # update package index again, this time for the cabal under test
-  - dist\build\cabal\cabal.exe update
-  # run cabal-testsuite first as it has better logging
-  - cd ..\cabal-testsuite
-  - dist\build\cabal-tests\cabal-tests.exe -j3 --skip-setup-tests --with-cabal=..\cabal-install\dist\build\cabal\cabal.exe
-  - cd ..\cabal-install
-  - ..\cabal test unit-tests --show-details=streaming --test-option=--pattern=!FileMonitor --test-option=--hide-successes
-  - ..\cabal test integration-tests2 --show-details=streaming --test-option=--hide-successes
-  - ..\cabal test solver-quickcheck --show-details=streaming --test-option=--hide-successes --test-option=--quickcheck-tests=1000
-  - ..\cabal test memory-usage-tests --show-details=streaming
+  - runghc cabal-dev-scripts/src/Preprocessor.hs -o cabal-install/cabal-install.cabal -f CABAL_FLAG_LIB cabal-install/cabal-install.cabal.pp
+  - cabal %CABOPTS% v2-configure --enable-tests
+  - appveyor-retry cabal %CABOPTS% v2-build lib:Cabal --only-dependencies
+  - cabal %CABOPTS% v2-build lib:Cabal
+  - appveyor-retry cabal %CABOPTS% v2-build Cabal:tests --only-dependencies
+  - cabal %CABOPTS% v2-test Cabal
+  - appveyor-retry cabal %CABOPTS% v2-build exe:cabal exe:cabal-tests --only-dependencies
+  - cabal %CABOPTS% v2-build exe:cabal
+  - cabal %CABOPTS% v2-run cabal-tests -- -j3 --with-cabal=dist-newstyle\build\x86_64-windows\ghc-8.6.5\cabal-install-3.3.0.0\x\cabal\build\cabal\cabal.exe
+  - appveyor-retry cabal %CABOPTS% v2-build cabal-install:tests --only-dependencies
+  - cd cabal-install
+  - cabal %CABOPTS% v2-run cabal-install:memory-usage-tests
+  - cabal %CABOPTS% v2-run cabal-install:solver-quickcheck
+  - cabal %CABOPTS% v2-run cabal-install:integration-tests2
+  - cabal %CABOPTS% v2-run cabal-install:unit-tests -- --pattern "! (/FileMonitor/ || /VCS/ || /Get/)"

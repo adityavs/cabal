@@ -9,13 +9,12 @@ import Distribution.Compat.Prelude
 import Prelude ()
 
 import Distribution.ModuleName
-import Distribution.Parsec.Class
+import Distribution.Parsec
 import Distribution.Pretty
-import Distribution.Text
+import Distribution.FieldGrammar.Described
 import Distribution.Types.PackageName
 
 import qualified Distribution.Compat.CharParsing as P
-import qualified Distribution.Compat.ReadP  as Parse
 import           Text.PrettyPrint           ((<+>))
 import qualified Text.PrettyPrint           as Disp
 
@@ -30,7 +29,7 @@ data ModuleReexport = ModuleReexport {
     deriving (Eq, Generic, Read, Show, Typeable, Data)
 
 instance Binary ModuleReexport
-
+instance Structured ModuleReexport
 instance NFData ModuleReexport where rnf = genericRnf
 
 instance Pretty ModuleReexport where
@@ -52,16 +51,5 @@ instance Parsec ModuleReexport where
             parsec
         return (ModuleReexport mpkgname origname newname)
 
-instance Text ModuleReexport where
-    parse = do
-      mpkgname <- Parse.option Nothing $ do
-                    pkgname <- parse
-                    _       <- Parse.char ':'
-                    return (Just pkgname)
-      origname <- parse
-      newname  <- Parse.option origname $ do
-                    Parse.skipSpaces
-                    _ <- Parse.string "as"
-                    Parse.skipSpaces
-                    parse
-      return (ModuleReexport mpkgname origname newname)
+instance Described ModuleReexport where
+    describe _ = RETodo

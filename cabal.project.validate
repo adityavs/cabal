@@ -1,6 +1,7 @@
-packages: Cabal/ cabal-testsuite/ cabal-install/
--- We need +lib to build test-suites, however we don't need monolithic build
-constraints: cabal-install +lib -monolithic
+packages: Cabal/ cabal-testsuite/ cabal-install/ solver-benchmarks/
+tests: True
+
+write-ghc-environment-files: never
 
 package Cabal
   ghc-options: -Werror -fno-ignore-asserts

@@ -5,12 +5,13 @@ module UnitTests.Distribution.Client.Targets (
 import Distribution.Client.Targets     (UserQualifier(..)
                                        ,UserConstraintScope(..)
                                        ,UserConstraint(..), readUserConstraint)
-import Distribution.Compat.ReadP       (readP_to_S)
 import Distribution.Package            (mkPackageName)
 import Distribution.PackageDescription (mkFlagName, mkFlagAssignment)
 import Distribution.Version            (anyVersion, thisVersion, mkVersion)
-import Distribution.ParseUtils         (parseCommaList)
-import Distribution.Text               (parse)
+
+import Distribution.Deprecated.ReadP       (readP_to_S)
+import Distribution.Deprecated.ParseUtils  (parseCommaList)
+import Distribution.Deprecated.Text        (parse)
 
 import Distribution.Solver.Types.PackageConstraint (PackageProperty(..))
 import Distribution.Solver.Types.OptionalStanza (OptionalStanza(..))
@@ -87,8 +88,8 @@ readUserConstraintTest :: String -> UserConstraint -> Assertion
 readUserConstraintTest str uc =
   assertEqual ("Couldn't read constraint: '" ++ str ++ "'") expected actual
   where
-    expected = uc
-    actual   = let Right r = readUserConstraint str in r
+    expected = Right uc
+    actual   = readUserConstraint str
 
 parseUserConstraintTest :: String -> UserConstraint -> Assertion
 parseUserConstraintTest str uc =

@@ -4,7 +4,7 @@
 -- Maintainer  :  cabal-devel@haskell.org
 -- Portability :  portable
 --
--- Implementation of the 'new-exec' command for running an arbitrary executable
+-- Implementation of the 'v2-exec' command for running an arbitrary executable
 -- in an environment suited to the part of the store built for a project.
 -------------------------------------------------------------------------------
 
@@ -27,9 +27,11 @@ import Distribution.Client.Setup
   , GlobalFlags
   , InstallFlags
   )
+import qualified Distribution.Client.Setup as Client
 import Distribution.Client.ProjectOrchestration
   ( ProjectBuildContext(..)
   , runProjectPreBuildPhase
+  , CurrentCommand(..)
   , establishProjectBaseContext
   , distDirLayout
   , commandLineFlagsToProjectConfig
@@ -73,11 +75,14 @@ import Distribution.Simple.GHC
   , GhcImplInfo(supportsPkgEnvFiles) )
 import Distribution.Simple.Setup
   ( HaddockFlags
+  , TestFlags
+  , BenchmarkFlags
   , fromFlagOrDefault
   )
 import Distribution.Simple.Utils
   ( die'
   , info
+  , createDirectoryIfMissingVerbose
   , withTempDirectory
   , wrapText
   )
@@ -86,46 +91,47 @@ import Distribution.Verbosity
   , normal
   )
 
-import qualified Distribution.Client.CmdBuild as CmdBuild
-
 import Prelude ()
 import Distribution.Client.Compat.Prelude
 
-import Data.Set (Set)
 import qualified Data.Set as S
 import qualified Data.Map as M
 
-execCommand :: CommandUI (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags)
+execCommand :: CommandUI ( ConfigFlags, ConfigExFlags, InstallFlags
+                         , HaddockFlags, TestFlags, BenchmarkFlags
+                         )
 execCommand = CommandUI
-  { commandName = "new-exec"
+  { commandName = "v2-exec"
   , commandSynopsis = "Give a command access to the store."
   , commandUsage = \pname ->
-    "Usage: " ++ pname ++ " new-exec [FLAGS] [--] COMMAND [--] [ARGS]\n"
+    "Usage: " ++ pname ++ " v2-exec [FLAGS] [--] COMMAND [--] [ARGS]\n"
   , commandDescription = Just $ \pname -> wrapText $
        "During development it is often useful to run build tasks and perform"
     ++ " one-off program executions to experiment with the behavior of build"
     ++ " tools. It is convenient to run these tools in the same way " ++ pname
-    ++ " itself would. The `" ++ pname ++ " new-exec` command provides a way to"
+    ++ " itself would. The `" ++ pname ++ " v2-exec` command provides a way to"
     ++ " do so.\n"
     ++ "\n"
     ++ "Compiler tools will be configured to see the same subset of the store"
     ++ " that builds would see. The PATH is modified to make all executables in"
     ++ " the dependency tree available (provided they have been built already)."
     ++ " Commands are also rewritten in the way cabal itself would. For"
-    ++ " example, `" ++ pname ++ " new-exec ghc` will consult the configuration"
+    ++ " example, `" ++ pname ++ " v2-exec ghc` will consult the configuration"
     ++ " to choose an appropriate version of ghc and to include any"
     ++ " ghc-specific flags requested."
   , commandNotes = Nothing
-  , commandOptions = commandOptions CmdBuild.buildCommand
-  , commandDefaultFlags = commandDefaultFlags CmdBuild.buildCommand
+  , commandOptions = commandOptions Client.installCommand
+  , commandDefaultFlags = commandDefaultFlags Client.installCommand
   }
 
-execAction :: (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags)
+execAction :: ( ConfigFlags, ConfigExFlags, InstallFlags
+              , HaddockFlags, TestFlags, BenchmarkFlags )
            -> [String] -> GlobalFlags -> IO ()
-execAction (configFlags, configExFlags, installFlags, haddockFlags)
+execAction ( configFlags, configExFlags, installFlags
+           , haddockFlags, testFlags, benchmarkFlags )
            extraArgs globalFlags = do
 
-  baseCtx <- establishProjectBaseContext verbosity cliConfig
+  baseCtx <- establishProjectBaseContext verbosity cliConfig OtherCommand
 
   -- To set up the environment, we'd like to select the libraries in our
   -- dependency tree that we've already built. So first we set up an install
@@ -194,7 +200,9 @@ execAction (configFlags, configExFlags, installFlags, haddockFlags)
     verbosity = fromFlagOrDefault normal (configVerbosity configFlags)
     cliConfig = commandLineFlagsToProjectConfig
                   globalFlags configFlags configExFlags
-                  installFlags haddockFlags
+                  installFlags
+                  mempty -- ClientInstallFlags, not needed here
+                  haddockFlags testFlags benchmarkFlags
     withOverrides env args program = program
       { programOverrideEnv = programOverrideEnv program ++ env
       , programDefaultArgs = programDefaultArgs program ++ args}
@@ -216,11 +224,8 @@ withTempEnvFile :: Verbosity
                 -> PostBuildProjectStatus
                 -> ([(String, Maybe String)] -> IO a)
                 -> IO a
-withTempEnvFile verbosity
-                baseCtx
-                buildCtx
-                buildStatus
-                action =
+withTempEnvFile verbosity baseCtx buildCtx buildStatus action = do
+  createDirectoryIfMissingVerbose verbosity True (distTempDirectory (distDirLayout baseCtx))
   withTempDirectory
    verbosity
    (distTempDirectory (distDirLayout baseCtx))

@@ -1,5 +1,4 @@
 {-# LANGUAGE NamedFieldPuns #-}
-{-# LANGUAGE ViewPatterns   #-}
 
 -- | cabal-install CLI command: test
 --
@@ -18,29 +17,33 @@ import Distribution.Client.ProjectOrchestration
 import Distribution.Client.CmdErrorMessages
 
 import Distribution.Client.Setup
-         ( GlobalFlags, ConfigFlags(..), ConfigExFlags, InstallFlags
-         , applyFlagDefaults )
+         ( GlobalFlags(..), ConfigFlags(..), ConfigExFlags, InstallFlags )
 import qualified Distribution.Client.Setup as Client
 import Distribution.Simple.Setup
-         ( HaddockFlags, fromFlagOrDefault )
+         ( HaddockFlags, TestFlags(..), BenchmarkFlags(..), fromFlagOrDefault )
 import Distribution.Simple.Command
          ( CommandUI(..), usageAlternatives )
-import Distribution.Text
+import Distribution.Simple.Flag
+         ( Flag(..) )
+import Distribution.Deprecated.Text
          ( display )
 import Distribution.Verbosity
          ( Verbosity, normal )
 import Distribution.Simple.Utils
-         ( wrapText, die' )
+         ( notice, wrapText, die' )
 
 import Control.Monad (when)
+import qualified System.Exit (exitSuccess)
 
 
-testCommand :: CommandUI (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags)
-testCommand = Client.installCommand {
-  commandName         = "new-test",
-  commandSynopsis     = "Run test-suites",
-  commandUsage        = usageAlternatives "new-test" [ "[TARGETS] [FLAGS]" ],
-  commandDescription  = Just $ \_ -> wrapText $
+testCommand :: CommandUI ( ConfigFlags, ConfigExFlags, InstallFlags
+                         , HaddockFlags, TestFlags, BenchmarkFlags
+                         )
+testCommand = Client.installCommand
+  { commandName         = "v2-test"
+  , commandSynopsis     = "Run test-suites"
+  , commandUsage        = usageAlternatives "v2-test" [ "[TARGETS] [FLAGS]" ]
+  , commandDescription  = Just $ \_ -> wrapText $
         "Runs the specified test-suites, first ensuring they are up to "
      ++ "date.\n\n"
 
@@ -52,20 +55,25 @@ testCommand = Client.installCommand {
      ++ "Dependencies are built or rebuilt as necessary. Additional "
      ++ "configuration flags can be specified on the command line and these "
      ++ "extend the project configuration from the 'cabal.project', "
-     ++ "'cabal.project.local' and other files.",
-  commandNotes        = Just $ \pname ->
+     ++ "'cabal.project.local' and other files.\n\n"
+
+     ++ "To pass command-line arguments to a test suite, see the "
+     ++ "v2-run command."
+  , commandNotes        = Just $ \pname ->
         "Examples:\n"
-     ++ "  " ++ pname ++ " new-test\n"
+     ++ "  " ++ pname ++ " v2-test\n"
      ++ "    Run all the test-suites in the package in the current directory\n"
-     ++ "  " ++ pname ++ " new-test pkgname\n"
+     ++ "  " ++ pname ++ " v2-test pkgname\n"
      ++ "    Run all the test-suites in the package named pkgname\n"
-     ++ "  " ++ pname ++ " new-test cname\n"
+     ++ "  " ++ pname ++ " v2-test cname\n"
      ++ "    Run the test-suite named cname\n"
-     ++ "  " ++ pname ++ " new-test cname --enable-coverage\n"
+     ++ "  " ++ pname ++ " v2-test cname --enable-coverage\n"
      ++ "    Run the test-suite built with code coverage (including local libs used)\n\n"
 
      ++ cmdCommonHelpTextNewBuildBeta
-   }
+
+  }
+
 
 
 -- | The @test@ command is very much like @build@. It brings the install plan
@@ -78,15 +86,17 @@ testCommand = Client.installCommand {
 -- For more details on how this works, see the module
 -- "Distribution.Client.ProjectOrchestration"
 --
-testAction :: (ConfigFlags, ConfigExFlags, InstallFlags, HaddockFlags)
+testAction :: ( ConfigFlags, ConfigExFlags, InstallFlags
+              , HaddockFlags, TestFlags, BenchmarkFlags )
            -> [String] -> GlobalFlags -> IO ()
-testAction (applyFlagDefaults -> (configFlags, configExFlags, installFlags, haddockFlags))
+testAction ( configFlags, configExFlags, installFlags
+           , haddockFlags, testFlags, benchmarkFlags )
            targetStrings globalFlags = do
 
-    baseCtx <- establishProjectBaseContext verbosity cliConfig
+    baseCtx <- establishProjectBaseContext verbosity cliConfig OtherCommand
 
     targetSelectors <- either (reportTargetSelectorProblems verbosity) return
-                   =<< readTargetSelectors (localPackages baseCtx) targetStrings
+                   =<< readTargetSelectors (localPackages baseCtx) (Just TestKind) targetStrings
 
     buildCtx <-
       runProjectPreBuildPhase verbosity baseCtx $ \elaboratedPlan -> do
@@ -99,12 +109,13 @@ testAction (applyFlagDefaults -> (configFlags, configExFlags, installFlags, hadd
 
             -- Interpret the targets on the command line as test targets
             -- (as opposed to say build or haddock targets).
-            targets <- either (reportTargetProblems verbosity) return
+            targets <- either (reportTargetProblems verbosity failWhenNoTestSuites) return
                      $ resolveTargets
                          selectPackageTargets
                          selectComponentTarget
                          TargetProblemCommon
                          elaboratedPlan
+                         Nothing
                          targetSelectors
 
             let elaboratedPlan' = pruneInstallPlanToTargets
@@ -118,10 +129,13 @@ testAction (applyFlagDefaults -> (configFlags, configExFlags, installFlags, hadd
     buildOutcomes <- runProjectBuildPhase verbosity baseCtx buildCtx
     runProjectPostBuildPhase verbosity baseCtx buildCtx buildOutcomes
   where
+    failWhenNoTestSuites = testFailWhenNoTestSuites testFlags
     verbosity = fromFlagOrDefault normal (configVerbosity configFlags)
     cliConfig = commandLineFlagsToProjectConfig
                   globalFlags configFlags configExFlags
-                  installFlags haddockFlags
+                  installFlags
+                  mempty -- ClientInstallFlags, not needed here
+                  haddockFlags testFlags benchmarkFlags
 
 -- | This defines what a 'TargetSelector' means for the @test@ command.
 -- It selects the 'AvailableTarget's that the 'TargetSelector' refers to,
@@ -202,9 +216,25 @@ data TargetProblem =
    | TargetProblemIsSubComponent   PackageId ComponentName SubComponentTarget
   deriving (Eq, Show)
 
-reportTargetProblems :: Verbosity -> [TargetProblem] -> IO a
-reportTargetProblems verbosity =
-    die' verbosity . unlines . map renderTargetProblem
+reportTargetProblems :: Verbosity -> Flag Bool -> [TargetProblem] -> IO a
+reportTargetProblems verbosity failWhenNoTestSuites problems =
+  case (failWhenNoTestSuites, problems) of
+    (Flag True, [TargetProblemNoTests _]) ->
+      die' verbosity problemsMessage
+    (_, [TargetProblemNoTests selector]) -> do
+      notice verbosity (renderAllowedNoTestsProblem selector)
+      System.Exit.exitSuccess
+    (_, _) -> die' verbosity problemsMessage
+    where
+      problemsMessage = unlines . map renderTargetProblem $ problems
+
+-- | Unless @--test-fail-when-no-test-suites@ flag is passed, we don't
+--   @die@ when the target problem is 'TargetProblemNoTests'.
+--   Instead, we display a notice saying that no tests have run and
+--   indicate how this behaviour was enabled.
+renderAllowedNoTestsProblem :: TargetSelector -> String
+renderAllowedNoTestsProblem selector =
+    "No tests to run for " ++ renderTargetSelector selector
 
 renderTargetProblem :: TargetProblem -> String
 renderTargetProblem (TargetProblemCommon problem) =
@@ -226,6 +256,7 @@ renderTargetProblem (TargetProblemNoTargets targetSelector) =
         -> "The test command is for running test suites, but the target '"
            ++ showTargetSelector targetSelector ++ "' refers to "
            ++ renderTargetSelector targetSelector ++ "."
+           ++ "\n" ++ show targetSelector
 
       _ -> renderTargetProblemNoTargets "test" targetSelector
 

@@ -3,6 +3,7 @@
 {-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE DeriveFoldable #-}
 {-# LANGUAGE DeriveTraversable #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module Distribution.Types.CondTree (
     CondTree(..),
@@ -15,6 +16,8 @@ module Distribution.Types.CondTree (
     mapTreeData,
     traverseCondTreeV,
     traverseCondBranchV,
+    traverseCondTreeC,
+    traverseCondBranchC,
     extractCondition,
     simplifyCondTree,
     ignoreConditions,
@@ -24,6 +27,9 @@ import Prelude ()
 import Distribution.Compat.Prelude
 
 import Distribution.Types.Condition
+
+import qualified Distribution.Compat.Lens as L
+
 
 -- | A 'CondTree' is used to represent the conditional structure of
 -- a Cabal file, reflecting a syntax element subject to constraints,
@@ -58,7 +64,7 @@ data CondTree v c a = CondNode
     deriving (Show, Eq, Typeable, Data, Generic, Functor, Foldable, Traversable)
 
 instance (Binary v, Binary c, Binary a) => Binary (CondTree v c a)
-
+instance (Structured v, Structured c, Structured a) => Structured (CondTree v c a)
 instance (NFData v, NFData c, NFData a) => NFData (CondTree v c a) where rnf = genericRnf
 
 -- | A 'CondBranch' represents a conditional branch, e.g., @if
@@ -80,7 +86,7 @@ instance Foldable (CondBranch v c) where
     foldMap f (CondBranch _ c (Just a)) = foldMap f c `mappend` foldMap f a
 
 instance (Binary v, Binary c, Binary a) => Binary (CondBranch v c a)
-
+instance (Structured v, Structured c, Structured a) => Structured (CondBranch v c a)
 instance (NFData v, NFData c, NFData a) => NFData (CondBranch v c a) where rnf = genericRnf
 
 condIfThen :: Condition v -> CondTree v c a -> CondBranch v c a
@@ -108,17 +114,29 @@ mapTreeConds f = mapCondTree id id f
 mapTreeData :: (a -> b) -> CondTree v c a -> CondTree v c b
 mapTreeData f = mapCondTree f id id
 
--- | @Traversal (CondTree v c a) (CondTree w c a) v w@
-traverseCondTreeV :: Applicative f => (v -> f w) -> CondTree v c a -> f (CondTree w c a)
+-- | @@Traversal@@ for the variables
+traverseCondTreeV :: L.Traversal (CondTree v c a) (CondTree w c a) v w
 traverseCondTreeV f (CondNode a c ifs) =
     CondNode a c <$> traverse (traverseCondBranchV f) ifs
 
--- | @Traversal (CondBranch v c a) (CondBranch w c a) v w@
-traverseCondBranchV :: Applicative f => (v -> f w) -> CondBranch v c a -> f (CondBranch w c a)
+-- | @@Traversal@@ for the variables
+traverseCondBranchV :: L.Traversal (CondBranch v c a) (CondBranch w c a) v w
 traverseCondBranchV f (CondBranch cnd t me) = CondBranch
     <$> traverse f cnd
     <*> traverseCondTreeV f t
     <*> traverse (traverseCondTreeV f) me
+
+-- | @@Traversal@@ for the aggregated constraints
+traverseCondTreeC :: L.Traversal (CondTree v c a) (CondTree v d a) c d
+traverseCondTreeC f (CondNode a c ifs) =
+    CondNode a <$> f c <*> traverse (traverseCondBranchC f) ifs
+
+-- | @@Traversal@@ for the aggregated constraints
+traverseCondBranchC :: L.Traversal (CondBranch v c a) (CondBranch v d a) c d
+traverseCondBranchC f (CondBranch cnd t me) = CondBranch cnd
+    <$> traverseCondTreeC f t
+    <*> traverse (traverseCondTreeC f) me
+
 
 -- | Extract the condition matched by the given predicate from a cond tree.
 --
@@ -140,12 +158,12 @@ extractCondition p = go
 
 -- | Flattens a CondTree using a partial flag assignment.  When a condition
 -- cannot be evaluated, both branches are ignored.
-simplifyCondTree :: (Monoid a, Monoid d) =>
+simplifyCondTree :: (Semigroup a, Semigroup d) =>
                     (v -> Either v Bool)
                  -> CondTree v d a
                  -> (d, a)
 simplifyCondTree env (CondNode a d ifs) =
-    mconcat $ (d, a) : mapMaybe simplifyIf ifs
+    foldl (<>) (d, a) $ mapMaybe simplifyIf ifs
   where
     simplifyIf (CondBranch cnd t me) =
         case simplifyCondition cnd env of
@@ -156,7 +174,7 @@ simplifyCondTree env (CondNode a d ifs) =
 -- | Flatten a CondTree.  This will resolve the CondTree by taking all
 --  possible paths into account.  Note that since branches represent exclusive
 --  choices this may not result in a \"sane\" result.
-ignoreConditions :: (Monoid a, Monoid c) => CondTree v c a -> (a, c)
-ignoreConditions (CondNode a c ifs) = (a, c) `mappend` mconcat (concatMap f ifs)
+ignoreConditions :: (Semigroup a, Semigroup c) => CondTree v c a -> (a, c)
+ignoreConditions (CondNode a c ifs) = foldl (<>) (a, c) $ concatMap f ifs
   where f (CondBranch _ t me) = ignoreConditions t
                        : maybeToList (fmap ignoreConditions me)

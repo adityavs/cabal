@@ -1,4 +1,4 @@
--- | This module contains a SPDX data from specification version 2.1
+-- | This module implements SPDX specification version 2.1 with a version 3.0 license list.
 --
 -- Specification is available on <https://spdx.org/specifications>
 module Distribution.SPDX (
@@ -14,17 +14,22 @@ module Distribution.SPDX (
     licenseName,
     licenseIsOsiApproved,
     mkLicenseId,
+    licenseIdList,
     -- * License exception
     LicenseExceptionId (..),
     licenseExceptionId,
     licenseExceptionName,
     mkLicenseExceptionId,
+    licenseExceptionIdList,
     -- * License reference
     LicenseRef,
     licenseRef,
     licenseDocumentRef,
     mkLicenseRef,
     mkLicenseRef',
+    -- * License list version
+    LicenseListVersion (..),
+    cabalSpecVersionToSPDXListVersion,
     ) where
 
 import Distribution.SPDX.LicenseExceptionId
@@ -32,3 +37,4 @@ import Distribution.SPDX.License
 import Distribution.SPDX.LicenseId
 import Distribution.SPDX.LicenseExpression
 import Distribution.SPDX.LicenseReference
+import Distribution.SPDX.LicenseListVersion

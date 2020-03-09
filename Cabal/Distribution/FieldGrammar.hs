@@ -9,7 +9,6 @@ module Distribution.FieldGrammar  (
     optionalField,
     optionalFieldDef,
     monoidalField,
-    deprecatedField',
     -- * Concrete grammar implementations
     ParsecFieldGrammar,
     ParsecFieldGrammar',
@@ -26,17 +25,18 @@ module Distribution.FieldGrammar  (
     takeFields,
     runFieldParser,
     runFieldParser',
+    defaultFreeTextFieldDefST,
     )  where
 
 import Distribution.Compat.Prelude
 import Prelude ()
 
-import qualified Distribution.Compat.Map.Strict as Map
+import qualified Data.Map.Strict as Map
 
 import Distribution.FieldGrammar.Class
 import Distribution.FieldGrammar.Parsec
 import Distribution.FieldGrammar.Pretty
-import Distribution.Parsec.Field
+import Distribution.Fields.Field
 import Distribution.Utils.Generic (spanMaybe)
 
 type ParsecFieldGrammar' a = ParsecFieldGrammar a a

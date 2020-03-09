@@ -1,5 +1,6 @@
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE OverloadedStrings #-}
 
 -----------------------------------------------------------------------------
 -- |
@@ -19,22 +20,20 @@ module Language.Haskell.Extension (
 
         Extension(..),
         KnownExtension(..),
-        knownExtensions,
         deprecatedExtensions,
         classifyExtension,
   ) where
 
-import Prelude ()
+import qualified Prelude (head)
 import Distribution.Compat.Prelude
 
 import Data.Array (Array, accumArray, bounds, Ix(inRange), (!))
 
-import Distribution.Parsec.Class
+import Distribution.Parsec
 import Distribution.Pretty
-import Distribution.Text
+import Distribution.FieldGrammar.Described
 
 import qualified Distribution.Compat.CharParsing as P
-import qualified Distribution.Compat.ReadP as Parse
 import qualified Text.PrettyPrint as Disp
 
 -- ------------------------------------------------------------
@@ -61,6 +60,7 @@ data Language =
   deriving (Generic, Show, Read, Eq, Typeable, Data)
 
 instance Binary Language
+instance Structured Language
 
 instance NFData Language where rnf = genericRnf
 
@@ -74,10 +74,8 @@ instance Pretty Language where
 instance Parsec Language where
   parsec = classifyLanguage <$> P.munch1 isAlphaNum
 
-instance Text Language where
-  parse = do
-    lang <- Parse.munch1 isAlphaNum
-    return (classifyLanguage lang)
+instance Described Language where
+    describe _ = REUnion ["Haskell98", "Haskell2010"]
 
 classifyLanguage :: String -> Language
 classifyLanguage = \str -> case lookup str langTable of
@@ -94,7 +92,7 @@ classifyLanguage = \str -> case lookup str langTable of
 -- Note: if you add a new 'KnownExtension':
 --
 -- * also add it to the Distribution.Simple.X.languageExtensions lists
---   (where X is each compiler: GHC, JHC, LHC, UHC, HaskellSuite)
+--   (where X is each compiler: GHC, UHC, HaskellSuite)
 --
 -- | This represents language extensions beyond a base 'Language' definition
 -- (such as 'Haskell98') that are supported by some implementations, usually
@@ -117,6 +115,7 @@ data Extension =
   deriving (Generic, Show, Read, Eq, Ord, Typeable, Data)
 
 instance Binary Extension
+instance Structured Extension
 
 instance NFData Extension where rnf = genericRnf
 
@@ -315,6 +314,9 @@ data KnownExtension =
   --
   -- * <https://www.haskell.org/ghc/docs/latest/html/users_guide/glasgow_exts.html#ghc-flag--XGeneralizedNewtypeDeriving>
   | GeneralizedNewtypeDeriving
+
+  -- Synonym for GeneralizedNewtypeDeriving added in GHC 8.6.1.
+  | GeneralisedNewtypeDeriving
 
   -- | Enable the \"Trex\" extensible records system.
   --
@@ -782,7 +784,7 @@ data KnownExtension =
   -- to the type-level.
   | TypeInType
 
-  -- | Allow recursive (and therefore undecideable) super-class relationships.
+  -- | Allow recursive (and therefore undecidable) super-class relationships.
   | UndecidableSuperClasses
 
   -- | A temporary extension to help library authors check if their
@@ -803,22 +805,51 @@ data KnownExtension =
   -- /strategy/.
   | DerivingStrategies
 
+  -- | Enable deriving instances via types of the same runtime representation.
+  -- Implies 'DerivingStrategies'.
+  | DerivingVia
+
   -- | Enable the use of unboxed sum syntax.
   | UnboxedSums
 
   -- | Allow use of hexadecimal literal notation for floating-point values.
   | HexFloatLiterals
 
+  -- | Allow @do@ blocks etc. in argument position.
+  | BlockArguments
+
+  -- | Allow use of underscores in numeric literals.
+  | NumericUnderscores
+
+  -- | Allow @forall@ in constraints.
+  | QuantifiedConstraints
+
+  -- | Have @*@ refer to @Type@.
+  | StarIsType
+
+  -- | Liberalises deriving to provide instances for empty data types.
+  --
+  -- * <https://downloads.haskell.org/~ghc/latest/docs/html/users_guide/glasgow_exts.html#deriving-instances-for-empty-data-types>
+  | EmptyDataDeriving
+
+  -- | Enable detection of complete user-supplied kind signatures.
+  | CUSKs
+
+  -- | Allows the syntax @import M qualified@.
+  | ImportQualifiedPost
+
+  -- | Allow the use of standalone kind signatures.
+  | StandaloneKindSignatures
+
+  -- | Enable unlifted newtypes.
+  | UnliftedNewtypes
+
   deriving (Generic, Show, Read, Eq, Ord, Enum, Bounded, Typeable, Data)
 
 instance Binary KnownExtension
+instance Structured KnownExtension
 
 instance NFData KnownExtension where rnf = genericRnf
-
-{-# DEPRECATED knownExtensions
-   "KnownExtension is an instance of Enum and Bounded, use those instead. This symbol will be removed in Cabal-3.0 (est. Oct 2018)." #-}
-knownExtensions :: [KnownExtension]
-knownExtensions = [minBound..maxBound]
 
 -- | Extensions that have been deprecated, possibly paired with another
 -- extension that replaces it.
@@ -843,22 +874,11 @@ instance Pretty Extension where
 instance Parsec Extension where
   parsec = classifyExtension <$> P.munch1 isAlphaNum
 
-instance Text Extension where
-  parse = do
-    extension <- Parse.munch1 isAlphaNum
-    return (classifyExtension extension)
-
 instance Pretty KnownExtension where
   pretty ke = Disp.text (show ke)
 
-instance Text KnownExtension where
-  parse = do
-    extension <- Parse.munch1 isAlphaNum
-    case classifyKnownExtension extension of
-        Just ke ->
-            return ke
-        Nothing ->
-            fail ("Can't parse " ++ show extension ++ " as KnownExtension")
+instance Described Extension where
+    describe _ = RETodo
 
 classifyExtension :: String -> Extension
 classifyExtension string
@@ -892,6 +912,6 @@ classifyKnownExtension string@(c : _)
 knownExtensionTable :: Array Char [(String, KnownExtension)]
 knownExtensionTable =
   accumArray (flip (:)) [] ('A', 'Z')
-    [ (head str, (str, extension))
+    [ (Prelude.head str, (str, extension)) -- assume KnownExtension's Show returns a non-empty string
     | extension <- [toEnum 0 ..]
     , let str = show extension ]

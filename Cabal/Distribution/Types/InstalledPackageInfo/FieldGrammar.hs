@@ -10,17 +10,20 @@ import Distribution.Compat.Prelude
 import Prelude ()
 
 import Distribution.Backpack
+import Distribution.CabalSpecVersion
 import Distribution.Compat.Lens               (Lens', (&), (.~))
 import Distribution.Compat.Newtype
 import Distribution.FieldGrammar
+import Distribution.FieldGrammar.Described
 import Distribution.FieldGrammar.FieldDescrs
 import Distribution.License
 import Distribution.ModuleName
 import Distribution.Package
-import Distribution.Parsec.Class
+import Distribution.Parsec
 import Distribution.Parsec.Newtypes
 import Distribution.Pretty
-import Distribution.Text
+import Distribution.Types.LibraryName
+import Distribution.Types.LibraryVisibility
 import Distribution.Types.MungedPackageName
 import Distribution.Types.UnqualComponentName
 import Distribution.Version
@@ -56,23 +59,24 @@ ipiFieldGrammar
 ipiFieldGrammar = mkInstalledPackageInfo
     -- Deprecated fields
     <$> monoidalFieldAla    "hugs-options"         (alaList' FSep Token)         unitedList
-        ^^^ deprecatedField' "hugs isn't supported anymore"
-    -- Very basic fields: name, version, package-name and lib-name
+        --- https://github.com/haskell/cabal/commit/40f3601e17024f07e0da8e64d3dd390177ce908b
+        ^^^ deprecatedSince CabalSpecV1_22 "hugs isn't supported anymore"
+    -- Very basic fields: name, version, package-name, lib-name and visibility
     <+> blurFieldGrammar basic basicFieldGrammar
     -- Basic fields
     <+> optionalFieldDef    "id"                                                 L.installedUnitId (mkUnitId "")
     <+> optionalFieldDefAla "instantiated-with"    InstWith                      L.instantiatedWith []
     <+> optionalFieldDefAla "key"                  CompatPackageKey              L.compatPackageKey ""
     <+> optionalFieldDefAla "license"              SpecLicenseLenient            L.license (Left SPDX.NONE)
-    <+> optionalFieldDefAla "copyright"            FreeText                      L.copyright ""
-    <+> optionalFieldDefAla "maintainer"           FreeText                      L.maintainer ""
-    <+> optionalFieldDefAla "author"               FreeText                      L.author ""
-    <+> optionalFieldDefAla "stability"            FreeText                      L.stability ""
-    <+> optionalFieldDefAla "homepage"             FreeText                      L.homepage ""
-    <+> optionalFieldDefAla "package-url"          FreeText                      L.pkgUrl ""
-    <+> optionalFieldDefAla "synopsis"             FreeText                      L.synopsis ""
-    <+> optionalFieldDefAla "description"          FreeText                      L.description ""
-    <+> optionalFieldDefAla "category"             FreeText                      L.category ""
+    <+> freeTextFieldDefST    "copyright"                                          L.copyright
+    <+> freeTextFieldDefST    "maintainer"                                         L.maintainer
+    <+> freeTextFieldDefST    "author"                                             L.author
+    <+> freeTextFieldDefST    "stability"                                          L.stability
+    <+> freeTextFieldDefST    "homepage"                                           L.homepage
+    <+> freeTextFieldDefST    "package-url"                                        L.pkgUrl
+    <+> freeTextFieldDefST    "synopsis"                                           L.synopsis
+    <+> freeTextFieldDefST    "description"                                        L.description
+    <+> freeTextFieldDefST    "category"                                           L.category
     -- Installed fields
     <+> optionalFieldDef    "abi"                                                L.abiHash (mkAbiHash "")
     <+> booleanFieldDef     "indefinite"                                         L.indefinite False
@@ -92,6 +96,7 @@ ipiFieldGrammar = mkInstalledPackageInfo
     <+> monoidalFieldAla    "depends"              (alaList FSep)                L.depends
     <+> monoidalFieldAla    "abi-depends"          (alaList FSep)                L.abiDepends
     <+> monoidalFieldAla    "cc-options"           (alaList' FSep Token)         L.ccOptions
+    <+> monoidalFieldAla    "cxx-options"          (alaList' FSep Token)         L.cxxOptions
     <+> monoidalFieldAla    "ld-options"           (alaList' FSep Token)         L.ldOptions
     <+> monoidalFieldAla    "framework-dirs"       (alaList' FSep FilePathNT)    L.frameworkDirs
     <+> monoidalFieldAla    "frameworks"           (alaList' FSep Token)         L.frameworks
@@ -103,10 +108,11 @@ ipiFieldGrammar = mkInstalledPackageInfo
         -- _basicPkgName is not used
         -- setMaybePackageId says it can be no-op.
         (PackageIdentifier pn _basicVersion)
-        (mb_uqn <|> _basicLibName)
+        (combineLibraryName ln _basicLibName)
         (mkComponentId "") -- installedComponentId_, not in use
+        _basicLibVisibility
       where
-        (pn, mb_uqn) = decodeCompatPackageName _basicName
+        MungedPackageName pn ln = _basicName
 {-# SPECIALIZE ipiFieldGrammar :: FieldDescrs InstalledPackageInfo InstalledPackageInfo #-}
 {-# SPECIALIZE ipiFieldGrammar :: ParsecFieldGrammar InstalledPackageInfo InstalledPackageInfo #-}
 {-# SPECIALIZE ipiFieldGrammar :: PrettyFieldGrammar InstalledPackageInfo InstalledPackageInfo #-}
@@ -119,6 +125,14 @@ unitedList f s = s <$ f []
 -- Helper functions
 -------------------------------------------------------------------------------
 
+-- | Combine 'LibraryName'. in parsing we prefer value coming
+-- from munged @name@ field over the @lib-name@.
+--
+-- /Should/ be irrelevant.
+combineLibraryName :: LibraryName -> LibraryName -> LibraryName
+combineLibraryName l@(LSubLibName _) _ = l
+combineLibraryName _ l                 = l
+
 -- To maintain backwards-compatibility, we accept both comma/non-comma
 -- separated variants of this field.  You SHOULD use the comma syntax if you
 -- use any new functions, although actually it's unambiguous due to a quirk
@@ -126,35 +140,32 @@ unitedList f s = s <$ f []
 
 showExposedModules :: [ExposedModule] -> Disp.Doc
 showExposedModules xs
-    | all isExposedModule xs = Disp.fsep (map disp xs)
-    | otherwise = Disp.fsep (Disp.punctuate Disp.comma (map disp xs))
+    | all isExposedModule xs = Disp.fsep (map pretty xs)
+    | otherwise = Disp.fsep (Disp.punctuate Disp.comma (map pretty xs))
     where isExposedModule (ExposedModule _ Nothing) = True
           isExposedModule _ = False
-
--- | Returns @Just@ if the @name@ field of the IPI record would not contain
--- the package name verbatim.  This helps us avoid writing @package-name@
--- when it's redundant.
-maybePackageName :: InstalledPackageInfo -> Maybe PackageName
-maybePackageName ipi =
-    case sourceLibName ipi of
-        Nothing -> Nothing
-        Just _ -> Just (packageName ipi)
 
 -- | Setter for the @package-name@ field.  It should be acceptable for this
 -- to be a no-op.
 setMaybePackageName :: Maybe PackageName -> InstalledPackageInfo -> InstalledPackageInfo
-setMaybePackageName Nothing ipi = ipi
-setMaybePackageName (Just pn) ipi = ipi {
-        sourcePackageId=(sourcePackageId ipi){pkgName=pn}
+setMaybePackageName Nothing   ipi = ipi
+setMaybePackageName (Just pn) ipi = ipi
+    { sourcePackageId = (sourcePackageId ipi) {pkgName=pn}
     }
 
 setMungedPackageName :: MungedPackageName -> InstalledPackageInfo -> InstalledPackageInfo
-setMungedPackageName mpn ipi =
-    let (pn, mb_uqn) = decodeCompatPackageName mpn
-    in ipi {
-            sourcePackageId = (sourcePackageId ipi) {pkgName=pn},
-            sourceLibName   = mb_uqn
-        }
+setMungedPackageName (MungedPackageName pn ln) ipi = ipi
+    { sourcePackageId = (sourcePackageId ipi) {pkgName=pn}
+    , sourceLibName   = ln
+    }
+
+--- | Returns @Just@ if the @name@ field of the IPI record would not contain
+--- the package name verbatim.  This helps us avoid writing @package-name@
+--- when it's redundant.
+maybePackageName :: InstalledPackageInfo -> Maybe PackageName
+maybePackageName ipi = case sourceLibName ipi of
+    LMainLibName  -> Nothing
+    LSubLibName _ -> Just (packageName ipi)
 
 -------------------------------------------------------------------------------
 -- Auxiliary types
@@ -162,9 +173,7 @@ setMungedPackageName mpn ipi =
 
 newtype ExposedModules = ExposedModules { getExposedModules :: [ExposedModule] }
 
-instance Newtype ExposedModules [ExposedModule] where
-    pack   = ExposedModules
-    unpack = getExposedModules
+instance Newtype [ExposedModule] ExposedModules
 
 instance Parsec ExposedModules where
     parsec = ExposedModules <$> parsecOptCommaList parsec
@@ -172,12 +181,12 @@ instance Parsec ExposedModules where
 instance Pretty ExposedModules where
     pretty = showExposedModules . getExposedModules
 
+instance Described ExposedModules where
+    describe _ = REMunch (REOpt reComma) (describe (Proxy :: Proxy ExposedModule))
 
 newtype CompatPackageKey = CompatPackageKey { getCompatPackageKey :: String }
 
-instance Newtype CompatPackageKey String where
-    pack = CompatPackageKey
-    unpack = getCompatPackageKey
+instance Newtype String CompatPackageKey
 
 instance Pretty CompatPackageKey where
     pretty = Disp.text . getCompatPackageKey
@@ -186,12 +195,12 @@ instance Parsec CompatPackageKey where
     parsec = CompatPackageKey <$> P.munch1 uid_char where
         uid_char c = Char.isAlphaNum c || c `elem` ("-_.=[],:<>+" :: String)
 
+instance Described CompatPackageKey where
+    describe _ = RETodo
 
 newtype InstWith = InstWith { getInstWith :: [(ModuleName,OpenModule)] }
 
-instance Newtype InstWith [(ModuleName, OpenModule)] where
-    pack = InstWith
-    unpack = getInstWith
+instance Newtype  [(ModuleName, OpenModule)] InstWith
 
 instance Pretty InstWith where
     pretty = dispOpenModuleSubst . Map.fromList . getInstWith
@@ -199,26 +208,36 @@ instance Pretty InstWith where
 instance Parsec InstWith where
     parsec = InstWith . Map.toList <$> parsecOpenModuleSubst
 
+instance Described InstWith where
+    describe _ = RETodo
 
 -- | SPDX License expression or legacy license. Lenient parser, accepts either.
 newtype SpecLicenseLenient = SpecLicenseLenient { getSpecLicenseLenient :: Either SPDX.License License }
 
-instance Newtype SpecLicenseLenient (Either SPDX.License License) where
-    pack = SpecLicenseLenient
-    unpack = getSpecLicenseLenient
+instance Newtype (Either SPDX.License License) SpecLicenseLenient
 
 instance Parsec SpecLicenseLenient where
     parsec = fmap SpecLicenseLenient $ Left <$> P.try parsec <|> Right <$> parsec
 
 instance Pretty SpecLicenseLenient where
-    pretty = either pretty pretty . unpack
+    pretty = either pretty pretty . getSpecLicenseLenient
 
+instance Described SpecLicenseLenient where
+    describe _ = RETodo
 
+-------------------------------------------------------------------------------
+-- Basic fields
+-------------------------------------------------------------------------------
+
+-- | This type is used to mangle fields as
+-- in serialised textual representation
+-- to the actual 'InstalledPackageInfo' fields.
 data Basic = Basic
-    { _basicName    :: MungedPackageName
-    , _basicVersion :: Version
-    , _basicPkgName :: Maybe PackageName
-    , _basicLibName :: Maybe UnqualComponentName
+    { _basicName          :: MungedPackageName
+    , _basicVersion       :: Version
+    , _basicPkgName       :: Maybe PackageName
+    , _basicLibName       :: LibraryName
+    , _basicLibVisibility :: LibraryVisibility
     }
 
 basic :: Lens' InstalledPackageInfo Basic
@@ -229,12 +248,14 @@ basic f ipi = g <$> f b
         (packageVersion ipi)
         (maybePackageName ipi)
         (sourceLibName ipi)
+        (libVisibility ipi)
 
-    g (Basic n v pn ln) = ipi
+    g (Basic n v pn ln lv) = ipi
         & setMungedPackageName n
         & L.sourcePackageId . L.pkgVersion .~ v
         & setMaybePackageName pn
         & L.sourceLibName .~ ln
+        & L.libVisibility .~ lv
 
 basicName :: Lens' Basic MungedPackageName
 basicName f b = (\x -> b { _basicName = x }) <$> f (_basicName b)
@@ -249,14 +270,38 @@ basicPkgName f b = (\x -> b { _basicPkgName = x }) <$> f (_basicPkgName b)
 {-# INLINE basicPkgName #-}
 
 basicLibName :: Lens' Basic (Maybe UnqualComponentName)
-basicLibName f b = (\x -> b { _basicLibName = x }) <$> f (_basicLibName b)
+basicLibName f b = (\x -> b { _basicLibName = maybeToLibraryName x }) <$>
+    f (libraryNameString (_basicLibName b))
 {-# INLINE basicLibName #-}
+
+basicLibVisibility :: Lens' Basic LibraryVisibility
+basicLibVisibility f b = (\x -> b { _basicLibVisibility = x }) <$>
+    f (_basicLibVisibility b)
+{-# INLINE basicLibVisibility #-}
 
 basicFieldGrammar
     :: (FieldGrammar g, Applicative (g Basic))
     => g Basic Basic
-basicFieldGrammar = Basic
+basicFieldGrammar = mkBasic
     <$> optionalFieldDefAla "name"          MQuoted  basicName (mungedPackageName emptyInstalledPackageInfo)
     <*> optionalFieldDefAla "version"       MQuoted  basicVersion nullVersion
     <*> optionalField       "package-name"           basicPkgName
     <*> optionalField       "lib-name"               basicLibName
+    <+> optionalFieldDef    "visibility"             basicLibVisibility LibraryVisibilityPrivate
+  where
+    mkBasic n v pn ln lv = Basic n v pn ln' lv'
+      where
+        ln' = maybe LMainLibName LSubLibName ln
+        -- Older GHCs (<8.8) always report installed libraries as private
+        -- because their ghc-pkg builds with an older Cabal.
+        -- So we always set LibraryVisibilityPublic for main (unnamed) libs.
+        -- This can be removed once we stop supporting GHC<8.8, at the
+        -- condition that we keep marking main libraries as public when
+        -- registering them.
+        lv' = if
+                let MungedPackageName _ mln = n in
+                -- We need to check both because on ghc<8.2 ln' will always
+                -- be LMainLibName
+                ln' == LMainLibName && mln == LMainLibName
+              then LibraryVisibilityPublic
+              else lv

@@ -10,25 +10,28 @@ import Test.Tasty
 import Test.Tasty.Golden.Advanced (goldenTest)
 import Test.Tasty.HUnit
 
-import Control.Monad                               (void)
-import Data.Algorithm.Diff                         (Diff (..), getGroupedDiff)
+import Control.Monad                               (unless, void)
+import Data.Algorithm.Diff                         (PolyDiff (..), getGroupedDiff)
 import Data.Maybe                                  (isNothing)
+import Distribution.Fields                         (runParseResult)
 import Distribution.PackageDescription             (GenericPackageDescription)
 import Distribution.PackageDescription.Parsec      (parseGenericPackageDescription)
 import Distribution.PackageDescription.PrettyPrint (showGenericPackageDescription)
-import Distribution.Parsec.Common                  (PWarnType (..), PWarning (..))
-import Distribution.Parsec.ParseResult             (runParseResult)
+import Distribution.Parsec
+       (PWarnType (..), PWarning (..), showPError, showPWarning)
 import Distribution.Utils.Generic                  (fromUTF8BS, toUTF8BS)
+import System.Directory                            (setCurrentDirectory)
+import System.Environment                          (getArgs, withArgs)
 import System.FilePath                             (replaceExtension, (</>))
 
 import qualified Data.ByteString       as BS
 import qualified Data.ByteString.Char8 as BS8
+import qualified Data.List.NonEmpty    as NE
 
 import qualified Distribution.InstalledPackageInfo as IPI
-import qualified Distribution.ParseUtils           as ReadP
 
 #ifdef MIN_VERSION_tree_diff
-import Data.TreeDiff        (toExpr)
+import Data.TreeDiff        (ansiWlEditExpr, ediff, toExpr)
 import Data.TreeDiff.Golden (ediffGolden)
 import Instances.TreeDiff ()
 #endif
@@ -63,6 +66,7 @@ warningTests = testGroup "warnings triggered"
     , warningTest PWTTrailingFields    "trailingfield.cabal"
     , warningTest PWTDoubleDash        "doubledash.cabal"
     , warningTest PWTMultipleSingularField "multiplesingular.cabal"
+    , warningTest PWTMultipleSingularField "multiplesingular.cabal"
     -- TODO: not implemented yet
     -- , warningTest PWTExtraTestModule   "extratestmodule.cabal"
     ]
@@ -94,10 +98,33 @@ errorTests = testGroup "errors"
     , errorTest "common2.cabal"
     , errorTest "common3.cabal"
     , errorTest "leading-comma.cabal"
+    , errorTest "leading-comma-2.cabal"
+    , errorTest "leading-comma-2b.cabal"
+    , errorTest "leading-comma-2c.cabal"
     , errorTest "range-ge-wild.cabal"
     , errorTest "forward-compat.cabal"
     , errorTest "forward-compat2.cabal"
     , errorTest "forward-compat3.cabal"
+    , errorTest "issue-5055.cabal"
+    , errorTest "issue-5055-2.cabal"
+    , errorTest "noVersion.cabal"
+    , errorTest "noVersion2.cabal"
+    , errorTest "multiple-libs.cabal"
+    , errorTest "spdx-1.cabal"
+    , errorTest "spdx-2.cabal"
+    , errorTest "spdx-3.cabal"
+    , errorTest "removed-fields.cabal"
+    , errorTest "version-sets-1.cabal"
+    , errorTest "version-sets-2.cabal"
+    , errorTest "version-sets-3.cabal"
+    , errorTest "version-sets-4.cabal"
+    , errorTest "undefined-flag.cabal"
+    , errorTest "mixin-1.cabal"
+    , errorTest "mixin-2.cabal"
+    , errorTest "libpq1.cabal"
+    , errorTest "libpq2.cabal"
+    , errorTest "MiniAgda.cabal"
+    , errorTest "big-version.cabal"
     ]
 
 errorTest :: FilePath -> TestTree
@@ -107,11 +134,11 @@ errorTest fp = cabalGoldenTest fp correct $ do
     let (_, x) = runParseResult res
 
     return $ toUTF8BS $ case x of
-        Right gpd -> 
+        Right gpd ->
             "UNXPECTED SUCCESS\n" ++
             showGenericPackageDescription gpd
         Left (v, errs) ->
-            unlines $ ("VERSION: " ++ show v) : map show errs
+            unlines $ ("VERSION: " ++ show v) : map (showPError fp) (NE.toList errs)
   where
     input = "tests" </> "ParserTests" </> "errors" </> fp
     correct = replaceExtension input "errors"
@@ -125,6 +152,7 @@ regressionTests = testGroup "regressions"
     [ regressionTest "encoding-0.8.cabal"
     , regressionTest "Octree-0.5.cabal"
     , regressionTest "nothing-unicode.cabal"
+    , regressionTest "multiple-libs-2.cabal"
     , regressionTest "issue-774.cabal"
     , regressionTest "generics-sop.cabal"
     , regressionTest "elif.cabal"
@@ -132,9 +160,31 @@ regressionTests = testGroup "regressions"
     , regressionTest "shake.cabal"
     , regressionTest "common.cabal"
     , regressionTest "common2.cabal"
+    , regressionTest "common3.cabal"
+    , regressionTest "common-conditional.cabal"
     , regressionTest "leading-comma.cabal"
+    , regressionTest "leading-comma-2.cabal"
     , regressionTest "wl-pprint-indef.cabal"
     , regressionTest "th-lift-instances.cabal"
+    , regressionTest "issue-5055.cabal"
+    , regressionTest "issue-6083-pkg-pkg.cabal"
+    , regressionTest "noVersion.cabal"
+    , regressionTest "spdx-1.cabal"
+    , regressionTest "spdx-2.cabal"
+    , regressionTest "spdx-3.cabal"
+    , regressionTest "hidden-main-lib.cabal"
+    , regressionTest "jaeger-flamegraph.cabal"
+    , regressionTest "version-sets.cabal"
+    , regressionTest "mixin-1.cabal"
+    , regressionTest "mixin-2.cabal"
+    , regressionTest "mixin-3.cabal"
+    , regressionTest "libpq1.cabal"
+    , regressionTest "libpq2.cabal"
+    , regressionTest "issue-5846.cabal"
+    , regressionTest "indentation.cabal"
+    , regressionTest "indentation2.cabal"
+    , regressionTest "indentation3.cabal"
+    , regressionTest "big-version.cabal"
     ]
 
 regressionTest :: FilePath -> TestTree
@@ -154,10 +204,10 @@ formatGoldenTest fp = cabalGoldenTest "format" correct $ do
 
     return $ toUTF8BS $ case x of
         Right gpd ->
-            unlines (map show warns)
+            unlines (map (showPWarning fp) warns)
             ++ showGenericPackageDescription gpd
         Left (_, errs) ->
-            unlines $ "ERROR" : map show errs
+            unlines $ "ERROR" : map (showPError fp) (NE.toList errs)
   where
     input = "tests" </> "ParserTests" </> "regressions" </> fp
     correct = replaceExtension input "format"
@@ -170,7 +220,7 @@ treeDiffGoldenTest fp = ediffGolden goldenTest "expr" exprFile $ do
     let (_, x) = runParseResult res
     case x of
         Right gpd      -> pure (toExpr gpd)
-        Left (_, errs) -> fail $ unlines $ "ERROR" : map show errs
+        Left (_, errs) -> fail $ unlines $ "ERROR" : map (showPError fp) (NE.toList errs)
   where
     input = "tests" </> "ParserTests" </> "regressions" </> fp
     exprFile = replaceExtension input "expr"
@@ -184,7 +234,21 @@ formatRoundTripTest fp = testCase "roundtrip" $ do
     y <- parse (toUTF8BS contents')
     -- previously we mangled licenses a bit
     let y' = y
-    assertEqual "re-parsed doesn't match" x y'
+    unless (x == y') $
+#ifdef MIN_VERSION_tree_diff
+        assertFailure $ unlines
+            [ "re-parsed doesn't match"
+            , show $ ansiWlEditExpr $ ediff x y
+            ]
+#else
+        assertFailure $ unlines
+            [ "re-parsed doesn't match"
+            , "expected"
+            , show x
+            , "actual"
+            , show y
+            ]
+#endif
   where
     parse :: BS.ByteString -> IO GenericPackageDescription
     parse c = do
@@ -192,7 +256,7 @@ formatRoundTripTest fp = testCase "roundtrip" $ do
         case x' of
             Right gpd      -> pure gpd
             Left (_, errs) -> do
-                void $ assertFailure $ unlines (map show errs)
+                void $ assertFailure $ unlines (map (showPError fp) $ NE.toList errs)
                 fail "failure"
     input = "tests" </> "ParserTests" </> "regressions" </> fp
 
@@ -219,13 +283,12 @@ ipiTest fp = testGroup fp $
 
 ipiFormatGoldenTest :: FilePath -> TestTree
 ipiFormatGoldenTest fp = cabalGoldenTest "format" correct $ do
-    contents <- readFile input
+    contents <- BS.readFile input
     let res = IPI.parseInstalledPackageInfo contents
     return $ toUTF8BS $ case res of
-        ReadP.ParseFailed err -> "ERROR " ++ show err
-        ReadP.ParseOk ws ipi  ->
-            unlines (map (ReadP.showPWarning fp) ws)
-            ++ IPI.showInstalledPackageInfo ipi
+        Left err -> "ERROR " ++ show err
+        Right (ws, ipi)  ->
+            unlines ws ++ IPI.showInstalledPackageInfo ipi
   where
     input = "tests" </> "ParserTests" </> "ipi" </> fp
     correct = replaceExtension input "format"
@@ -233,11 +296,11 @@ ipiFormatGoldenTest fp = cabalGoldenTest "format" correct $ do
 #ifdef MIN_VERSION_tree_diff
 ipiTreeDiffGoldenTest :: FilePath -> TestTree
 ipiTreeDiffGoldenTest fp = ediffGolden goldenTest "expr" exprFile $ do
-    contents <- readFile input
+    contents <- BS.readFile input
     let res = IPI.parseInstalledPackageInfo contents
     case res of
-        ReadP.ParseFailed err -> fail $ "ERROR " ++ show err
-        ReadP.ParseOk _ws ipi -> pure (toExpr ipi)
+        Left err -> fail $ "ERROR " ++ show err
+        Right (_ws, ipi) -> pure (toExpr ipi)
   where
     input = "tests" </> "ParserTests" </> "ipi" </> fp
     exprFile = replaceExtension input "expr"
@@ -245,10 +308,10 @@ ipiTreeDiffGoldenTest fp = ediffGolden goldenTest "expr" exprFile $ do
 
 ipiFormatRoundTripTest :: FilePath -> TestTree
 ipiFormatRoundTripTest fp = testCase "roundtrip" $ do
-    contents <- readFile input
+    contents <- BS.readFile input
     x <- parse contents
     let contents' = IPI.showInstalledPackageInfo x
-    y <- parse contents'
+    y <- parse (toUTF8BS contents')
 
     -- ghc-pkg prints pkgroot itself, based on cli arguments!
     let x' = x { IPI.pkgRoot = Nothing }
@@ -258,15 +321,15 @@ ipiFormatRoundTripTest fp = testCase "roundtrip" $ do
 
     -- Complete round-trip
     let contents2 = IPI.showFullInstalledPackageInfo x
-    z <- parse contents2
+    z <- parse (toUTF8BS contents2)
     assertEqual "re-parsed doesn't match" x z
 
   where
-    parse :: String -> IO IPI.InstalledPackageInfo
+    parse :: BS.ByteString -> IO IPI.InstalledPackageInfo
     parse c = do
         case IPI.parseInstalledPackageInfo c of
-            ReadP.ParseOk _ ipi   -> return ipi
-            ReadP.ParseFailed err -> do
+            Right (_, ipi) -> return ipi
+            Left err       -> do
               void $ assertFailure $ show err
               fail "failure"
     input = "tests" </> "ParserTests" </> "ipi" </> fp
@@ -276,7 +339,13 @@ ipiFormatRoundTripTest fp = testCase "roundtrip" $ do
 -------------------------------------------------------------------------------
 
 main :: IO ()
-main = defaultMain tests
+main = do
+    args <- getArgs
+    case args of
+        ("--cwd" : cwd : args') -> do
+            setCurrentDirectory cwd
+            withArgs args' $ defaultMain tests
+        _ -> defaultMain tests
 
 cabalGoldenTest :: TestName -> FilePath -> IO BS.ByteString -> TestTree
 cabalGoldenTest name ref act = goldenTest name (BS.readFile ref) act cmp upd

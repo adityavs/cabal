@@ -1,5 +1,5 @@
-{-# LANGUAGE RecordWildCards, NamedFieldPuns, GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE RecordWildCards, NamedFieldPuns #-}
+{-# LANGUAGE DeriveDataTypeable, DeriveGeneric #-}
 
 -- | Functions to calculate nix-style hashes for package ids.
 --
@@ -20,13 +20,6 @@ module Distribution.Client.PackageHash (
     -- ** Platform-specific variations
     hashedInstalledPackageIdLong,
     hashedInstalledPackageIdShort,
-
-    -- * Low level hash choice
-    HashValue,
-    hashValue,
-    showHashValue,
-    readFileHashValue,
-    hashFromTUF,
   ) where
 
 import Prelude ()
@@ -44,27 +37,18 @@ import Distribution.Simple.Compiler
          , ProfDetailLevel(..), showProfDetailLevel )
 import Distribution.Simple.InstallDirs
          ( PathTemplate, fromPathTemplate )
-import Distribution.Text
-         ( display )
-import Distribution.Version
+import Distribution.Pretty (prettyShow)
+import Distribution.Types.PkgconfigVersion (PkgconfigVersion)
+import Distribution.Client.HashValue
 import Distribution.Client.Types
          ( InstalledPackageId )
 import qualified Distribution.Solver.Types.ComponentDeps as CD
 
-import qualified Hackage.Security.Client    as Sec
-
-import qualified Crypto.Hash.SHA256         as SHA256
-import qualified Data.ByteString.Base16     as Base16
-import qualified Data.ByteString.Char8      as BS
 import qualified Data.ByteString.Lazy.Char8 as LBS
 import qualified Data.Map as Map
 import qualified Data.Set as Set
-import           Data.Set (Set)
 
 import Data.Function     (on)
-import Control.Exception (evaluate)
-import System.IO         (withBinaryFile, IOMode(..))
-
 
 -------------------------------
 -- Calculating package hashes
@@ -90,11 +74,22 @@ hashedInstalledPackageId
 -- without significant path length limitations (ie not Windows).
 --
 hashedInstalledPackageIdLong :: PackageHashInputs -> InstalledPackageId
-hashedInstalledPackageIdLong pkghashinputs@PackageHashInputs{pkgHashPkgId} =
-    mkComponentId $
-         display pkgHashPkgId   -- to be a bit user friendly
-      ++ "-"
-      ++ showHashValue (hashPackageHashInputs pkghashinputs)
+hashedInstalledPackageIdLong
+    pkghashinputs@PackageHashInputs{pkgHashPkgId,pkgHashComponent}
+    = mkComponentId $
+           prettyShow pkgHashPkgId   -- to be a bit user friendly
+        ++ maybe "" displayComponent pkgHashComponent
+        ++ "-"
+        ++ showHashValue (hashPackageHashInputs pkghashinputs)
+  where
+    displayComponent :: CD.Component -> String
+    displayComponent CD.ComponentLib        = ""
+    displayComponent (CD.ComponentSubLib s) = "-l-" ++ prettyShow s
+    displayComponent (CD.ComponentFLib s)   = "-f-" ++ prettyShow s
+    displayComponent (CD.ComponentExe s)    = "-e-" ++ prettyShow s
+    displayComponent (CD.ComponentTest s)   = "-t-" ++ prettyShow s
+    displayComponent (CD.ComponentBench s)  = "-b-" ++ prettyShow s
+    displayComponent CD.ComponentSetup      = "-setup"
 
 -- | On Windows we have serious problems with path lengths. Windows imposes a
 -- maximum path length of 260 chars, and even if we can use the windows long
@@ -119,38 +114,34 @@ hashedInstalledPackageIdShort pkghashinputs@PackageHashInputs{pkgHashPkgId} =
     mkComponentId $
       intercalate "-"
         -- max length now 64
-        [ truncateStr 14 (display name)
-        , truncateStr  8 (display version)
-        , showHashValue (truncateHash (hashPackageHashInputs pkghashinputs))
+        [ truncateStr 14 (prettyShow name)
+        , truncateStr  8 (prettyShow version)
+        , showHashValue (truncateHash 20 (hashPackageHashInputs pkghashinputs))
         ]
   where
     PackageIdentifier name version = pkgHashPkgId
-
-    -- Truncate a 32 byte SHA256 hash to 160bits, 20 bytes :-(
-    -- It'll render as 40 hex chars.
-    truncateHash (HashValue h) = HashValue (BS.take 20 h)
 
     -- Truncate a string, with a visual indication that it is truncated.
     truncateStr n s | length s <= n = s
                     | otherwise     = take (n-1) s ++ "_"
 
 -- | On macOS we shorten the name very aggressively.  The mach-o linker on
--- macOS has a limited load command size, to which the name of the lirbary
+-- macOS has a limited load command size, to which the name of the library
 -- as well as its relative path (\@rpath) entry count.  To circumvent this,
 -- on macOS the libraries are not stored as
 --  @store/<libraryname>/libHS<libraryname>.dylib@
--- where libraryname contains the librarys name, version and abi hash, but in
+-- where libraryname contains the libraries name, version and abi hash, but in
 --  @store/lib/libHS<very short libraryname>.dylib@
 -- where the very short library name drops all vowels from the package name,
 -- and truncates the hash to 4 bytes.
 --
--- We therefore only need one \@rpath entry to @store/lib@ instead of one
+-- We therefore we only need one \@rpath entry to @store/lib@ instead of one
 -- \@rpath entry for each library. And the reduced library name saves some
 -- additional space.
 --
 -- This however has two major drawbacks:
--- 1) Packages can easier collide due to the shortened hash.
--- 2) The lirbaries are *not* prefix relocateable anymore as they all end up
+-- 1) Packages can collide more easily due to the shortened hash.
+-- 2) The libraries are *not* prefix relocatable anymore as they all end up
 --    in the same @store/lib@ folder.
 --
 -- The ultimate solution would have to include generating proxy dynamic
@@ -161,13 +152,12 @@ hashedInstalledPackageIdVeryShort :: PackageHashInputs -> InstalledPackageId
 hashedInstalledPackageIdVeryShort pkghashinputs@PackageHashInputs{pkgHashPkgId} =
   mkComponentId $
     intercalate "-"
-      [ filter (not . flip elem "aeiou") (display name)
-      , display version
-      , showHashValue (truncateHash (hashPackageHashInputs pkghashinputs))
+      [ filter (not . flip elem "aeiou") (prettyShow name)
+      , prettyShow version
+      , showHashValue (truncateHash 4 (hashPackageHashInputs pkghashinputs))
       ]
   where
     PackageIdentifier name version = pkgHashPkgId
-    truncateHash (HashValue h) = HashValue (BS.take 4 h)
 
 -- | All the information that contribues to a package's hash, and thus its
 -- 'InstalledPackageId'.
@@ -176,7 +166,7 @@ data PackageHashInputs = PackageHashInputs {
        pkgHashPkgId         :: PackageId,
        pkgHashComponent     :: Maybe CD.Component,
        pkgHashSourceHash    :: PackageSourceHash,
-       pkgHashPkgConfigDeps :: Set (PkgconfigName, Maybe Version),
+       pkgHashPkgConfigDeps :: Set (PkgconfigName, Maybe PkgconfigVersion),
        pkgHashDirectDeps    :: Set InstalledPackageId,
        pkgHashOtherConfig   :: PackageHashConfigInputs
      }
@@ -194,6 +184,7 @@ data PackageHashConfigInputs = PackageHashConfigInputs {
        pkgHashVanillaLib          :: Bool,
        pkgHashSharedLib           :: Bool,
        pkgHashDynExe              :: Bool,
+       pkgHashFullyStaticExe      :: Bool,
        pkgHashGHCiLib             :: Bool,
        pkgHashProfLib             :: Bool,
        pkgHashProfExe             :: Bool,
@@ -211,11 +202,25 @@ data PackageHashConfigInputs = PackageHashConfigInputs {
        pkgHashExtraFrameworkDirs  :: [FilePath],
        pkgHashExtraIncludeDirs    :: [FilePath],
        pkgHashProgPrefix          :: Maybe PathTemplate,
-       pkgHashProgSuffix          :: Maybe PathTemplate
+       pkgHashProgSuffix          :: Maybe PathTemplate,
+
+       -- Haddock options
+       pkgHashDocumentation       :: Bool,
+       pkgHashHaddockHoogle       :: Bool,
+       pkgHashHaddockHtml         :: Bool,
+       pkgHashHaddockHtmlLocation :: Maybe String,
+       pkgHashHaddockForeignLibs  :: Bool,
+       pkgHashHaddockExecutables  :: Bool,
+       pkgHashHaddockTestSuites   :: Bool,
+       pkgHashHaddockBenchmarks   :: Bool,
+       pkgHashHaddockInternal     :: Bool,
+       pkgHashHaddockCss          :: Maybe FilePath,
+       pkgHashHaddockLinkedSource :: Bool,
+       pkgHashHaddockQuickJump    :: Bool,
+       pkgHashHaddockContents     :: Maybe PathTemplate
 
 --     TODO: [required eventually] pkgHashToolsVersions     ?
 --     TODO: [required eventually] pkgHashToolsExtraOptions ?
---     TODO: [research required] and what about docs?
      }
   deriving Show
 
@@ -248,48 +253,64 @@ renderPackageHashInputs PackageHashInputs{
     -- the default value for that feature. So if we avoid adding entries with
     -- the default value then most of the time adding new features will not
     -- change the hashes of existing packages and so fewer packages will need
-    -- to be rebuilt. 
+    -- to be rebuilt.
 
     --TODO: [nice to have] ultimately we probably want to put this config info
     -- into the ghc-pkg db. At that point this should probably be changed to
     -- use the config file infrastructure so it can be read back in again.
     LBS.pack $ unlines $ catMaybes $
-      [ entry "pkgid"       display pkgHashPkgId
+      [ entry "pkgid"       prettyShow pkgHashPkgId
       , mentry "component"  show pkgHashComponent
       , entry "src"         showHashValue pkgHashSourceHash
       , entry "pkg-config-deps"
-                            (intercalate ", " . map (\(pn, mb_v) -> display pn ++
+                            (intercalate ", " . map (\(pn, mb_v) -> prettyShow pn ++
                                                     case mb_v of
                                                         Nothing -> ""
-                                                        Just v -> " " ++ display v)
+                                                        Just v -> " " ++ prettyShow v)
                                               . Set.toList) pkgHashPkgConfigDeps
-      , entry "deps"        (intercalate ", " . map display
+      , entry "deps"        (intercalate ", " . map prettyShow
                                               . Set.toList) pkgHashDirectDeps
         -- and then all the config
-      , entry "compilerid"  display pkgHashCompilerId
-      , entry "platform"    display pkgHashPlatform
+      , entry "compilerid"  prettyShow pkgHashCompilerId
+      , entry "platform" prettyShow pkgHashPlatform
       , opt   "flags" mempty showFlagAssignment pkgHashFlagAssignment
       , opt   "configure-script" [] unwords pkgHashConfigureScriptArgs
-      , opt   "vanilla-lib" True  display pkgHashVanillaLib
-      , opt   "shared-lib"  False display pkgHashSharedLib
-      , opt   "dynamic-exe" False display pkgHashDynExe
-      , opt   "ghci-lib"    False display pkgHashGHCiLib
-      , opt   "prof-lib"    False display pkgHashProfLib
-      , opt   "prof-exe"    False display pkgHashProfExe
-      , opt   "prof-lib-detail" ProfDetailDefault showProfDetailLevel pkgHashProfLibDetail 
-      , opt   "prof-exe-detail" ProfDetailDefault showProfDetailLevel pkgHashProfExeDetail 
-      , opt   "hpc"          False display pkgHashCoverage
+      , opt   "vanilla-lib" True  prettyShow pkgHashVanillaLib
+      , opt   "shared-lib"  False prettyShow pkgHashSharedLib
+      , opt   "dynamic-exe" False prettyShow pkgHashDynExe
+      , opt   "fully-static-exe" False prettyShow pkgHashFullyStaticExe
+      , opt   "ghci-lib"    False prettyShow pkgHashGHCiLib
+      , opt   "prof-lib"    False prettyShow pkgHashProfLib
+      , opt   "prof-exe"    False prettyShow pkgHashProfExe
+      , opt   "prof-lib-detail" ProfDetailDefault showProfDetailLevel pkgHashProfLibDetail
+      , opt   "prof-exe-detail" ProfDetailDefault showProfDetailLevel pkgHashProfExeDetail
+      , opt   "hpc"          False prettyShow pkgHashCoverage
       , opt   "optimisation" NormalOptimisation (show . fromEnum) pkgHashOptimization
-      , opt   "split-objs"   False display pkgHashSplitObjs
-      , opt   "split-sections" False display pkgHashSplitSections
-      , opt   "stripped-lib" False display pkgHashStripLibs
-      , opt   "stripped-exe" True  display pkgHashStripExes
+      , opt   "split-objs"   False prettyShow pkgHashSplitObjs
+      , opt   "split-sections" False prettyShow pkgHashSplitSections
+      , opt   "stripped-lib" False prettyShow pkgHashStripLibs
+      , opt   "stripped-exe" True  prettyShow pkgHashStripExes
       , opt   "debug-info"   NormalDebugInfo (show . fromEnum) pkgHashDebugInfo
       , opt   "extra-lib-dirs"     [] unwords pkgHashExtraLibDirs
       , opt   "extra-framework-dirs" [] unwords pkgHashExtraFrameworkDirs
       , opt   "extra-include-dirs" [] unwords pkgHashExtraIncludeDirs
       , opt   "prog-prefix" Nothing (maybe "" fromPathTemplate) pkgHashProgPrefix
       , opt   "prog-suffix" Nothing (maybe "" fromPathTemplate) pkgHashProgSuffix
+
+      , opt   "documentation"  False prettyShow pkgHashDocumentation
+      , opt   "haddock-hoogle" False prettyShow pkgHashHaddockHoogle
+      , opt   "haddock-html"   False prettyShow pkgHashHaddockHtml
+      , opt   "haddock-html-location" Nothing (fromMaybe "") pkgHashHaddockHtmlLocation
+      , opt   "haddock-foreign-libraries" False prettyShow pkgHashHaddockForeignLibs
+      , opt   "haddock-executables" False prettyShow pkgHashHaddockExecutables
+      , opt   "haddock-tests" False prettyShow pkgHashHaddockTestSuites
+      , opt   "haddock-benchmarks" False prettyShow pkgHashHaddockBenchmarks
+      , opt   "haddock-internal" False prettyShow pkgHashHaddockInternal
+      , opt   "haddock-css" Nothing (fromMaybe "") pkgHashHaddockCss
+      , opt   "haddock-hyperlink-source" False prettyShow pkgHashHaddockLinkedSource
+      , opt   "haddock-quickjump" False prettyShow pkgHashHaddockQuickJump
+      , opt   "haddock-contents-location" Nothing (maybe "" fromPathTemplate) pkgHashHaddockContents
+
       ] ++ Map.foldrWithKey (\prog args acc -> opt (prog ++ "-options") [] unwords args : acc) [] pkgHashProgramArgs
   where
     entry key     format value = Just (key ++ ": " ++ format value)
@@ -299,59 +320,3 @@ renderPackageHashInputs PackageHashInputs{
          | otherwise    = entry key format value
 
     showFlagAssignment = unwords . map showFlagValue . sortBy (compare `on` fst) . unFlagAssignment
-
------------------------------------------------
--- The specific choice of hash implementation
---
-
--- Is a crypto hash necessary here? One thing to consider is who controls the
--- inputs and what's the result of a hash collision. Obviously we should not
--- install packages we don't trust because they can run all sorts of code, but
--- if I've checked there's no TH, no custom Setup etc, is there still a
--- problem? If someone provided us a tarball that hashed to the same value as
--- some other package and we installed it, we could end up re-using that
--- installed package in place of another one we wanted. So yes, in general
--- there is some value in preventing intentional hash collisions in installed
--- package ids.
-
-newtype HashValue = HashValue BS.ByteString
-  deriving (Eq, Show, Typeable)
-
-instance Binary HashValue where
-  put (HashValue digest) = put digest
-  get = do
-    digest <- get
-    -- Cannot do any sensible validation here. Although we use SHA256
-    -- for stuff we hash ourselves, we can also get hashes from TUF
-    -- and that can in principle use different hash functions in future.
-    return (HashValue digest)
-
--- | Hash some data. Currently uses SHA256.
---
-hashValue :: LBS.ByteString -> HashValue
-hashValue = HashValue . SHA256.hashlazy
-
-showHashValue :: HashValue -> String
-showHashValue (HashValue digest) = BS.unpack (Base16.encode digest)
-
--- | Hash the content of a file. Uses SHA256.
---
-readFileHashValue :: FilePath -> IO HashValue
-readFileHashValue tarball =
-    withBinaryFile tarball ReadMode $ \hnd ->
-      evaluate . hashValue =<< LBS.hGetContents hnd
-
--- | Convert a hash from TUF metadata into a 'PackageSourceHash'.
---
--- Note that TUF hashes don't neessarily have to be SHA256, since it can
--- support new algorithms in future.
---
-hashFromTUF :: Sec.Hash -> HashValue
-hashFromTUF (Sec.Hash hashstr) =
-    --TODO: [code cleanup] either we should get TUF to use raw bytestrings or
-    -- perhaps we should also just use a base16 string as the internal rep.
-    case Base16.decode (BS.pack hashstr) of
-      (hash, trailing) | not (BS.null hash) && BS.null trailing
-        -> HashValue hash
-      _ -> error "hashFromTUF: cannot decode base16 hash"
-

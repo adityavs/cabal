@@ -30,7 +30,7 @@ import qualified Distribution.Simple.LocalBuildInfo as LBI
 import Distribution.Simple.Setup
 import Distribution.Simple.UserHooks
 import Distribution.Simple.Utils
-import Distribution.Text
+import Distribution.Pretty
 
 import System.Exit ( ExitCode(..), exitFailure, exitSuccess )
 import System.Directory ( doesFileExist )
@@ -53,7 +53,7 @@ bench args pkg_descr lbi flags = do
         doBench bm =
             case PD.benchmarkInterface bm of
               PD.BenchmarkExeV10 _ _ -> do
-                  let cmd = LBI.buildDir lbi </> name </> name <.> exeExtension
+                  let cmd = LBI.buildDir lbi </> name </> name <.> exeExtension (LBI.hostPlatform lbi)
                       options = map (benchOption pkg_descr lbi bm) $
                                 benchmarkOptions flags
                   -- Check that the benchmark executable exists.
@@ -72,7 +72,7 @@ bench args pkg_descr lbi flags = do
               _ -> do
                   notice verbosity $ "No support for running "
                       ++ "benchmark " ++ name ++ " of type: "
-                      ++ display (PD.benchmarkType bm)
+                      ++ prettyShow (PD.benchmarkType bm)
                   exitFailure
           where name = unUnqualComponentName $ PD.benchmarkName bm
 

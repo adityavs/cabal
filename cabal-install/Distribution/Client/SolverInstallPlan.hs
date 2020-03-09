@@ -51,11 +51,14 @@ module Distribution.Client.SolverInstallPlan(
   reverseTopologicalOrder,
 ) where
 
+import Distribution.Client.Compat.Prelude hiding (toList)
+import Prelude ()
+
 import Distribution.Package
          ( PackageIdentifier(..), Package(..), PackageName
          , HasUnitId(..), PackageId, packageVersion, packageName )
 import qualified Distribution.Solver.Types.ComponentDeps as CD
-import Distribution.Text
+import Distribution.Deprecated.Text
          ( display )
 
 import Distribution.Client.Types
@@ -67,18 +70,12 @@ import           Distribution.Solver.Types.Settings
 import           Distribution.Solver.Types.ResolverPackage
 import           Distribution.Solver.Types.SolverId
 
-import Data.List
-         ( intercalate )
-import Data.Maybe
-         ( fromMaybe, mapMaybe )
-import Distribution.Compat.Binary (Binary(..))
 import Distribution.Compat.Graph (Graph, IsNode(..))
+import qualified Data.Foldable as Foldable
 import qualified Data.Graph as OldGraph
 import qualified Distribution.Compat.Graph as Graph
 import qualified Data.Map as Map
-import Data.Map (Map)
 import Data.Array ((!))
-import Data.Typeable
 
 type SolverPlanPackage = ResolverPackage UnresolvedPkgLoc
 
@@ -88,7 +85,7 @@ data SolverInstallPlan = SolverInstallPlan {
     planIndex      :: !SolverPlanIndex,
     planIndepGoals :: !IndependentGoals
   }
-  deriving (Typeable)
+  deriving (Typeable, Generic)
 
 {-
 -- | Much like 'planPkgIdOf', but mapping back to full packages.
@@ -102,24 +99,10 @@ planPkgOf plan v =
       Nothing  -> error "InstallPlan: internal error: planPkgOf lookup failed"
 -}
 
-mkInstallPlan :: SolverPlanIndex
-              -> IndependentGoals
-              -> SolverInstallPlan
-mkInstallPlan index indepGoals =
-    SolverInstallPlan {
-      planIndex      = index,
-      planIndepGoals = indepGoals
-    }
 
-instance Binary SolverInstallPlan where
-    put SolverInstallPlan {
-              planIndex      = index,
-              planIndepGoals = indepGoals
-        } = put (index, indepGoals)
 
-    get = do
-      (index, indepGoals) <- get
-      return $! mkInstallPlan index indepGoals
+instance Binary SolverInstallPlan
+instance Structured SolverInstallPlan
 
 showPlanIndex :: [SolverPlanPackage] -> String
 showPlanIndex = intercalate "\n" . map showPlanPackage
@@ -140,11 +123,11 @@ new :: IndependentGoals
     -> Either [SolverPlanProblem] SolverInstallPlan
 new indepGoals index =
   case problems indepGoals index of
-    []    -> Right (mkInstallPlan index indepGoals)
+    []    -> Right (SolverInstallPlan index indepGoals)
     probs -> Left probs
 
 toList :: SolverInstallPlan -> [SolverPlanPackage]
-toList = Graph.toList . planIndex
+toList = Foldable.toList . planIndex
 
 toMap :: SolverInstallPlan -> Map SolverId SolverPlanPackage
 toMap = Graph.toMap . planIndex
@@ -239,7 +222,7 @@ problems indepGoals index =
        dependencyInconsistencies indepGoals index ]
 
   ++ [ PackageStateInvalid pkg pkg'
-     | pkg <- Graph.toList index
+     | pkg <- Foldable.toList index
      , Just pkg' <- map (flip Graph.lookup index)
                     (nodeNeighbors pkg)
      , not (stateDependencyRelation pkg pkg') ]
@@ -316,7 +299,7 @@ libraryRoots index =
 setupRoots :: SolverPlanIndex -> [[SolverId]]
 setupRoots = filter (not . null)
            . map (CD.setupDeps . resolverPackageLibDeps)
-           . Graph.toList
+           . Foldable.toList
 
 -- | Given a package index where we assume we want to use all the packages
 -- (use 'dependencyClosure' if you need to get such a index subset) find out
@@ -345,7 +328,7 @@ dependencyInconsistencies' index =
     inverseIndex = Map.fromListWith (Map.unionWith (\(a,b) (_,b') -> (a,b++b')))
       [ (packageName dep, Map.fromList [(sid,(dep,[packageId pkg]))])
       | -- For each package @pkg@
-        pkg <- Graph.toList index
+        pkg <- Foldable.toList index
         -- Find out which @sid@ @pkg@ depends on
       , sid <- CD.nonSetupDeps (resolverPackageLibDeps pkg)
         -- And look up those @sid@ (i.e., @sid@ is the ID of @dep@)

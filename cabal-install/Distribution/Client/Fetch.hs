@@ -44,7 +44,7 @@ import Distribution.Simple.Utils
          ( die', notice, debug )
 import Distribution.System
          ( Platform )
-import Distribution.Text
+import Distribution.Deprecated.Text
          ( display )
 import Distribution.Verbosity
          ( Verbosity )
@@ -162,11 +162,17 @@ planPackages verbosity comp platform fetchFlags
 
       . setCountConflicts countConflicts
 
+      . setFineGrainedConflicts fineGrainedConflicts
+
+      . setMinimizeConflictSet minimizeConflictSet
+
       . setShadowPkgs shadowPkgs
 
       . setStrongFlags strongFlags
 
       . setAllowBootLibInstalls allowBootLibInstalls
+
+      . setOnlyConstrained onlyConstrained
 
       . setSolverVerbosity verbosity
 
@@ -195,11 +201,14 @@ planPackages verbosity comp platform fetchFlags
 
     reorderGoals     = fromFlag (fetchReorderGoals     fetchFlags)
     countConflicts   = fromFlag (fetchCountConflicts   fetchFlags)
+    fineGrainedConflicts = fromFlag (fetchFineGrainedConflicts fetchFlags)
+    minimizeConflictSet = fromFlag (fetchMinimizeConflictSet fetchFlags)
     independentGoals = fromFlag (fetchIndependentGoals fetchFlags)
     shadowPkgs       = fromFlag (fetchShadowPkgs       fetchFlags)
     strongFlags      = fromFlag (fetchStrongFlags      fetchFlags)
     maxBackjumps     = fromFlag (fetchMaxBackjumps     fetchFlags)
     allowBootLibInstalls = fromFlag (fetchAllowBootLibInstalls fetchFlags)
+    onlyConstrained  = fromFlag (fetchOnlyConstrained  fetchFlags)
 
 
 checkTarget :: Verbosity -> UserTarget -> IO ()
@@ -217,6 +226,10 @@ fetchPackage verbosity repoCtxt pkgsrc = case pkgsrc of
     RemoteTarballPackage _uri _ ->
       die' verbosity $ "The 'fetch' command does not yet support remote tarballs. "
          ++ "In the meantime you can use the 'unpack' commands."
+
+    RemoteSourceRepoPackage _repo _ ->
+      die' verbosity $ "The 'fetch' command does not yet support remote "
+         ++ "source repositores."
 
     RepoTarballPackage repo pkgid _ -> do
       _ <- fetchRepoTarball verbosity repoCtxt repo pkgid

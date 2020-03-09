@@ -1,4 +1,5 @@
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE DeriveGeneric #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Client.InstallSymlink
@@ -12,33 +13,16 @@
 -- Managing installing binaries with symlinks.
 -----------------------------------------------------------------------------
 module Distribution.Client.InstallSymlink (
+    OverwritePolicy(..),
     symlinkBinaries,
     symlinkBinary,
+    trySymlink,
   ) where
 
-#ifdef mingw32_HOST_OS
-
-import Distribution.Package (PackageIdentifier)
-import Distribution.Types.UnqualComponentName
-import Distribution.Client.InstallPlan (InstallPlan)
-import Distribution.Client.Types (BuildOutcomes)
-import Distribution.Client.Setup (InstallFlags)
-import Distribution.Simple.Setup (ConfigFlags)
-import Distribution.Simple.Compiler
-import Distribution.System
-
-symlinkBinaries :: Platform -> Compiler
-                -> ConfigFlags
-                -> InstallFlags
-                -> InstallPlan
-                -> BuildOutcomes
-                -> IO [(PackageIdentifier, UnqualComponentName, FilePath)]
-symlinkBinaries _ _ _ _ _ _ = return []
-
-symlinkBinary :: FilePath -> FilePath -> UnqualComponentName -> String -> IO Bool
-symlinkBinary _ _ _ _ = fail "Symlinking feature not available on Windows"
-
-#else
+import Distribution.Compat.Binary
+         ( Binary )
+import Distribution.Utils.Structured
+         ( Structured )
 
 import Distribution.Client.Types
          ( ConfiguredPackage(..), BuildOutcomes )
@@ -67,14 +51,13 @@ import Distribution.Simple.Compiler
          ( Compiler, compilerInfo, CompilerInfo(..) )
 import Distribution.System
          ( Platform )
-import Distribution.Text
+import Distribution.Deprecated.Text
          ( display )
+import Distribution.Verbosity  ( Verbosity )
+import Distribution.Simple.Utils ( info, withTempDirectory )
 
-import System.Posix.Files
-         ( getSymbolicLinkStatus, isSymbolicLink, createSymbolicLink
-         , removeLink )
 import System.Directory
-         ( canonicalizePath )
+         ( canonicalizePath, getTemporaryDirectory, removeFile )
 import System.FilePath
          ( (</>), splitPath, joinPath, isAbsolute )
 
@@ -86,6 +69,19 @@ import Control.Exception
          ( assert )
 import Data.Maybe
          ( catMaybes )
+import GHC.Generics
+         ( Generic )
+
+import Distribution.Client.Compat.Directory ( createFileLink, getSymbolicLinkTarget, pathIsSymbolicLink )
+
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as BS8
+
+data OverwritePolicy = NeverOverwrite | AlwaysOverwrite
+  deriving (Show, Eq, Generic, Bounded, Enum)
+
+instance Binary OverwritePolicy
+instance Structured OverwritePolicy
 
 -- | We would like by default to install binaries into some location that is on
 -- the user's PATH. For per-user installations on Unix systems that basically
@@ -108,12 +104,15 @@ import Data.Maybe
 -- with symlinks so is not available to Windows users.
 --
 symlinkBinaries :: Platform -> Compiler
+                -> OverwritePolicy
                 -> ConfigFlags
                 -> InstallFlags
                 -> InstallPlan
                 -> BuildOutcomes
                 -> IO [(PackageIdentifier, UnqualComponentName, FilePath)]
-symlinkBinaries platform comp configFlags installFlags plan buildOutcomes =
+symlinkBinaries platform comp overwritePolicy
+                configFlags installFlags
+                plan buildOutcomes =
   case flagToMaybe (installSymlinkBinDir installFlags) of
     Nothing            -> return []
     Just symlinkBinDir
@@ -125,8 +124,9 @@ symlinkBinaries platform comp configFlags installFlags plan buildOutcomes =
       fmap catMaybes $ sequence
         [ do privateBinDir <- pkgBinDir pkg ipid
              ok <- symlinkBinary
+                     overwritePolicy
                      publicBinDir  privateBinDir
-                     publicExeName privateExeName
+                     (display publicExeName) privateExeName
              if ok
                then return Nothing
                else return (Just (pkgid, publicExeName,
@@ -187,11 +187,12 @@ symlinkBinaries platform comp configFlags installFlags plan buildOutcomes =
     (CompilerId compilerFlavor _) = compilerInfoId cinfo
 
 symlinkBinary ::
-  FilePath               -- ^ The canonical path of the public bin dir eg
+  OverwritePolicy        -- ^ Whether to force overwrite an existing file
+  -> FilePath            -- ^ The canonical path of the public bin dir eg
                          --   @/home/user/bin@
   -> FilePath            -- ^ The canonical path of the private bin dir eg
                          --   @/home/user/.cabal/bin@
-  -> UnqualComponentName -- ^ The name of the executable to go in the public bin
+  -> FilePath            -- ^ The name of the executable to go in the public bin
                          --   dir, eg @foo@
   -> String              -- ^ The name of the executable to in the private bin
                          --   dir, eg @foo-1.0@
@@ -199,19 +200,20 @@ symlinkBinary ::
                          --   there was another file there already that we did
                          --   not own. Other errors like permission errors just
                          --   propagate as exceptions.
-symlinkBinary publicBindir privateBindir publicName privateName = do
-  ok <- targetOkToOverwrite (publicBindir </> publicName')
+symlinkBinary overwritePolicy publicBindir privateBindir publicName privateName = do
+  ok <- targetOkToOverwrite (publicBindir </> publicName)
                             (privateBindir </> privateName)
   case ok of
-    NotOurFile    ->                     return False
-    NotExists     ->           mkLink >> return True
-    OkToOverwrite -> rmLink >> mkLink >> return True
+    NotExists         ->           mkLink >> return True
+    OkToOverwrite     -> rmLink >> mkLink >> return True
+    NotOurFile ->
+      case overwritePolicy of
+        NeverOverwrite  ->                     return False
+        AlwaysOverwrite -> rmLink >> mkLink >> return True
   where
-    publicName' = display publicName
     relativeBindir = makeRelative publicBindir privateBindir
-    mkLink = createSymbolicLink (relativeBindir </> privateName)
-                                (publicBindir   </> publicName')
-    rmLink = removeLink (publicBindir </> publicName')
+    mkLink = createFileLink (relativeBindir </> privateName) (publicBindir   </> publicName)
+    rmLink = removeFile (publicBindir </> publicName)
 
 -- | Check a file path of a symlink that we would like to create to see if it
 -- is OK. For it to be OK to overwrite it must either not already exist yet or
@@ -223,11 +225,11 @@ targetOkToOverwrite :: FilePath -- ^ The file path of the symlink to the private
                                 -- Use 'canonicalizePath' to make this.
                     -> IO SymlinkStatus
 targetOkToOverwrite symlink target = handleNotExist $ do
-  status <- getSymbolicLinkStatus symlink
-  if not (isSymbolicLink status)
+  isLink <- pathIsSymbolicLink symlink
+  if not isLink
     then return NotOurFile
-    else do target' <- canonicalizePath symlink
-            -- This relies on canonicalizePath handling symlinks
+    else do target' <- canonicalizePath =<< getSymbolicLinkTarget symlink
+            -- This partially relies on canonicalizePath handling symlinks
             if target == target'
               then return OkToOverwrite
               else return NotOurFile
@@ -259,4 +261,27 @@ makeRelative a b = assert (isAbsolute a && isAbsolute b) $
    in joinPath $ [ ".." | _  <- drop commonLen as ]
               ++ drop commonLen bs
 
-#endif
+-- | Try to make a symlink in a temporary directory.
+--
+-- If this works, we can try to symlink: even on Windows.
+--
+trySymlink :: Verbosity -> IO Bool
+trySymlink verbosity = do
+  tmp <- getTemporaryDirectory
+  withTempDirectory verbosity tmp "cabal-symlink-test" $ \tmpDirPath -> do
+    let from = tmpDirPath </> "file.txt"
+    let to   = tmpDirPath </> "file2.txt"
+
+    -- create a file
+    BS.writeFile from (BS8.pack "TEST")
+
+    -- create a symbolic link
+    let create :: IO Bool
+        create = do
+          createFileLink from to
+          info verbosity $ "Symlinking seems to work"
+          return True
+
+    create `catchIO` \exc -> do
+      info verbosity $ "Symlinking doesn't seem to be working: " ++ show exc
+      return False

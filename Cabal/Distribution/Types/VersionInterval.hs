@@ -28,6 +28,9 @@ import Control.Exception (assert)
 import Distribution.Types.Version
 import Distribution.Types.VersionRange
 
+-- NonEmpty
+import qualified Prelude (foldr1)
+
 -------------------------------------------------------------------------------
 -- VersionRange
 -------------------------------------------------------------------------------
@@ -115,9 +118,9 @@ invariant (VersionIntervals intervals) = all validInterval intervals
     doesNotTouch' ((_,u), (l',_)) = doesNotTouch u l'
 
     adjacentIntervals :: [(VersionInterval, VersionInterval)]
-    adjacentIntervals
-      | null intervals = []
-      | otherwise      = zip intervals (tail intervals)
+    adjacentIntervals = case intervals of
+      []     -> []
+      (_:tl) -> zip intervals tl
 
 checkInvariant :: VersionIntervals -> VersionIntervals
 checkInvariant is = assert (invariant is) is
@@ -214,7 +217,7 @@ toVersionIntervals = foldVersionRange
 fromVersionIntervals :: VersionIntervals -> VersionRange
 fromVersionIntervals (VersionIntervals []) = noVersion
 fromVersionIntervals (VersionIntervals intervals) =
-    foldr1 unionVersionRanges [ interval l u | (l, u) <- intervals ]
+    Prelude.foldr1 unionVersionRanges [ interval l u | (l, u) <- intervals ]
 
   where
     interval (LowerBound v  InclusiveBound)

@@ -1,7 +1,6 @@
-{-# LANGUAGE CPP #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE RankNTypes #-}
-
+{-# LANGUAGE LambdaCase #-}
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.Simple
@@ -53,10 +52,10 @@ module Distribution.Simple (
         -- ** Standard sets of hooks
         simpleUserHooks,
         autoconfUserHooks,
-        defaultUserHooks, emptyUserHooks,
-        -- ** Utils
-        defaultHookedPackageDesc
+        emptyUserHooks,
   ) where
+
+import Control.Exception (try)
 
 import Prelude ()
 import Distribution.Compat.Prelude
@@ -92,14 +91,17 @@ import Distribution.Verbosity
 import Language.Haskell.Extension
 import Distribution.Version
 import Distribution.License
-import Distribution.Text
+import Distribution.Pretty
+import Distribution.System (buildPlatform)
 
 -- Base
 import System.Environment (getArgs, getProgName)
 import System.Directory   (removeFile, doesFileExist
                           ,doesDirectoryExist, removeDirectoryRecursive)
 import System.Exit                          (exitWith,ExitCode(..))
-import System.FilePath                      (searchPathSeparator)
+import System.FilePath                      (searchPathSeparator, takeDirectory, (</>), splitDirectories, dropDrive)
+import Distribution.Compat.ResponseFile (expandResponse)
+import Distribution.Compat.Directory        (makeAbsolute)
 import Distribution.Compat.Environment      (getEnvironment)
 import Distribution.Compat.GetShortPathName (getShortPathName)
 
@@ -147,8 +149,9 @@ defaultMainWithHooksNoReadArgs hooks pkg_descr =
   defaultMainHelper hooks { readDesc = return (Just pkg_descr) }
 
 defaultMainHelper :: UserHooks -> Args -> IO ()
-defaultMainHelper hooks args = topHandler $
-  case commandsRun (globalCommand commands) commands args of
+defaultMainHelper hooks args = topHandler $ do
+  args' <- expandResponse args
+  case commandsRun (globalCommand commands) commands args' of
     CommandHelp   help                 -> printHelp help
     CommandList   opts                 -> printOptionsList opts
     CommandErrors errs                 -> printErrors errs
@@ -167,15 +170,16 @@ defaultMainHelper hooks args = topHandler $
     printErrors errs = do
       putStr (intercalate "\n" errs)
       exitWith (ExitFailure 1)
-    printNumericVersion = putStrLn $ display cabalVersion
+    printNumericVersion = putStrLn $ prettyShow cabalVersion
     printVersion        = putStrLn $ "Cabal library version "
-                                  ++ display cabalVersion
+                                  ++ prettyShow cabalVersion
 
     progs = addKnownPrograms (hookedPrograms hooks) defaultProgramDb
     commands =
       [configureCommand progs `commandAddAction`
         \fs as -> configureAction hooks fs as >> return ()
       ,buildCommand     progs `commandAddAction` buildAction        hooks
+      ,showBuildInfoCommand progs `commandAddAction` showBuildInfoAction    hooks
       ,replCommand      progs `commandAddAction` replAction         hooks
       ,installCommand         `commandAddAction` installAction      hooks
       ,copyCommand            `commandAddAction` copyAction         hooks
@@ -248,17 +252,45 @@ buildAction :: UserHooks -> BuildFlags -> Args -> IO ()
 buildAction hooks flags args = do
   distPref <- findDistPrefOrDefault (buildDistPref flags)
   let verbosity = fromFlag $ buildVerbosity flags
-      flags' = flags { buildDistPref = toFlag distPref }
-
   lbi <- getBuildConfig hooks verbosity distPref
+  let flags' = flags { buildDistPref = toFlag distPref
+                     , buildCabalFilePath = maybeToFlag (cabalFilePath lbi)}
+
   progs <- reconfigurePrograms verbosity
              (buildProgramPaths flags')
              (buildProgramArgs flags')
              (withPrograms lbi)
 
-  hookedAction preBuild buildHook postBuild
+  hookedAction verbosity preBuild buildHook postBuild
                (return lbi { withPrograms = progs })
                hooks flags' { buildArgs = args } args
+
+showBuildInfoAction :: UserHooks -> ShowBuildInfoFlags -> Args -> IO ()
+showBuildInfoAction hooks (ShowBuildInfoFlags flags fileOutput) args = do
+  distPref <- findDistPrefOrDefault (buildDistPref flags)
+  let verbosity = fromFlag $ buildVerbosity flags
+  lbi <- getBuildConfig hooks verbosity distPref
+  let flags' = flags { buildDistPref = toFlag distPref
+                     , buildCabalFilePath = maybeToFlag (cabalFilePath lbi)
+                     }
+
+  progs <- reconfigurePrograms verbosity
+             (buildProgramPaths flags')
+             (buildProgramArgs flags')
+             (withPrograms lbi)
+
+  pbi <- preBuild hooks args flags'
+  let lbi' = lbi { withPrograms = progs }
+      pkg_descr0 = localPkgDescr lbi'
+      pkg_descr = updatePackageDescription pbi pkg_descr0
+      -- TODO: Somehow don't ignore build hook?
+  buildInfoString <- showBuildInfo pkg_descr lbi' flags
+
+  case fileOutput of
+    Nothing -> putStr buildInfoString
+    Just fp -> writeFile fp buildInfoString
+
+  postBuild hooks args flags' pkg_descr lbi'
 
 replAction :: UserHooks -> ReplFlags -> Args -> IO ()
 replAction hooks flags args = do
@@ -277,7 +309,7 @@ replAction hooks flags args = do
   -- takes the args explicitly.  UGH.   -- ezyang
   pbi <- preRepl hooks args flags'
   let pkg_descr0 = localPkgDescr lbi
-  sanityCheckHookedBuildInfo pkg_descr0 pbi
+  sanityCheckHookedBuildInfo verbosity pkg_descr0 pbi
   let pkg_descr = updatePackageDescription pbi pkg_descr0
       lbi' = lbi { withPrograms = progs
                  , localPkgDescr = pkg_descr }
@@ -288,8 +320,11 @@ hscolourAction :: UserHooks -> HscolourFlags -> Args -> IO ()
 hscolourAction hooks flags args = do
     distPref <- findDistPrefOrDefault (hscolourDistPref flags)
     let verbosity = fromFlag $ hscolourVerbosity flags
-        flags' = flags { hscolourDistPref = toFlag distPref }
-    hookedAction preHscolour hscolourHook postHscolour
+    lbi <- getBuildConfig hooks verbosity distPref
+    let flags' = flags { hscolourDistPref = toFlag distPref
+                       , hscolourCabalFilePath = maybeToFlag (cabalFilePath lbi)}
+
+    hookedAction verbosity preHscolour hscolourHook postHscolour
                  (getBuildConfig hooks verbosity distPref)
                  hooks flags' args
 
@@ -305,7 +340,7 @@ doctestAction hooks flags args = do
              (doctestProgramArgs  flags')
              (withPrograms lbi)
 
-  hookedAction preDoctest doctestHook postDoctest
+  hookedAction verbosity preDoctest doctestHook postDoctest
                (return lbi { withPrograms = progs })
                hooks flags' args
 
@@ -313,22 +348,28 @@ haddockAction :: UserHooks -> HaddockFlags -> Args -> IO ()
 haddockAction hooks flags args = do
   distPref <- findDistPrefOrDefault (haddockDistPref flags)
   let verbosity = fromFlag $ haddockVerbosity flags
-      flags' = flags { haddockDistPref = toFlag distPref }
-
   lbi <- getBuildConfig hooks verbosity distPref
+  let flags' = flags { haddockDistPref = toFlag distPref
+                     , haddockCabalFilePath = maybeToFlag (cabalFilePath lbi)}
+
   progs <- reconfigurePrograms verbosity
              (haddockProgramPaths flags')
              (haddockProgramArgs flags')
              (withPrograms lbi)
 
-  hookedAction preHaddock haddockHook postHaddock
+  hookedAction verbosity preHaddock haddockHook postHaddock
                (return lbi { withPrograms = progs })
-               hooks flags' args
+               hooks flags' { haddockArgs = args } args
 
 cleanAction :: UserHooks -> CleanFlags -> Args -> IO ()
 cleanAction hooks flags args = do
     distPref <- findDistPrefOrDefault (cleanDistPref flags)
-    let flags' = flags { cleanDistPref = toFlag distPref }
+
+    elbi <- tryGetBuildConfig hooks verbosity distPref
+    let flags' = flags { cleanDistPref = toFlag distPref
+                       , cleanCabalFilePath = case elbi of
+                           Left _ -> mempty
+                           Right lbi -> maybeToFlag (cabalFilePath lbi)}
 
     pbi <- preClean hooks args flags'
 
@@ -342,7 +383,7 @@ cleanAction hooks flags args = do
     let pkg_descr0 = flattenPackageDescription ppd
     -- We don't sanity check for clean as an error
     -- here would prevent cleaning:
-    --sanityCheckHookedBuildInfo pkg_descr0 pbi
+    --sanityCheckHookedBuildInfo verbosity pkg_descr0 pbi
     let pkg_descr = updatePackageDescription pbi pkg_descr0
 
     cleanHook hooks pkg_descr () hooks flags'
@@ -354,8 +395,10 @@ copyAction :: UserHooks -> CopyFlags -> Args -> IO ()
 copyAction hooks flags args = do
     distPref <- findDistPrefOrDefault (copyDistPref flags)
     let verbosity = fromFlag $ copyVerbosity flags
-        flags' = flags { copyDistPref = toFlag distPref }
-    hookedAction preCopy copyHook postCopy
+    lbi <- getBuildConfig hooks verbosity distPref
+    let flags' = flags { copyDistPref = toFlag distPref
+                       , copyCabalFilePath = maybeToFlag (cabalFilePath lbi)}
+    hookedAction verbosity preCopy copyHook postCopy
                  (getBuildConfig hooks verbosity distPref)
                  hooks flags' { copyArgs = args } args
 
@@ -363,16 +406,17 @@ installAction :: UserHooks -> InstallFlags -> Args -> IO ()
 installAction hooks flags args = do
     distPref <- findDistPrefOrDefault (installDistPref flags)
     let verbosity = fromFlag $ installVerbosity flags
-        flags' = flags { installDistPref = toFlag distPref }
-    hookedAction preInst instHook postInst
+    lbi <- getBuildConfig hooks verbosity distPref
+    let flags' = flags { installDistPref = toFlag distPref
+                       , installCabalFilePath = maybeToFlag (cabalFilePath lbi)}
+    hookedAction verbosity preInst instHook postInst
                  (getBuildConfig hooks verbosity distPref)
                  hooks flags' args
 
 sdistAction :: UserHooks -> SDistFlags -> Args -> IO ()
-sdistAction hooks flags args = do
+sdistAction hooks flags _args = do
     distPref <- findDistPrefOrDefault (sDistDistPref flags)
-    let flags' = flags { sDistDistPref = toFlag distPref }
-    pbi <- preSDist hooks args flags'
+    let pbi   = emptyHookedBuildInfo
 
     mlbi <- maybeGetPersistBuildConfig distPref
 
@@ -389,12 +433,11 @@ sdistAction hooks flags args = do
     (_, ppd) <- confPkgDescr hooks verbosity Nothing
 
     let pkg_descr0 = flattenPackageDescription ppd
-    sanityCheckHookedBuildInfo pkg_descr0 pbi
+    sanityCheckHookedBuildInfo verbosity pkg_descr0 pbi
     let pkg_descr = updatePackageDescription pbi pkg_descr0
         mlbi' = fmap (\lbi -> lbi { localPkgDescr = pkg_descr }) mlbi
 
-    sDistHook hooks pkg_descr mlbi' hooks flags'
-    postSDist hooks args flags' pkg_descr mlbi'
+    sdist pkg_descr mlbi' flags srcPref (allSuffixHandlers hooks)
   where
     verbosity = fromFlag (sDistVerbosity flags)
 
@@ -404,13 +447,7 @@ testAction hooks flags args = do
     let verbosity = fromFlag $ testVerbosity flags
         flags' = flags { testDistPref = toFlag distPref }
 
-    localBuildInfo <- getBuildConfig hooks verbosity distPref
-    let pkg_descr = localPkgDescr localBuildInfo
-    -- It is safe to do 'runTests' before the new test handler because the
-    -- default action is a no-op and if the package uses the old test interface
-    -- the new handler will find no tests.
-    runTests hooks args False pkg_descr localBuildInfo
-    hookedActionWithArgs preTest testHook postTest
+    hookedActionWithArgs verbosity preTest testHook postTest
             (getBuildConfig hooks verbosity distPref)
             hooks flags' args
 
@@ -419,7 +456,7 @@ benchAction hooks flags args = do
     distPref <- findDistPrefOrDefault (benchmarkDistPref flags)
     let verbosity = fromFlag $ benchmarkVerbosity flags
         flags' = flags { benchmarkDistPref = toFlag distPref }
-    hookedActionWithArgs preBench benchHook postBench
+    hookedActionWithArgs verbosity preBench benchHook postBench
             (getBuildConfig hooks verbosity distPref)
             hooks flags' args
 
@@ -427,8 +464,10 @@ registerAction :: UserHooks -> RegisterFlags -> Args -> IO ()
 registerAction hooks flags args = do
     distPref <- findDistPrefOrDefault (regDistPref flags)
     let verbosity = fromFlag $ regVerbosity flags
-        flags' = flags { regDistPref = toFlag distPref }
-    hookedAction preReg regHook postReg
+    lbi <- getBuildConfig hooks verbosity distPref
+    let flags' = flags { regDistPref = toFlag distPref
+                       , regCabalFilePath = maybeToFlag (cabalFilePath lbi)}
+    hookedAction verbosity preReg regHook postReg
                  (getBuildConfig hooks verbosity distPref)
                  hooks flags' { regArgs = args } args
 
@@ -436,58 +475,73 @@ unregisterAction :: UserHooks -> RegisterFlags -> Args -> IO ()
 unregisterAction hooks flags args = do
     distPref <- findDistPrefOrDefault (regDistPref flags)
     let verbosity = fromFlag $ regVerbosity flags
-        flags' = flags { regDistPref = toFlag distPref }
-    hookedAction preUnreg unregHook postUnreg
+    lbi <- getBuildConfig hooks verbosity distPref
+    let flags' = flags { regDistPref = toFlag distPref
+                       , regCabalFilePath = maybeToFlag (cabalFilePath lbi)}
+    hookedAction verbosity preUnreg unregHook postUnreg
                  (getBuildConfig hooks verbosity distPref)
                  hooks flags' args
 
-hookedAction :: (UserHooks -> Args -> flags -> IO HookedBuildInfo)
-        -> (UserHooks -> PackageDescription -> LocalBuildInfo
-                      -> UserHooks -> flags -> IO ())
-        -> (UserHooks -> Args -> flags -> PackageDescription
-                      -> LocalBuildInfo -> IO ())
-        -> IO LocalBuildInfo
-        -> UserHooks -> flags -> Args -> IO ()
-hookedAction pre_hook cmd_hook =
-    hookedActionWithArgs pre_hook (\h _ pd lbi uh flags ->
-                                     cmd_hook h pd lbi uh flags)
+hookedAction
+  :: Verbosity
+  -> (UserHooks -> Args -> flags -> IO HookedBuildInfo)
+  -> (UserHooks -> PackageDescription -> LocalBuildInfo
+                -> UserHooks -> flags -> IO ())
+  -> (UserHooks -> Args -> flags -> PackageDescription
+                -> LocalBuildInfo -> IO ())
+  -> IO LocalBuildInfo
+  -> UserHooks -> flags -> Args -> IO ()
+hookedAction verbosity pre_hook cmd_hook =
+    hookedActionWithArgs verbosity pre_hook
+    (\h _ pd lbi uh flags ->
+        cmd_hook h pd lbi uh flags)
 
-hookedActionWithArgs :: (UserHooks -> Args -> flags -> IO HookedBuildInfo)
-        -> (UserHooks -> Args -> PackageDescription -> LocalBuildInfo
-                      -> UserHooks -> flags -> IO ())
-        -> (UserHooks -> Args -> flags -> PackageDescription
-                      -> LocalBuildInfo -> IO ())
-        -> IO LocalBuildInfo
-        -> UserHooks -> flags -> Args -> IO ()
-hookedActionWithArgs pre_hook cmd_hook post_hook
+hookedActionWithArgs
+  :: Verbosity
+  -> (UserHooks -> Args -> flags -> IO HookedBuildInfo)
+  -> (UserHooks -> Args -> PackageDescription -> LocalBuildInfo
+                -> UserHooks -> flags -> IO ())
+  -> (UserHooks -> Args -> flags -> PackageDescription
+                -> LocalBuildInfo -> IO ())
+  -> IO LocalBuildInfo
+  -> UserHooks -> flags -> Args -> IO ()
+hookedActionWithArgs verbosity pre_hook cmd_hook post_hook
   get_build_config hooks flags args = do
    pbi <- pre_hook hooks args flags
    lbi0 <- get_build_config
    let pkg_descr0 = localPkgDescr lbi0
-   sanityCheckHookedBuildInfo pkg_descr0 pbi
+   sanityCheckHookedBuildInfo verbosity pkg_descr0 pbi
    let pkg_descr = updatePackageDescription pbi pkg_descr0
        lbi = lbi0 { localPkgDescr = pkg_descr }
    cmd_hook hooks args pkg_descr lbi hooks flags
    post_hook hooks args flags pkg_descr lbi
 
-sanityCheckHookedBuildInfo :: PackageDescription -> HookedBuildInfo -> IO ()
-sanityCheckHookedBuildInfo PackageDescription { library = Nothing } (Just _,_)
-    = die $ "The buildinfo contains info for a library, "
-         ++ "but the package does not have a library."
+sanityCheckHookedBuildInfo
+  :: Verbosity -> PackageDescription -> HookedBuildInfo -> IO ()
+sanityCheckHookedBuildInfo verbosity
+  (PackageDescription { library = Nothing }) (Just _,_)
+    = die' verbosity $ "The buildinfo contains info for a library, "
+      ++ "but the package does not have a library."
 
-sanityCheckHookedBuildInfo pkg_descr (_, hookExes)
-    | not (null nonExistant)
-    = die $ "The buildinfo contains info for an executable called '"
-         ++ display (head nonExistant) ++ "' but the package does not have a "
-         ++ "executable with that name."
+sanityCheckHookedBuildInfo verbosity pkg_descr (_, hookExes)
+    | exe1 : _ <- nonExistant
+    = die' verbosity $ "The buildinfo contains info for an executable called '"
+      ++ prettyShow exe1 ++ "' but the package does not have a "
+      ++ "executable with that name."
   where
     pkgExeNames  = nub (map exeName (executables pkg_descr))
     hookExeNames = nub (map fst hookExes)
     nonExistant  = hookExeNames \\ pkgExeNames
 
-sanityCheckHookedBuildInfo _ _ = return ()
+sanityCheckHookedBuildInfo _ _ _ = return ()
+
+-- | Try to read the 'localBuildInfoFile'
+tryGetBuildConfig :: UserHooks -> Verbosity -> FilePath
+                  -> IO (Either ConfigStateFileError LocalBuildInfo)
+tryGetBuildConfig u v = try . getBuildConfig u v
 
 
+-- | Read the 'localBuildInfoFile' or throw an exception.
 getBuildConfig :: UserHooks -> Verbosity -> FilePath -> IO LocalBuildInfo
 getBuildConfig hooks verbosity distPref = do
   lbi_wo_programs <- getPersistBuildConfig distPref
@@ -517,8 +571,8 @@ getBuildConfig hooks verbosity distPref = do
             -- Since the list of unconfigured programs is not serialized,
             -- restore it to the same value as normally used at the beginning
             -- of a configure run:
-            configPrograms_ = restoreProgramDb
-                               (builtinPrograms ++ hookedPrograms hooks)
+            configPrograms_ = fmap (restoreProgramDb
+                                      (builtinPrograms ++ hookedPrograms hooks))
                                `fmap` configPrograms_ cFlags,
 
             -- Use the current, not saved verbosity level:
@@ -552,7 +606,7 @@ clean pkg_descr flags = do
     traverse_ (writePersistBuildConfig distPref) maybeConfig
 
   where
-        removeFileOrDirectory :: FilePath -> NoCallStackIO ()
+        removeFileOrDirectory :: FilePath -> IO ()
         removeFileOrDirectory fname = do
             isDir <- doesDirectoryExist fname
             isFile <- doesFileExist fname
@@ -577,7 +631,6 @@ simpleUserHooks =
        testHook  = defaultTestHook,
        benchHook = defaultBenchHook,
        instHook  = defaultInstallHook,
-       sDistHook = \p l h f -> sdist p l f srcPref (allSuffixHandlers h),
        cleanHook = \p _ _ f -> clean p f,
        hscolourHook = \p l h f -> hscolour p l (allSuffixHandlers h) f,
        haddockHook  = \p l h f -> haddock  p l (allSuffixHandlers h) f,
@@ -602,78 +655,57 @@ simpleUserHooks =
 -- Thus @configure@ can use local system information to generate
 -- /package/@.buildinfo@ and possibly other files.
 
-{-# DEPRECATED defaultUserHooks
-     "Use simpleUserHooks or autoconfUserHooks, unless you need Cabal-1.2\n             compatibility in which case you must stick with defaultUserHooks" #-}
-defaultUserHooks :: UserHooks
-defaultUserHooks = autoconfUserHooks {
-          confHook = \pkg flags -> do
-                       let verbosity = fromFlag (configVerbosity flags)
-                       warn verbosity
-                         "defaultUserHooks in Setup script is deprecated."
-                       confHook autoconfUserHooks pkg flags,
-          postConf = oldCompatPostConf
-    }
-    -- This is the annoying old version that only runs configure if it exists.
-    -- It's here for compatibility with existing Setup.hs scripts. See:
-    -- https://github.com/haskell/cabal/issues/158
-    where oldCompatPostConf args flags pkg_descr lbi
-              = do let verbosity = fromFlag (configVerbosity flags)
-                   confExists <- doesFileExist "configure"
-                   when confExists $
-                       runConfigureScript verbosity
-                         backwardsCompatHack flags lbi
-
-                   pbi <- getHookedBuildInfo verbosity
-                   sanityCheckHookedBuildInfo pkg_descr pbi
-                   let pkg_descr' = updatePackageDescription pbi pkg_descr
-                       lbi' = lbi { localPkgDescr = pkg_descr' }
-                   postConf simpleUserHooks args flags pkg_descr' lbi'
-
-          backwardsCompatHack = True
-
 autoconfUserHooks :: UserHooks
 autoconfUserHooks
     = simpleUserHooks
       {
        postConf    = defaultPostConf,
-       preBuild    = readHookWithArgs buildVerbosity,
-       preCopy     = readHookWithArgs copyVerbosity,
-       preClean    = readHook cleanVerbosity,
-       preInst     = readHook installVerbosity,
-       preHscolour = readHook hscolourVerbosity,
-       preHaddock  = readHook haddockVerbosity,
-       preReg      = readHook regVerbosity,
-       preUnreg    = readHook regVerbosity
+       preBuild    = readHookWithArgs buildVerbosity buildDistPref, -- buildCabalFilePath,
+       preCopy     = readHookWithArgs copyVerbosity copyDistPref,
+       preClean    = readHook cleanVerbosity cleanDistPref,
+       preInst     = readHook installVerbosity installDistPref,
+       preHscolour = readHook hscolourVerbosity hscolourDistPref,
+       preHaddock  = readHookWithArgs haddockVerbosity haddockDistPref,
+       preReg      = readHook regVerbosity regDistPref,
+       preUnreg    = readHook regVerbosity regDistPref
       }
     where defaultPostConf :: Args -> ConfigFlags -> PackageDescription
                           -> LocalBuildInfo -> IO ()
           defaultPostConf args flags pkg_descr lbi
               = do let verbosity = fromFlag (configVerbosity flags)
-                   confExists <- doesFileExist "configure"
+                       baseDir lbi' = fromMaybe ""
+                                      (takeDirectory <$> cabalFilePath lbi')
+                   confExists <- doesFileExist $ (baseDir lbi) </> "configure"
                    if confExists
                      then runConfigureScript verbosity
                             backwardsCompatHack flags lbi
-                     else die "configure script not found."
+                     else die' verbosity "configure script not found."
 
-                   pbi <- getHookedBuildInfo verbosity
-                   sanityCheckHookedBuildInfo pkg_descr pbi
+                   pbi <- getHookedBuildInfo verbosity (buildDir lbi)
+                   sanityCheckHookedBuildInfo verbosity pkg_descr pbi
                    let pkg_descr' = updatePackageDescription pbi pkg_descr
                        lbi' = lbi { localPkgDescr = pkg_descr' }
                    postConf simpleUserHooks args flags pkg_descr' lbi'
 
           backwardsCompatHack = False
 
-          readHookWithArgs :: (a -> Flag Verbosity) -> Args -> a
+          readHookWithArgs :: (a -> Flag Verbosity)
+                           -> (a -> Flag FilePath)
+                           -> Args -> a
                            -> IO HookedBuildInfo
-          readHookWithArgs get_verbosity _ flags = do
-              getHookedBuildInfo verbosity
+          readHookWithArgs get_verbosity get_dist_pref _ flags = do
+              dist_dir <- findDistPrefOrDefault (get_dist_pref flags)
+              getHookedBuildInfo verbosity (dist_dir </> "build")
             where
               verbosity = fromFlag (get_verbosity flags)
 
-          readHook :: (a -> Flag Verbosity) -> Args -> a -> IO HookedBuildInfo
-          readHook get_verbosity a flags = do
+          readHook :: (a -> Flag Verbosity)
+                   -> (a -> Flag FilePath)
+                   -> Args -> a -> IO HookedBuildInfo
+          readHook get_verbosity get_dist_pref a flags = do
               noExtraFlags a
-              getHookedBuildInfo verbosity
+              dist_dir <- findDistPrefOrDefault (get_dist_pref flags)
+              getHookedBuildInfo verbosity (dist_dir </> "build")
             where
               verbosity = fromFlag (get_verbosity flags)
 
@@ -690,6 +722,31 @@ runConfigureScript verbosity backwardsCompatHack flags lbi = do
   -- to ccFlags
   -- We don't try and tell configure which ld to use, as we don't have
   -- a way to pass its flags too
+  configureFile <- makeAbsolute $
+    fromMaybe "." (takeDirectory <$> cabalFilePath lbi) </> "configure"
+  -- autoconf is fussy about filenames, and has a set of forbidden
+  -- characters that can't appear in the build directory, etc:
+  -- https://www.gnu.org/software/autoconf/manual/autoconf.html#File-System-Conventions
+  --
+  -- This has caused hard-to-debug failures in the past (#5368), so we
+  -- detect some cases early and warn with a clear message. Windows's
+  -- use of backslashes is problematic here, so we'll switch to
+  -- slashes, but we do still want to fail on backslashes in POSIX
+  -- paths.
+  --
+  -- TODO: We don't check for colons, tildes or leading dashes. We
+  -- also should check the builddir's path, destdir, and all other
+  -- paths as well.
+  let configureFile' = intercalate "/" $ splitDirectories configureFile
+  for_ badAutoconfCharacters $ \(c, cname) ->
+    when (c `elem` dropDrive configureFile') $
+      warn verbosity $ concat
+        [ "The path to the './configure' script, '", configureFile'
+        , "', contains the character '", [c], "' (", cname, ")."
+        , " This may cause the script to fail with an obscure error, or for"
+        , " building the package to fail later."
+        ]
+
   let extraPath = fromNubList $ configProgramPathExtra flags
   let cflagsEnv = maybe (unwords ccFlags) (++ (" " ++ unwords ccFlags))
                   $ lookup "CFLAGS" env
@@ -698,19 +755,21 @@ runConfigureScript verbosity backwardsCompatHack flags lbi = do
                 ((intercalate spSep extraPath ++ spSep)++) $ lookup "PATH" env
       overEnv = ("CFLAGS", Just cflagsEnv) :
                 [("PATH", Just pathEnv) | not (null extraPath)]
-      args' = args ++ ["CC=" ++ ccProgShort]
+      hp = hostPlatform lbi
+      maybeHostFlag = if hp == buildPlatform then [] else ["--host=" ++ show (pretty hp)]
+      args' = configureFile':args ++ ["CC=" ++ ccProgShort] ++ maybeHostFlag
       shProg = simpleProgram "sh"
       progDb = modifyProgramSearchPath
                (\p -> map ProgramSearchPathDir extraPath ++ p) emptyProgramDb
   shConfiguredProg <- lookupProgram shProg
                       `fmap` configureProgram  verbosity shProg progDb
   case shConfiguredProg of
-      Just sh -> runProgramInvocation verbosity
+      Just sh -> runProgramInvocation verbosity $
                  (programInvocation (sh {programOverrideEnv = overEnv}) args')
-      Nothing -> die notFoundMsg
-
+                 { progInvokeCwd = Just (buildDir lbi) }
+      Nothing -> die' verbosity notFoundMsg
   where
-    args = "./configure" : configureArgs backwardsCompatHack flags
+    args = configureArgs backwardsCompatHack flags
 
     notFoundMsg = "The package has a './configure' script. "
                ++ "If you are on Windows, This requires a "
@@ -718,9 +777,34 @@ runConfigureScript verbosity backwardsCompatHack flags lbi = do
                ++ "If you are not on Windows, ensure that an 'sh' command "
                ++ "is discoverable in your path."
 
-getHookedBuildInfo :: Verbosity -> IO HookedBuildInfo
-getHookedBuildInfo verbosity = do
-  maybe_infoFile <- defaultHookedPackageDesc
+badAutoconfCharacters :: [(Char, String)]
+badAutoconfCharacters =
+  [ (' ', "space")
+  , ('\t', "tab")
+  , ('\n', "newline")
+  , ('\0', "null")
+  , ('"', "double quote")
+  , ('#', "hash")
+  , ('$', "dollar sign")
+  , ('&', "ampersand")
+  , ('\'', "single quote")
+  , ('(', "left bracket")
+  , (')', "right bracket")
+  , ('*', "star")
+  , (';', "semicolon")
+  , ('<', "less-than sign")
+  , ('=', "equals sign")
+  , ('>', "greater-than sign")
+  , ('?', "question mark")
+  , ('[', "left square bracket")
+  , ('\\', "backslash")
+  , ('`', "backtick")
+  , ('|', "pipe")
+  ]
+
+getHookedBuildInfo :: Verbosity -> FilePath -> IO HookedBuildInfo
+getHookedBuildInfo verbosity build_dir = do
+  maybe_infoFile <- findHookedPackageDesc verbosity build_dir
   case maybe_infoFile of
     Nothing       -> return emptyHookedBuildInfo
     Just infoFile -> do

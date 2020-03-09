@@ -22,7 +22,7 @@ module Distribution.Client.Config (
     showConfigWithComments,
     parseConfig,
 
-    defaultCabalDir,
+    getCabalDir,
     defaultConfigFile,
     defaultCacheDir,
     defaultCompiler,
@@ -41,54 +41,69 @@ module Distribution.Client.Config (
     userConfigUpdate,
     createDefaultConfigFile,
 
-    remoteRepoFields
+    remoteRepoFields,
+    postProcessRepo,
   ) where
 
+import Language.Haskell.Extension ( Language(Haskell2010) )
+
+import Distribution.Deprecated.ViewAsFieldDescr
+         ( viewAsFieldDescr )
+
 import Distribution.Client.Types
-         ( RemoteRepo(..), Username(..), Password(..), emptyRemoteRepo
+         ( RemoteRepo(..), LocalRepo (..), Username(..), Password(..), emptyRemoteRepo
          , AllowOlder(..), AllowNewer(..), RelaxDeps(..), isRelaxDeps
          )
 import Distribution.Client.BuildReports.Types
          ( ReportLevel(..) )
+import qualified Distribution.Client.Init.Types as IT
+         ( InitFlags(..) )
 import Distribution.Client.Setup
          ( GlobalFlags(..), globalCommand, defaultGlobalFlags
          , ConfigExFlags(..), configureExOptions, defaultConfigExFlags
+         , initOptions
          , InstallFlags(..), installOptions, defaultInstallFlags
          , UploadFlags(..), uploadCommand
          , ReportFlags(..), reportCommand
-         , showRepo, parseRepo, readRepo )
+         , showRemoteRepo, parseRemoteRepo, readRemoteRepo )
+import Distribution.Client.CmdInstall.ClientInstallFlags
+         ( ClientInstallFlags(..), defaultClientInstallFlags
+         , clientInstallOptions )
 import Distribution.Utils.NubList
          ( NubList, fromNubList, toNubList, overNubList )
 
+import Distribution.License
+         ( License(BSD3) )
 import Distribution.Simple.Compiler
          ( DebugInfoLevel(..), OptimisationLevel(..) )
 import Distribution.Simple.Setup
          ( ConfigFlags(..), configureOptions, defaultConfigFlags
          , HaddockFlags(..), haddockOptions, defaultHaddockFlags
+         , TestFlags(..), defaultTestFlags
+         , BenchmarkFlags(..), defaultBenchmarkFlags
          , installDirsOptions, optionDistPref
          , programDbPaths', programDbOptions
          , Flag(..), toFlag, flagToMaybe, fromFlagOrDefault )
 import Distribution.Simple.InstallDirs
          ( InstallDirs(..), defaultInstallDirs
          , PathTemplate, toPathTemplate )
-import Distribution.ParseUtils
-         ( FieldDescr(..), liftField
+import Distribution.Deprecated.ParseUtils
+         ( FieldDescr(..), liftField, runP
          , ParseResult(..), PError(..), PWarning(..)
          , locatedErrorMsg, showPWarning
          , readFields, warning, lineNo
          , simpleField, listField, spaceListField
-         , parseFilePathQ, parseOptCommaList, parseTokenQ )
+         , parseFilePathQ, parseOptCommaList, parseTokenQ, syntaxError)
 import Distribution.Client.ParseUtils
          ( parseFields, ppFields, ppSection )
 import Distribution.Client.HttpUtils
          ( isOldHackageURI )
-import qualified Distribution.ParseUtils as ParseUtils
+import qualified Distribution.Deprecated.ParseUtils as ParseUtils
          ( Field(..) )
-import qualified Distribution.Text as Text
+import qualified Distribution.Deprecated.Text as Text
          ( Text(..), display )
 import Distribution.Simple.Command
-         ( CommandUI(commandOptions), commandDefaultFlags, ShowOrParseArgs(..)
-         , viewAsFieldDescr )
+         ( CommandUI(commandOptions), commandDefaultFlags, ShowOrParseArgs(..) )
 import Distribution.Simple.Program
          ( defaultProgramDb )
 import Distribution.Simple.Utils
@@ -97,6 +112,8 @@ import Distribution.Compiler
          ( CompilerFlavor(..), defaultCompilerFlavor )
 import Distribution.Verbosity
          ( Verbosity, normal )
+import Distribution.Version
+         ( mkVersion )
 
 import Distribution.Solver.Types.ConstraintSource
 
@@ -106,7 +123,7 @@ import Data.Maybe
          ( fromMaybe )
 import Control.Monad
          ( when, unless, foldM, liftM )
-import qualified Distribution.Compat.ReadP as Parse
+import qualified Distribution.Deprecated.ReadP as Parse
          ( (<++), option )
 import Distribution.Compat.Semigroup
 import qualified Text.PrettyPrint as Disp
@@ -124,7 +141,7 @@ import System.FilePath
 import System.IO.Error
          ( isDoesNotExistError )
 import Distribution.Compat.Environment
-         ( getEnvironment )
+         ( getEnvironment, lookupEnv )
 import Distribution.Compat.Exception
          ( catchIO )
 import qualified Paths_cabal_install
@@ -144,14 +161,18 @@ import GHC.Generics ( Generic )
 
 data SavedConfig = SavedConfig {
     savedGlobalFlags       :: GlobalFlags,
+    savedInitFlags         :: IT.InitFlags,
     savedInstallFlags      :: InstallFlags,
+    savedClientInstallFlags :: ClientInstallFlags,
     savedConfigureFlags    :: ConfigFlags,
     savedConfigureExFlags  :: ConfigExFlags,
     savedUserInstallDirs   :: InstallDirs (Flag PathTemplate),
     savedGlobalInstallDirs :: InstallDirs (Flag PathTemplate),
     savedUploadFlags       :: UploadFlags,
     savedReportFlags       :: ReportFlags,
-    savedHaddockFlags      :: HaddockFlags
+    savedHaddockFlags      :: HaddockFlags,
+    savedTestFlags         :: TestFlags,
+    savedBenchmarkFlags    :: BenchmarkFlags
   } deriving Generic
 
 instance Monoid SavedConfig where
@@ -161,14 +182,18 @@ instance Monoid SavedConfig where
 instance Semigroup SavedConfig where
   a <> b = SavedConfig {
     savedGlobalFlags       = combinedSavedGlobalFlags,
+    savedInitFlags         = combinedSavedInitFlags,
     savedInstallFlags      = combinedSavedInstallFlags,
+    savedClientInstallFlags = combinedSavedClientInstallFlags,
     savedConfigureFlags    = combinedSavedConfigureFlags,
     savedConfigureExFlags  = combinedSavedConfigureExFlags,
     savedUserInstallDirs   = combinedSavedUserInstallDirs,
     savedGlobalInstallDirs = combinedSavedGlobalInstallDirs,
     savedUploadFlags       = combinedSavedUploadFlags,
     savedReportFlags       = combinedSavedReportFlags,
-    savedHaddockFlags      = combinedSavedHaddockFlags
+    savedHaddockFlags      = combinedSavedHaddockFlags,
+    savedTestFlags         = combinedSavedTestFlags,
+    savedBenchmarkFlags    = combinedSavedBenchmarkFlags
   }
     where
       -- This is ugly, but necessary. If we're mappending two config files, we
@@ -204,7 +229,8 @@ instance Semigroup SavedConfig where
         in case b' of [] -> a'
                       _  -> b'
 
-      lastNonMempty' :: (Eq a, Monoid a) => (SavedConfig -> flags) -> (flags -> a) -> a
+      lastNonMempty'
+        :: (Eq a, Monoid a) => (SavedConfig -> flags) -> (flags -> a) -> a
       lastNonMempty'   field subfield =
         let a' = subfield . field $ a
             b' = subfield . field $ b
@@ -227,6 +253,7 @@ instance Semigroup SavedConfig where
         globalRemoteRepos       = lastNonEmptyNL globalRemoteRepos,
         globalCacheDir          = combine globalCacheDir,
         globalLocalRepos        = lastNonEmptyNL globalLocalRepos,
+        globalLocalNoIndexRepos = lastNonEmptyNL globalLocalNoIndexRepos,
         globalLogsDir           = combine globalLogsDir,
         globalWorldFile         = combine globalWorldFile,
         globalRequireSandbox    = combine globalRequireSandbox,
@@ -241,6 +268,42 @@ instance Semigroup SavedConfig where
           combine        = combine'        savedGlobalFlags
           lastNonEmptyNL = lastNonEmptyNL' savedGlobalFlags
 
+      combinedSavedInitFlags = IT.InitFlags {
+        IT.applicationDirs = combineMonoid savedInitFlags IT.applicationDirs,
+        IT.author              = combine IT.author,
+        IT.buildTools          = combineMonoid savedInitFlags IT.buildTools,
+        IT.cabalVersion        = combine IT.cabalVersion,
+        IT.category            = combine IT.category,
+        IT.dependencies        = combineMonoid savedInitFlags IT.dependencies,
+        IT.email               = combine IT.email,
+        IT.exposedModules      = combineMonoid savedInitFlags IT.exposedModules,
+        IT.extraSrc            = combineMonoid savedInitFlags IT.extraSrc,
+        IT.homepage            = combine IT.homepage,
+        IT.initHcPath          = combine IT.initHcPath,
+        IT.initVerbosity       = combine IT.initVerbosity,
+        IT.initializeTestSuite = combine IT.initializeTestSuite,
+        IT.interactive         = combine IT.interactive,
+        IT.language            = combine IT.language,
+        IT.license             = combine IT.license,
+        IT.mainIs              = combine IT.mainIs,
+        IT.minimal             = combine IT.minimal,
+        IT.noComments          = combine IT.noComments,
+        IT.otherExts           = combineMonoid savedInitFlags IT.otherExts,
+        IT.otherModules        = combineMonoid savedInitFlags IT.otherModules,
+        IT.overwrite           = combine IT.overwrite,
+        IT.packageDir          = combine IT.packageDir,
+        IT.packageName         = combine IT.packageName,
+        IT.packageType         = combine IT.packageType,
+        IT.quiet               = combine IT.quiet,
+        IT.simpleProject       = combine IT.simpleProject,
+        IT.sourceDirs          = combineMonoid savedInitFlags IT.sourceDirs,
+        IT.synopsis            = combine IT.synopsis,
+        IT.testDirs            = combineMonoid savedInitFlags IT.testDirs,
+        IT.version             = combine IT.version
+        }
+        where
+          combine = combine' savedInitFlags
+
       combinedSavedInstallFlags = InstallFlags {
         installDocumentation         = combine installDocumentation,
         installHaddockIndex          = combine installHaddockIndex,
@@ -249,10 +312,13 @@ instance Semigroup SavedConfig where
         installMaxBackjumps          = combine installMaxBackjumps,
         installReorderGoals          = combine installReorderGoals,
         installCountConflicts        = combine installCountConflicts,
+        installFineGrainedConflicts  = combine installFineGrainedConflicts,
+        installMinimizeConflictSet   = combine installMinimizeConflictSet,
         installIndependentGoals      = combine installIndependentGoals,
         installShadowPkgs            = combine installShadowPkgs,
         installStrongFlags           = combine installStrongFlags,
         installAllowBootLibInstalls  = combine installAllowBootLibInstalls,
+        installOnlyConstrained       = combine installOnlyConstrained,
         installReinstall             = combine installReinstall,
         installAvoidReinstalls       = combine installAvoidReinstalls,
         installOverrideReinstall     = combine installOverrideReinstall,
@@ -278,6 +344,17 @@ instance Semigroup SavedConfig where
           combine        = combine'        savedInstallFlags
           lastNonEmptyNL = lastNonEmptyNL' savedInstallFlags
 
+      combinedSavedClientInstallFlags = ClientInstallFlags
+        { cinstInstallLibs     = combine cinstInstallLibs
+        , cinstIgnoreProject   = combine cinstIgnoreProject
+        , cinstEnvironmentPath = combine cinstEnvironmentPath
+        , cinstOverwritePolicy = combine cinstOverwritePolicy
+        , cinstInstallMethod   = combine cinstInstallMethod
+        , cinstInstalldir      = combine cinstInstalldir
+        }
+        where
+          combine        = combine'        savedClientInstallFlags
+
       combinedSavedConfigureFlags = ConfigFlags {
         configArgs                = lastNonEmpty configArgs,
         configPrograms_           = configPrograms_ . savedConfigureFlags $ b,
@@ -296,6 +373,7 @@ instance Semigroup SavedConfig where
         configSharedLib           = combine configSharedLib,
         configStaticLib           = combine configStaticLib,
         configDynExe              = combine configDynExe,
+        configFullyStaticExe      = combine configFullyStaticExe,
         configProfExe             = combine configProfExe,
         configProfDetail          = combine configProfDetail,
         configProfLibDetail       = combine configProfLibDetail,
@@ -343,7 +421,9 @@ instance Semigroup SavedConfig where
         configExactConfiguration  = combine configExactConfiguration,
         configFlagError           = combine configFlagError,
         configRelocatable         = combine configRelocatable,
-        configUseResponseFiles    = combine configUseResponseFiles
+        configUseResponseFiles    = combine configUseResponseFiles,
+        configAllowDependingOnPrivateLibs =
+            combine configAllowDependingOnPrivateLibs
         }
         where
           combine        = combine'        savedConfigureFlags
@@ -358,8 +438,12 @@ instance Semigroup SavedConfig where
         -- TODO: NubListify
         configPreferences   = lastNonEmpty configPreferences,
         configSolver        = combine configSolver,
-        configAllowNewer    = combineMonoid savedConfigureExFlags configAllowNewer,
-        configAllowOlder    = combineMonoid savedConfigureExFlags configAllowOlder
+        configAllowNewer    =
+            combineMonoid savedConfigureExFlags configAllowNewer,
+        configAllowOlder    =
+            combineMonoid savedConfigureExFlags configAllowOlder,
+        configWriteGhcEnvironmentFilesPolicy
+                            = combine configWriteGhcEnvironmentFilesPolicy
         }
         where
           combine      = combine' savedConfigureExFlags
@@ -407,16 +491,43 @@ instance Semigroup SavedConfig where
         haddockForeignLibs   = combine haddockForeignLibs,
         haddockInternal      = combine haddockInternal,
         haddockCss           = combine haddockCss,
-        haddockHscolour      = combine haddockHscolour,
+        haddockLinkedSource  = combine haddockLinkedSource,
+        haddockQuickJump     = combine haddockQuickJump,
         haddockHscolourCss   = combine haddockHscolourCss,
         haddockContents      = combine haddockContents,
         haddockDistPref      = combine haddockDistPref,
         haddockKeepTempFiles = combine haddockKeepTempFiles,
-        haddockVerbosity     = combine haddockVerbosity
+        haddockVerbosity     = combine haddockVerbosity,
+        haddockCabalFilePath = combine haddockCabalFilePath,
+        haddockArgs          = lastNonEmpty haddockArgs
         }
         where
           combine      = combine'        savedHaddockFlags
           lastNonEmpty = lastNonEmpty'   savedHaddockFlags
+
+      combinedSavedTestFlags = TestFlags {
+        testDistPref    = combine testDistPref,
+        testVerbosity   = combine testVerbosity,
+        testHumanLog    = combine testHumanLog,
+        testMachineLog  = combine testMachineLog,
+        testShowDetails = combine testShowDetails,
+        testKeepTix     = combine testKeepTix,
+        testWrapper     = combine testWrapper,
+        testFailWhenNoTestSuites = combine testFailWhenNoTestSuites,
+        testOptions     = lastNonEmpty testOptions
+        }
+        where
+          combine      = combine'        savedTestFlags
+          lastNonEmpty = lastNonEmpty'   savedTestFlags
+
+      combinedSavedBenchmarkFlags = BenchmarkFlags {
+        benchmarkDistPref  = combine benchmarkDistPref,
+        benchmarkVerbosity = combine benchmarkVerbosity,
+        benchmarkOptions   = lastNonEmpty benchmarkOptions
+        }
+        where
+          combine      = combine'        savedBenchmarkFlags
+          lastNonEmpty = lastNonEmpty'   savedBenchmarkFlags
 
 
 --
@@ -430,7 +541,7 @@ instance Semigroup SavedConfig where
 --
 baseSavedConfig :: IO SavedConfig
 baseSavedConfig = do
-  userPrefix <- defaultCabalDir
+  userPrefix <- getCabalDir
   cacheDir   <- defaultCacheDir
   logsDir    <- defaultLogsDir
   worldFile  <- defaultWorldFile
@@ -458,10 +569,11 @@ baseSavedConfig = do
 --
 initialSavedConfig :: IO SavedConfig
 initialSavedConfig = do
-  cacheDir   <- defaultCacheDir
-  logsDir    <- defaultLogsDir
-  worldFile  <- defaultWorldFile
-  extraPath  <- defaultExtraPath
+  cacheDir    <- defaultCacheDir
+  logsDir     <- defaultLogsDir
+  worldFile   <- defaultWorldFile
+  extraPath   <- defaultExtraPath
+  installPath <- defaultInstallPath
   return mempty {
     savedGlobalFlags     = mempty {
       globalCacheDir     = toFlag cacheDir,
@@ -475,39 +587,52 @@ initialSavedConfig = do
       installSummaryFile = toNubList [toPathTemplate (logsDir </> "build.log")],
       installBuildReports= toFlag AnonymousReports,
       installNumJobs     = toFlag Nothing
+    },
+    savedClientInstallFlags = mempty {
+      cinstInstalldir = toFlag installPath
     }
   }
 
---TODO: misleading, there's no way to override this default
---      either make it possible or rename to simply getCabalDir.
 defaultCabalDir :: IO FilePath
 defaultCabalDir = getAppUserDataDirectory "cabal"
 
+getCabalDir :: IO FilePath
+getCabalDir = do
+  mDir <- lookupEnv "CABAL_DIR"
+  case mDir of
+    Nothing -> defaultCabalDir
+    Just dir -> return dir
+
 defaultConfigFile :: IO FilePath
 defaultConfigFile = do
-  dir <- defaultCabalDir
+  dir <- getCabalDir
   return $ dir </> "config"
 
 defaultCacheDir :: IO FilePath
 defaultCacheDir = do
-  dir <- defaultCabalDir
+  dir <- getCabalDir
   return $ dir </> "packages"
 
 defaultLogsDir :: IO FilePath
 defaultLogsDir = do
-  dir <- defaultCabalDir
+  dir <- getCabalDir
   return $ dir </> "logs"
 
 -- | Default position of the world file
 defaultWorldFile :: IO FilePath
 defaultWorldFile = do
-  dir <- defaultCabalDir
+  dir <- getCabalDir
   return $ dir </> "world"
 
 defaultExtraPath :: IO [FilePath]
 defaultExtraPath = do
-  dir <- defaultCabalDir
+  dir <- getCabalDir
   return [dir </> "bin"]
+
+defaultInstallPath :: IO FilePath
+defaultInstallPath = do
+  dir <- getCabalDir
+  return (dir </> "bin")
 
 defaultCompiler :: CompilerFlavor
 defaultCompiler = fromMaybe GHC defaultCompilerFlavor
@@ -619,7 +744,8 @@ loadRawConfig verbosity configFileFlag = do
   minp <- readConfigFile mempty configFile
   case minp of
     Nothing -> do
-      notice verbosity $ "Config file path source is " ++ sourceMsg source ++ "."
+      notice verbosity $
+        "Config file path source is " ++ sourceMsg source ++ "."
       notice verbosity $ "Config file " ++ configFile ++ " not found."
       createDefaultConfigFile verbosity [] configFile
     Just (ParseOk ws conf) -> do
@@ -659,7 +785,8 @@ getConfigFilePathAndSource configFileFlag =
     getSource ((source,action): xs) =
                       action >>= maybe (getSource xs) (return . (,) source)
 
-readConfigFile :: SavedConfig -> FilePath -> IO (Maybe (ParseResult SavedConfig))
+readConfigFile
+  :: SavedConfig -> FilePath -> IO (Maybe (ParseResult SavedConfig))
 readConfigFile initial file = handleNotExists $
   fmap (Just . parseConfig (ConstraintSourceMainConfig file) initial)
        (readFile file)
@@ -683,7 +810,8 @@ writeConfigFile :: FilePath -> SavedConfig -> SavedConfig -> IO ()
 writeConfigFile file comments vals = do
   let tmpFile = file <.> "tmp"
   createDirectoryIfMissing True (takeDirectory file)
-  writeFile tmpFile $ explanation ++ showConfigWithComments comments vals ++ "\n"
+  writeFile tmpFile $
+    explanation ++ showConfigWithComments comments vals ++ "\n"
   renameFile tmpFile file
   where
     explanation = unlines
@@ -716,7 +844,16 @@ commentSavedConfig = do
         savedGlobalFlags       = defaultGlobalFlags {
             globalRemoteRepos = toNubList [defaultRemoteRepo]
             },
+        savedInitFlags       = mempty {
+            IT.interactive     = toFlag False,
+            IT.cabalVersion    = toFlag (mkVersion [1,10]),
+            IT.language        = toFlag Haskell2010,
+            IT.license         = toFlag BSD3,
+            IT.sourceDirs      = Nothing,
+            IT.applicationDirs = Nothing
+            },
         savedInstallFlags      = defaultInstallFlags,
+        savedClientInstallFlags= defaultClientInstallFlags,
         savedConfigureExFlags  = defaultConfigExFlags {
             configAllowNewer     = Just (AllowNewer mempty),
             configAllowOlder     = Just (AllowOlder mempty)
@@ -728,8 +865,9 @@ commentSavedConfig = do
         savedGlobalInstallDirs = fmap toFlag globalInstallDirs,
         savedUploadFlags       = commandDefaultFlags uploadCommand,
         savedReportFlags       = commandDefaultFlags reportCommand,
-        savedHaddockFlags      = defaultHaddockFlags
-
+        savedHaddockFlags      = defaultHaddockFlags,
+        savedTestFlags         = defaultTestFlags,
+        savedBenchmarkFlags    = defaultBenchmarkFlags
         }
   conf1 <- extendToEffectiveConfig conf0
   let globalFlagsConf1 = savedGlobalFlags conf1
@@ -787,7 +925,8 @@ configFieldDescriptions src =
              |  str == "1"     -> ParseOk [] (Flag NormalOptimisation)
              |  str == "2"     -> ParseOk [] (Flag MaximumOptimisation)
              | lstr == "false" -> ParseOk [caseWarning] (Flag NoOptimisation)
-             | lstr == "true"  -> ParseOk [caseWarning] (Flag NormalOptimisation)
+             | lstr == "true"  -> ParseOk [caseWarning]
+                                  (Flag NormalOptimisation)
              | otherwise       -> ParseFailed (NoParse name line)
              where
                lstr = lowercase str
@@ -823,21 +962,29 @@ configFieldDescriptions src =
   ++ toSavedConfig liftConfigExFlag
        (configureExOptions ParseArgs src)
        []
-       [let pkgs = (Just . AllowOlder . RelaxDepsSome) `fmap` parseOptCommaList Text.parse
-            parseAllowOlder = ((Just . AllowOlder . toRelaxDeps) `fmap` Text.parse) Parse.<++ pkgs in
-        simpleField "allow-older"
-        (showRelaxDeps . fmap unAllowOlder) parseAllowOlder
-        configAllowOlder (\v flags -> flags { configAllowOlder = v })
-       ,let pkgs = (Just . AllowNewer . RelaxDepsSome) `fmap` parseOptCommaList Text.parse
-            parseAllowNewer = ((Just . AllowNewer . toRelaxDeps) `fmap` Text.parse) Parse.<++ pkgs in
-        simpleField "allow-newer"
-        (showRelaxDeps . fmap unAllowNewer) parseAllowNewer
-        configAllowNewer (\v flags -> flags { configAllowNewer = v })
+       [let pkgs            = (Just . AllowOlder . RelaxDepsSome)
+                              `fmap` parseOptCommaList Text.parse
+            parseAllowOlder = ((Just . AllowOlder . toRelaxDeps)
+                               `fmap` Text.parse) Parse.<++ pkgs
+         in simpleField "allow-older"
+            (showRelaxDeps . fmap unAllowOlder) parseAllowOlder
+            configAllowOlder (\v flags -> flags { configAllowOlder = v })
+       ,let pkgs            = (Just . AllowNewer . RelaxDepsSome)
+                              `fmap` parseOptCommaList Text.parse
+            parseAllowNewer = ((Just . AllowNewer . toRelaxDeps)
+                               `fmap` Text.parse) Parse.<++ pkgs
+         in simpleField "allow-newer"
+            (showRelaxDeps . fmap unAllowNewer) parseAllowNewer
+            configAllowNewer (\v flags -> flags { configAllowNewer = v })
        ]
 
   ++ toSavedConfig liftInstallFlag
        (installOptions ParseArgs)
        ["dry-run", "only", "only-dependencies", "dependencies-only"] []
+
+  ++ toSavedConfig liftClientInstallFlag
+       (clientInstallOptions ParseArgs)
+       [] []
 
   ++ toSavedConfig liftUploadFlag
        (commandOptions uploadCommand ParseArgs)
@@ -890,7 +1037,7 @@ deprecatedFieldDescriptions :: [FieldDescr SavedConfig]
 deprecatedFieldDescriptions =
   [ liftGlobalFlag $
     listField "repos"
-      (Disp.text . showRepo) parseRepo
+      (Disp.text . showRemoteRepo) parseRemoteRepo
       (fromNubList . globalRemoteRepos)
       (\rs cfg -> cfg { globalRemoteRepos = toNubList rs })
   , liftGlobalFlag $
@@ -913,8 +1060,10 @@ deprecatedFieldDescriptions =
       (fromFlagOrDefault [] . uploadPasswordCmd)
                         (\d cfg -> cfg { uploadPasswordCmd = Flag d })
   ]
- ++ map (modifyFieldName ("user-"++)   . liftUserInstallDirs)   installDirsFields
- ++ map (modifyFieldName ("global-"++) . liftGlobalInstallDirs) installDirsFields
+ ++ map (modifyFieldName ("user-"++)   . liftUserInstallDirs)
+    installDirsFields
+ ++ map (modifyFieldName ("global-"++) . liftGlobalInstallDirs)
+    installDirsFields
   where
     optional = Parse.option mempty . fmap toFlag
     modifyFieldName :: (String -> String) -> FieldDescr a -> FieldDescr a
@@ -927,8 +1076,9 @@ liftUserInstallDirs = liftField
 
 liftGlobalInstallDirs :: FieldDescr (InstallDirs (Flag PathTemplate))
                       -> FieldDescr SavedConfig
-liftGlobalInstallDirs = liftField
-  savedGlobalInstallDirs (\flags conf -> conf { savedGlobalInstallDirs = flags })
+liftGlobalInstallDirs =
+  liftField savedGlobalInstallDirs
+  (\flags conf -> conf { savedGlobalInstallDirs = flags })
 
 liftGlobalFlag :: FieldDescr GlobalFlags -> FieldDescr SavedConfig
 liftGlobalFlag = liftField
@@ -946,6 +1096,11 @@ liftInstallFlag :: FieldDescr InstallFlags -> FieldDescr SavedConfig
 liftInstallFlag = liftField
   savedInstallFlags (\flags conf -> conf { savedInstallFlags = flags })
 
+liftClientInstallFlag :: FieldDescr ClientInstallFlags -> FieldDescr SavedConfig
+liftClientInstallFlag =
+  liftField savedClientInstallFlags
+  (\flags conf -> conf { savedClientInstallFlags = flags })
+
 liftUploadFlag :: FieldDescr UploadFlags -> FieldDescr SavedConfig
 liftUploadFlag = liftField
   savedUploadFlags (\flags conf -> conf { savedUploadFlags = flags })
@@ -962,11 +1117,12 @@ parseConfig src initial = \str -> do
   fields <- readFields str
   let (knownSections, others) = partition isKnownSection fields
   config <- parse others
-  let user0   = savedUserInstallDirs config
+  let init0   = savedInitFlags config
+      user0   = savedUserInstallDirs config
       global0 = savedGlobalInstallDirs config
-  (remoteRepoSections0, haddockFlags, user, global, paths, args) <-
+  (remoteRepoSections0, localRepoSections0, haddockFlags, initFlags, user, global, paths, args) <-
     foldM parseSections
-          ([], savedHaddockFlags config, user0, global0, [], [])
+          ([], [], savedHaddockFlags config, init0, user0, global0, [], [])
           knownSections
 
   let remoteRepoSections =
@@ -974,9 +1130,15 @@ parseConfig src initial = \str -> do
         . nubBy ((==) `on` remoteRepoName)
         $ remoteRepoSections0
 
-  return config {
+  let localRepoSections =
+          reverse
+        . nubBy ((==) `on` localRepoName)
+        $ localRepoSections0
+
+  return . fixConfigMultilines $ config {
     savedGlobalFlags       = (savedGlobalFlags config) {
        globalRemoteRepos   = toNubList remoteRepoSections,
+       globalLocalNoIndexRepos = toNubList localRepoSections,
        -- the global extra prog path comes from the configure flag prog path
        globalProgPathExtra = configProgramPathExtra (savedConfigureFlags config)
        },
@@ -985,6 +1147,7 @@ parseConfig src initial = \str -> do
        configProgramArgs   = args
        },
     savedHaddockFlags      = haddockFlags,
+    savedInitFlags         = initFlags,
     savedUserInstallDirs   = user,
     savedGlobalInstallDirs = global
   }
@@ -993,66 +1156,129 @@ parseConfig src initial = \str -> do
     isKnownSection (ParseUtils.Section _ "repository" _ _)              = True
     isKnownSection (ParseUtils.F _ "remote-repo" _)                     = True
     isKnownSection (ParseUtils.Section _ "haddock" _ _)                 = True
+    isKnownSection (ParseUtils.Section _ "init" _ _)                    = True
     isKnownSection (ParseUtils.Section _ "install-dirs" _ _)            = True
     isKnownSection (ParseUtils.Section _ "program-locations" _ _)       = True
     isKnownSection (ParseUtils.Section _ "program-default-options" _ _) = True
     isKnownSection _                                                    = False
 
+    -- Attempt to split fields that can represent lists of paths into
+    -- actual lists on failure, leave the field untouched.
+    splitMultiPath :: [String] -> [String]
+    splitMultiPath [s] = case runP 0 "" (parseOptCommaList parseTokenQ) s of
+            ParseOk _ res -> res
+            _ -> [s]
+    splitMultiPath xs = xs
+
+    -- This is a fixup, pending a full config parser rewrite, to
+    -- ensure that config fields which can be comma-separated lists
+    -- actually parse as comma-separated lists.
+    fixConfigMultilines conf = conf {
+         savedConfigureFlags =
+           let scf = savedConfigureFlags conf
+           in  scf {
+                     configProgramPathExtra   =
+                       toNubList $ splitMultiPath
+                       (fromNubList $ configProgramPathExtra scf)
+                   , configExtraLibDirs       = splitMultiPath
+                                                (configExtraLibDirs scf)
+                   , configExtraFrameworkDirs = splitMultiPath
+                                                (configExtraFrameworkDirs scf)
+                   , configExtraIncludeDirs   = splitMultiPath
+                                                (configExtraIncludeDirs scf)
+                   , configConfigureArgs      = splitMultiPath
+                                                (configConfigureArgs scf)
+               }
+      }
+
     parse = parseFields (configFieldDescriptions src
                       ++ deprecatedFieldDescriptions) initial
 
-    parseSections (rs, h, u, g, p, a)
-                 (ParseUtils.Section _ "repository" name fs) = do
+    parseSections (rs, ls, h, i, u, g, p, a)
+                 (ParseUtils.Section lineno "repository" name fs) = do
       r' <- parseFields remoteRepoFields (emptyRemoteRepo name) fs
-      when (remoteRepoKeyThreshold r' > length (remoteRepoRootKeys r')) $
-        warning $ "'key-threshold' for repository " ++ show (remoteRepoName r')
-               ++ " higher than number of keys"
-      when (not (null (remoteRepoRootKeys r'))
-            && remoteRepoSecure r' /= Just True) $
-        warning $ "'root-keys' for repository " ++ show (remoteRepoName r')
-               ++ " non-empty, but 'secure' not set to True."
-      return (r':rs, h, u, g, p, a)
+      r'' <- postProcessRepo lineno name r'
+      case r'' of
+          Left local   -> return (rs,        local:ls, h, i, u, g, p, a)
+          Right remote -> return (remote:rs, ls,       h, i, u, g, p, a)
 
-    parseSections (rs, h, u, g, p, a)
+    parseSections (rs, ls, h, i, u, g, p, a)
                  (ParseUtils.F lno "remote-repo" raw) = do
-      let mr' = readRepo raw
+      let mr' = readRemoteRepo raw
       r' <- maybe (ParseFailed $ NoParse "remote-repo" lno) return mr'
-      return (r':rs, h, u, g, p, a)
+      return (r':rs, ls, h, i, u, g, p, a)
 
-    parseSections accum@(rs, h, u, g, p, a)
+    parseSections accum@(rs, ls, h, i, u, g, p, a)
                  (ParseUtils.Section _ "haddock" name fs)
       | name == ""        = do h' <- parseFields haddockFlagsFields h fs
-                               return (rs, h', u, g, p, a)
+                               return (rs, ls, h', i, u, g, p, a)
       | otherwise         = do
           warning "The 'haddock' section should be unnamed"
           return accum
-    parseSections accum@(rs, h, u, g, p, a)
+
+    parseSections accum@(rs, ls, h, i, u, g, p, a)
+                 (ParseUtils.Section _ "init" name fs)
+      | name == ""        = do i' <- parseFields initFlagsFields i fs
+                               return (rs, ls, h, i', u, g, p, a)
+      | otherwise         = do
+          warning "The 'init' section should be unnamed"
+          return accum
+
+    parseSections accum@(rs, ls, h, i, u, g, p, a)
                   (ParseUtils.Section _ "install-dirs" name fs)
       | name' == "user"   = do u' <- parseFields installDirsFields u fs
-                               return (rs, h, u', g, p, a)
+                               return (rs, ls, h, i, u', g, p, a)
       | name' == "global" = do g' <- parseFields installDirsFields g fs
-                               return (rs, h, u, g', p, a)
+                               return (rs, ls, h, i, u, g', p, a)
       | otherwise         = do
           warning "The 'install-paths' section should be for 'user' or 'global'"
           return accum
       where name' = lowercase name
-    parseSections accum@(rs, h, u, g, p, a)
+    parseSections accum@(rs, ls, h, i, u, g, p, a)
                  (ParseUtils.Section _ "program-locations" name fs)
       | name == ""        = do p' <- parseFields withProgramsFields p fs
-                               return (rs, h, u, g, p', a)
+                               return (rs, ls, h, i, u, g, p', a)
       | otherwise         = do
           warning "The 'program-locations' section should be unnamed"
           return accum
-    parseSections accum@(rs, h, u, g, p, a)
+    parseSections accum@(rs, ls, h, i, u, g, p, a)
                   (ParseUtils.Section _ "program-default-options" name fs)
       | name == ""        = do a' <- parseFields withProgramOptionsFields a fs
-                               return (rs, h, u, g, p, a')
+                               return (rs, ls, h, i, u, g, p, a')
       | otherwise         = do
           warning "The 'program-default-options' section should be unnamed"
           return accum
     parseSections accum f = do
       warning $ "Unrecognized stanza on line " ++ show (lineNo f)
       return accum
+
+postProcessRepo :: Int -> String -> RemoteRepo -> ParseResult (Either LocalRepo RemoteRepo)
+postProcessRepo lineno reponame repo0 = do
+    when (null reponame) $
+        syntaxError lineno $ "a 'repository' section requires the "
+                          ++ "repository name as an argument"
+
+    case uriScheme (remoteRepoURI repo0) of
+        -- TODO: check that there are no authority, query or fragment
+        -- Note: the trailing colon is important
+        "file+noindex:" -> do
+            let uri = remoteRepoURI repo0
+            return $ Left $ LocalRepo reponame (uriPath uri) (uriFragment uri == "#shared-cache")
+
+        _              -> do
+            let repo = repo0 { remoteRepoName = reponame }
+
+            when (remoteRepoKeyThreshold repo > length (remoteRepoRootKeys repo)) $
+                warning $ "'key-threshold' for repository "
+                    ++ show (remoteRepoName repo)
+                    ++ " higher than number of keys"
+
+            when (not (null (remoteRepoRootKeys repo)) && remoteRepoSecure repo /= Just True) $
+                warning $ "'root-keys' for repository "
+                    ++ show (remoteRepoName repo)
+                    ++ " non-empty, but 'secure' not set to True."
+
+            return $ Right repo
 
 showConfig :: SavedConfig -> String
 showConfig = showConfigWithComments mempty
@@ -1064,11 +1290,15 @@ showConfigWithComments comment vals = Disp.render $
         [] -> Disp.text ""
         (x:xs) -> foldl' (\ r r' -> r $+$ Disp.text "" $+$ r') x xs
   $+$ Disp.text ""
-  $+$ ppFields (skipSomeFields (configFieldDescriptions ConstraintSourceUnknown))
-               mcomment vals
+  $+$ ppFields
+      (skipSomeFields (configFieldDescriptions ConstraintSourceUnknown))
+      mcomment vals
   $+$ Disp.text ""
   $+$ ppSection "haddock" "" haddockFlagsFields
                 (fmap savedHaddockFlags mcomment) (savedHaddockFlags vals)
+  $+$ Disp.text ""
+  $+$ ppSection "init" "" initFlagsFields
+                (fmap savedInitFlags mcomment) (savedInitFlags vals)
   $+$ Disp.text ""
   $+$ installDirsSection "user"   savedUserInstallDirs
   $+$ Disp.text ""
@@ -1100,23 +1330,23 @@ installDirsFields = map viewAsFieldDescr installDirsOptions
 
 ppRemoteRepoSection :: RemoteRepo -> RemoteRepo -> Doc
 ppRemoteRepoSection def vals = ppSection "repository" (remoteRepoName vals)
-        remoteRepoFields (Just def) vals
+    remoteRepoFields (Just def) vals
 
 remoteRepoFields :: [FieldDescr RemoteRepo]
 remoteRepoFields =
-    [ simpleField "url"
-        (text . show)            (parseTokenQ >>= parseURI')
-        remoteRepoURI            (\x repo -> repo { remoteRepoURI = x })
-    , simpleField "secure"
-        showSecure               (Just `fmap` Text.parse)
-        remoteRepoSecure         (\x repo -> repo { remoteRepoSecure = x })
-    , listField "root-keys"
-        text                     parseTokenQ
-        remoteRepoRootKeys       (\x repo -> repo { remoteRepoRootKeys = x })
-    , simpleField "key-threshold"
-        showThreshold            Text.parse
-        remoteRepoKeyThreshold   (\x repo -> repo { remoteRepoKeyThreshold = x })
-    ]
+  [ simpleField "url"
+    (text . show)            (parseTokenQ >>= parseURI')
+    remoteRepoURI            (\x repo -> repo { remoteRepoURI = x })
+  , simpleField "secure"
+    showSecure               (Just `fmap` Text.parse)
+    remoteRepoSecure         (\x repo -> repo { remoteRepoSecure = x })
+  , listField "root-keys"
+    text                     parseTokenQ
+    remoteRepoRootKeys       (\x repo -> repo { remoteRepoRootKeys = x })
+  , simpleField "key-threshold"
+    showThreshold            Text.parse
+    remoteRepoKeyThreshold   (\x repo -> repo { remoteRepoKeyThreshold = x })
+  ]
   where
     parseURI' uriString =
       case parseURI uriString of
@@ -1144,6 +1374,23 @@ haddockFlagsFields = [ field
   where
     exclusions = ["verbose", "builddir", "for-hackage"]
 
+-- | Fields for the 'init' section.
+initFlagsFields :: [FieldDescr IT.InitFlags]
+initFlagsFields = [ field
+                  | opt <- initOptions ParseArgs
+                  , let field = viewAsFieldDescr opt
+                        name  = fieldName field
+                  , name `notElem` exclusions ]
+  where
+    exclusions =
+      [ "author", "email", "quiet", "no-comments", "minimal", "overwrite"
+      , "package-dir", "packagedir", "package-name", "version", "homepage"
+      , "synopsis", "category", "extra-source-file", "lib", "exe", "libandexe"
+      , "simple", "main-is", "expose-module", "exposed-modules", "extension"
+      , "dependency", "build-tool", "with-compiler"
+      , "verbose"
+      ]
+
 -- | Fields for the 'program-locations' section.
 withProgramsFields :: [FieldDescr [(String, FilePath)]]
 withProgramsFields =
@@ -1159,16 +1406,17 @@ withProgramOptionsFields =
 
 parseExtraLines :: Verbosity -> [String] -> IO SavedConfig
 parseExtraLines verbosity extraLines =
-                case parseConfig (ConstraintSourceMainConfig "additional lines")
-                     mempty (unlines extraLines) of
-                  ParseFailed err ->
-                    let (line, msg) = locatedErrorMsg err
-                    in die' verbosity $
-                         "Error parsing additional config lines\n"
-                         ++ maybe "" (\n -> ':' : show n) line ++ ":\n" ++ msg
-                  ParseOk [] r -> return r
-                  ParseOk ws _ -> die' verbosity $
-                         unlines (map (showPWarning "Error parsing additional config lines") ws)
+  case parseConfig (ConstraintSourceMainConfig "additional lines")
+       mempty (unlines extraLines) of
+    ParseFailed err ->
+      let (line, msg) = locatedErrorMsg err
+      in die' verbosity $
+         "Error parsing additional config lines\n"
+         ++ maybe "" (\n -> ':' : show n) line ++ ":\n" ++ msg
+    ParseOk [] r -> return r
+    ParseOk ws _ ->
+      die' verbosity $
+      unlines (map (showPWarning "Error parsing additional config lines") ws)
 
 -- | Get the differences (as a pseudo code diff) between the user's
 -- '~/.cabal/config' and the one that cabal would generate if it didn't exist.
@@ -1177,10 +1425,11 @@ userConfigDiff verbosity globalFlags extraLines = do
   userConfig <- loadRawConfig normal (globalConfigFile globalFlags)
   extraConfig <- parseExtraLines verbosity extraLines
   testConfig <- initialSavedConfig
-  return $ reverse . foldl' createDiff [] . M.toList
-                $ M.unionWith combine
-                    (M.fromList . map justFst $ filterShow testConfig)
-                    (M.fromList . map justSnd $ filterShow (userConfig `mappend` extraConfig))
+  return $
+    reverse . foldl' createDiff [] . M.toList
+    $ M.unionWith combine
+      (M.fromList . map justFst $ filterShow testConfig)
+      (M.fromList . map justSnd $ filterShow (userConfig `mappend` extraConfig))
   where
     justFst (a, b) = (a, (Just b, Nothing))
     justSnd (a, b) = (a, (Nothing, Just b))
@@ -1229,4 +1478,5 @@ userConfigUpdate verbosity globalFlags extraLines = do
   notice verbosity $ "Renaming " ++ cabalFile ++ " to " ++ backup ++ "."
   renameFile cabalFile backup
   notice verbosity $ "Writing merged config to " ++ cabalFile ++ "."
-  writeConfigFile cabalFile commentConf (newConfig `mappend` userConfig `mappend` extraConfig)
+  writeConfigFile cabalFile commentConf
+    (newConfig `mappend` userConfig `mappend` extraConfig)

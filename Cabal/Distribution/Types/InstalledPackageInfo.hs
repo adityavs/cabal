@@ -1,6 +1,7 @@
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveGeneric      #-}
 {-# LANGUAGE TypeFamilies       #-}
+{-# LANGUAGE OverloadedStrings  #-}
 module Distribution.Types.InstalledPackageInfo (
     InstalledPackageInfo (..),
     emptyInstalledPackageInfo,
@@ -14,16 +15,18 @@ import Distribution.Compat.Prelude
 import Prelude ()
 
 import Distribution.Backpack
-import Distribution.Compat.Graph              (IsNode (..))
+import Distribution.Compat.Graph            (IsNode (..))
 import Distribution.License
 import Distribution.ModuleName
-import Distribution.Package                   hiding (installedUnitId)
+import Distribution.Package                 hiding (installedUnitId)
 import Distribution.Types.AbiDependency
 import Distribution.Types.ExposedModule
+import Distribution.Types.LibraryName
+import Distribution.Types.LibraryVisibility
 import Distribution.Types.MungedPackageId
 import Distribution.Types.MungedPackageName
-import Distribution.Types.UnqualComponentName
-import Distribution.Version                   (nullVersion)
+import Distribution.Version                 (nullVersion)
+import Distribution.Utils.ShortText         (ShortText)
 
 import qualified Distribution.Package as Package
 import qualified Distribution.SPDX    as SPDX
@@ -38,8 +41,9 @@ data InstalledPackageInfo
         -- these parts (sourcePackageId, installedUnitId) are
         -- exactly the same as PackageDescription
         sourcePackageId   :: PackageId,
-        sourceLibName     :: Maybe UnqualComponentName,
+        sourceLibName     :: LibraryName,
         installedComponentId_ :: ComponentId,
+        libVisibility     :: LibraryVisibility,
         installedUnitId   :: UnitId,
         -- INVARIANT: if this package is definite, OpenModule's
         -- OpenUnitId directly records UnitId.  If it is
@@ -48,15 +52,15 @@ data InstalledPackageInfo
         instantiatedWith  :: [(ModuleName, OpenModule)],
         compatPackageKey  :: String,
         license           :: Either SPDX.License License,
-        copyright         :: String,
-        maintainer        :: String,
-        author            :: String,
-        stability         :: String,
-        homepage          :: String,
-        pkgUrl            :: String,
-        synopsis          :: String,
-        description       :: String,
-        category          :: String,
+        copyright         :: !ShortText,
+        maintainer        :: !ShortText,
+        author            :: !ShortText,
+        stability         :: !ShortText,
+        homepage          :: !ShortText,
+        pkgUrl            :: !ShortText,
+        synopsis          :: !ShortText,
+        description       :: !ShortText,
+        category          :: !ShortText,
         -- these parts are required by an installed package only:
         abiHash           :: AbiHash,
         indefinite        :: Bool,
@@ -80,6 +84,7 @@ data InstalledPackageInfo
         depends           :: [UnitId],
         abiDepends        :: [AbiDependency],
         ccOptions         :: [String],
+        cxxOptions        :: [String],
         ldOptions         :: [String],
         frameworkDirs     :: [FilePath],
         frameworks        :: [String],
@@ -90,6 +95,7 @@ data InstalledPackageInfo
     deriving (Eq, Generic, Typeable, Read, Show)
 
 instance Binary InstalledPackageInfo
+instance Structured InstalledPackageInfo
 
 instance NFData InstalledPackageInfo where rnf = genericRnf
 
@@ -117,16 +123,13 @@ mungedPackageId ipi =
 -- | Returns the munged package name, which we write into @name@ for
 -- compatibility with old versions of GHC.
 mungedPackageName :: InstalledPackageInfo -> MungedPackageName
-mungedPackageName ipi =
-    computeCompatPackageName
-        (packageName ipi)
-        (sourceLibName ipi)
+mungedPackageName ipi = MungedPackageName (packageName ipi) (sourceLibName ipi)
 
 emptyInstalledPackageInfo :: InstalledPackageInfo
 emptyInstalledPackageInfo
    = InstalledPackageInfo {
         sourcePackageId   = PackageIdentifier (mkPackageName "") nullVersion,
-        sourceLibName     = Nothing,
+        sourceLibName     = LMainLibName,
         installedComponentId_ = mkComponentId "",
         installedUnitId   = mkUnitId "",
         instantiatedWith  = [],
@@ -159,10 +162,12 @@ emptyInstalledPackageInfo
         depends           = [],
         abiDepends        = [],
         ccOptions         = [],
+        cxxOptions        = [],
         ldOptions         = [],
         frameworkDirs     = [],
         frameworks        = [],
         haddockInterfaces = [],
         haddockHTMLs      = [],
-        pkgRoot           = Nothing
+        pkgRoot           = Nothing,
+        libVisibility     = LibraryVisibilityPrivate
     }

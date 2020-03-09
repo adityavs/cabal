@@ -61,7 +61,6 @@ import Distribution.Simple.BuildTarget
 
 import qualified Distribution.Simple.GHC   as GHC
 import qualified Distribution.Simple.GHCJS as GHCJS
-import qualified Distribution.Simple.LHC   as LHC
 import qualified Distribution.Simple.UHC   as UHC
 import qualified Distribution.Simple.HaskellSuite as HaskellSuite
 import qualified Distribution.Simple.PackageIndex as Index
@@ -80,8 +79,7 @@ import Distribution.InstalledPackageInfo (InstalledPackageInfo)
 import Distribution.Simple.Utils
 import Distribution.Utils.MapAccum
 import Distribution.System
-import Distribution.Text
-import Distribution.Types.ComponentName
+import Distribution.Pretty
 import Distribution.Verbosity as Verbosity
 import Distribution.Version
 import Distribution.Compat.Graph (IsNode(nodeKey))
@@ -158,8 +156,8 @@ registerAll pkg lbi regFlags ipis
       for_ ipis $ \installedPkgInfo ->
         -- Only print the public library's IPI
         when (packageId installedPkgInfo == packageId pkg
-              && IPI.sourceLibName installedPkgInfo == Nothing) $
-          putStrLn (display (IPI.installedUnitId installedPkgInfo))
+              && IPI.sourceLibName installedPkgInfo == LMainLibName) $
+          putStrLn (prettyShow (IPI.installedUnitId installedPkgInfo))
 
      -- Three different modes:
     case () of
@@ -168,14 +166,14 @@ registerAll pkg lbi regFlags ipis
        | otherwise             -> do
            for_ ipis $ \ipi -> do
                setupMessage' verbosity "Registering" (packageId pkg)
-                 (libraryComponentName (IPI.sourceLibName ipi))
+                 (CLibName (IPI.sourceLibName ipi))
                  (Just (IPI.instantiatedWith ipi))
                registerPackage verbosity (compiler lbi) (withPrograms lbi)
                                packageDbs ipi HcPkg.defaultRegisterOptions
 
   where
     modeGenerateRegFile = isJust (flagToMaybe (regGenPkgConf regFlags))
-    regFile             = fromMaybe (display (packageId pkg) <.> "conf")
+    regFile             = fromMaybe (prettyShow (packageId pkg) <.> "conf")
                                     (fromFlag (regGenPkgConf regFlags))
 
     modeGenerateRegScript = fromFlag (regGenScript regFlags)
@@ -202,12 +200,11 @@ registerAll pkg lbi regFlags ipis
                   where ys = take m xs
               number i = lpad (length (show num_ipis)) (show i)
           for_ (zip ([1..] :: [Int]) ipis) $ \(i, installedPkgInfo) ->
-            writeUTF8File (regFile </> (number i ++ "-" ++ display (IPI.installedUnitId installedPkgInfo)))
+            writeUTF8File (regFile </> (number i ++ "-" ++ prettyShow (IPI.installedUnitId installedPkgInfo)))
                           (IPI.showInstalledPackageInfo installedPkgInfo)
 
     writeRegisterScript =
       case compilerFlavor (compiler lbi) of
-        JHC -> notice verbosity "Registration scripts not needed for jhc"
         UHC -> notice verbosity "Registration scripts not needed for uhc"
         _   -> withHcPkg verbosity
                "Registration scripts are not implemented for this compiler"
@@ -257,7 +254,7 @@ abiHash :: Verbosity
         -> IO AbiHash
 abiHash verbosity pkg distPref lbi lib clbi =
     case compilerFlavor comp of
-     GHC | compilerVersion comp >= mkVersion [6,11] -> do
+     GHC -> do
             fmap mkAbiHash $ GHC.libAbiHash verbosity pkg lbi' lib clbi
      GHCJS -> do
             fmap mkAbiHash $ GHCJS.libAbiHash verbosity pkg lbi' lib clbi
@@ -297,14 +294,13 @@ createPackageDB verbosity comp progdb preferCompat dbPath =
     case compilerFlavor comp of
       GHC   -> HcPkg.init (GHC.hcPkgInfo   progdb) verbosity preferCompat dbPath
       GHCJS -> HcPkg.init (GHCJS.hcPkgInfo progdb) verbosity False dbPath
-      LHC   -> HcPkg.init (LHC.hcPkgInfo   progdb) verbosity False dbPath
       UHC   -> return ()
       HaskellSuite _ -> HaskellSuite.initPackageDB verbosity progdb dbPath
       _              -> die' verbosity $
                               "Distribution.Simple.Register.createPackageDB: "
                            ++ "not implemented for this compiler"
 
-doesPackageDBExist :: FilePath -> NoCallStackIO Bool
+doesPackageDBExist :: FilePath -> IO Bool
 doesPackageDBExist dbPath = do
     -- currently one impl for all compiler flavours, but could change if needed
     dir_exists <- doesDirectoryExist dbPath
@@ -312,7 +308,7 @@ doesPackageDBExist dbPath = do
         then return True
         else doesFileExist dbPath
 
-deletePackageDB :: FilePath -> NoCallStackIO ()
+deletePackageDB :: FilePath -> IO ()
 deletePackageDB dbPath = do
     -- currently one impl for all compiler flavours, but could change if needed
     dir_exists <- doesDirectoryExist dbPath
@@ -335,7 +331,6 @@ withHcPkg verbosity name comp progdb f =
   case compilerFlavor comp of
     GHC   -> f (GHC.hcPkgInfo progdb)
     GHCJS -> f (GHCJS.hcPkgInfo progdb)
-    LHC   -> f (LHC.hcPkgInfo progdb)
     _     -> die' verbosity ("Distribution.Simple.Register." ++ name ++ ":\
                   \not implemented for this compiler")
 
@@ -350,13 +345,11 @@ registerPackage verbosity comp progdb packageDbs installedPkgInfo registerOption
   case compilerFlavor comp of
     GHC   -> GHC.registerPackage   verbosity progdb packageDbs installedPkgInfo registerOptions
     GHCJS -> GHCJS.registerPackage verbosity progdb packageDbs installedPkgInfo registerOptions
-    _ | HcPkg.registerMultiInstance registerOptions
-          -> die' verbosity "Registering multiple package instances is not yet supported for this compiler"
-    LHC   -> LHC.registerPackage   verbosity      progdb packageDbs installedPkgInfo registerOptions
-    UHC   -> UHC.registerPackage   verbosity comp progdb packageDbs installedPkgInfo
-    JHC   -> notice verbosity "Registering for jhc (nothing to do)"
     HaskellSuite {} ->
       HaskellSuite.registerPackage verbosity      progdb packageDbs installedPkgInfo
+    _ | HcPkg.registerMultiInstance registerOptions
+          -> die' verbosity "Registering multiple package instances is not yet supported for this compiler"
+    UHC   -> UHC.registerPackage   verbosity comp progdb packageDbs installedPkgInfo
     _    -> die' verbosity "Registering is not implemented for this compiler"
 
 writeHcPkgRegisterScript :: Verbosity
@@ -443,16 +436,18 @@ generalInstalledPackageInfo adjustRelIncDirs pkg abi_hash lib lbi clbi installDi
     IPI.includeDirs        = absinc ++ adjustRelIncDirs relinc,
     IPI.includes           = includes bi,
     IPI.depends            = depends,
-    IPI.abiDepends         = abi_depends,
+    IPI.abiDepends         = [], -- due to #5465
     IPI.ccOptions          = [], -- Note. NOT ccOptions bi!
                                  -- We don't want cc-options to be propagated
                                  -- to C compilations in other packages.
+    IPI.cxxOptions         = [], -- Also. NOT cxxOptions bi!
     IPI.ldOptions          = ldOptions bi,
     IPI.frameworks         = frameworks bi,
     IPI.frameworkDirs      = extraFrameworkDirs bi,
     IPI.haddockInterfaces  = [haddockdir installDirs </> haddockName pkg],
     IPI.haddockHTMLs       = [htmldir installDirs],
-    IPI.pkgRoot            = Nothing
+    IPI.pkgRoot            = Nothing,
+    IPI.libVisibility      = libVisibility lib
   }
   where
     ghc84 = case compilerId $ compiler lbi of
@@ -463,13 +458,6 @@ generalInstalledPackageInfo adjustRelIncDirs pkg abi_hash lib lbi clbi installDi
     --TODO: unclear what the root cause of the
     -- duplication is, but we nub it here for now:
     depends = ordNub $ map fst (componentPackageDeps clbi)
-    abi_depends = map add_abi depends
-    add_abi uid = IPI.AbiDependency uid abi
-      where
-        abi = case Index.lookupUnitId (installedPkgs lbi) uid of
-                Nothing -> error $
-                  "generalInstalledPackageInfo: missing IPI for " ++ display uid
-                Just ipi -> IPI.abiHash ipi
     (absinc, relinc) = partition isAbsolute (includeDirs bi)
     hasModules = not $ null (allLibModules lib clbi)
     comp = compiler lbi
@@ -512,7 +500,10 @@ inplaceInstalledPackageInfo inplaceDir distPref pkg abi_hash lib lbi clbi =
     generalInstalledPackageInfo adjustRelativeIncludeDirs
                                 pkg abi_hash lib lbi clbi installDirs
   where
-    adjustRelativeIncludeDirs = map (inplaceDir </>)
+    adjustRelativeIncludeDirs = concatMap $ \d ->
+      [ inplaceDir </> d                    -- local include-dir
+      , inplaceDir </> libTargetDir </> d   -- autogen include-dir
+      ]
     libTargetDir = componentBuildDir lbi clbi
     installDirs =
       (absoluteComponentInstallDirs pkg lbi (componentUnitId clbi) NoCopyDest) {
@@ -524,7 +515,7 @@ inplaceInstalledPackageInfo inplaceDir distPref pkg abi_hash lib lbi clbi =
         haddockdir = inplaceHtmldir
       }
     inplaceDocdir  = inplaceDir </> distPref </> "doc"
-    inplaceHtmldir = inplaceDocdir </> "html" </> display (packageName pkg)
+    inplaceHtmldir = inplaceDocdir </> "html" </> prettyShow (packageName pkg)
 
 
 -- | Construct 'InstalledPackageInfo' for the final install location of a

@@ -44,6 +44,7 @@ module Distribution.Client.Sandbox (
 
 import Prelude ()
 import Distribution.Client.Compat.Prelude
+import Distribution.Utils.Generic(safeLast)
 
 import Distribution.Client.Setup
   ( SandboxFlags(..), ConfigFlags(..), ConfigExFlags(..), InstallFlags(..)
@@ -91,6 +92,7 @@ import qualified Distribution.Simple.LocalBuildInfo as LocalBuildInfo
 import Distribution.Simple.PreProcess         ( knownSuffixHandlers )
 import Distribution.Simple.Program            ( ProgramDb )
 import Distribution.Simple.Setup              ( Flag(..), HaddockFlags(..)
+                                              , emptyTestFlags, emptyBenchmarkFlags
                                               , fromFlagOrDefault, flagToMaybe )
 import Distribution.Simple.SrcDist            ( prepareTree )
 import Distribution.Simple.Utils              ( die', debug, notice, info, warn
@@ -99,7 +101,7 @@ import Distribution.Simple.Utils              ( die', debug, notice, info, warn
                                               , createDirectoryIfMissingVerbose )
 import Distribution.Package                   ( Package(..) )
 import Distribution.System                    ( Platform )
-import Distribution.Text                      ( display )
+import Distribution.Deprecated.Text                      ( display )
 import Distribution.Verbosity                 ( Verbosity )
 import Distribution.Compat.Environment        ( lookupEnv, setEnv )
 import Distribution.Client.Compat.FilePerms   ( setFileHidden )
@@ -215,10 +217,10 @@ tryGetIndexFilePath verbosity config = tryGetIndexFilePath' verbosity (savedGlob
 tryGetIndexFilePath' :: Verbosity -> GlobalFlags -> IO FilePath
 tryGetIndexFilePath' verbosity globalFlags = do
   let paths = fromNubList $ globalLocalRepos globalFlags
-  case paths of
-    []  -> die' verbosity $ "Distribution.Client.Sandbox.tryGetIndexFilePath: " ++
+  case safeLast paths of
+    Nothing   -> die' verbosity $ "Distribution.Client.Sandbox.tryGetIndexFilePath: " ++
            "no local repos found. " ++ checkConfiguration
-    _   -> return $ (last paths) </> Index.defaultIndexFileName
+    Just lp   -> return $ lp </> Index.defaultIndexFileName
   where
     checkConfiguration = "Please check your configuration ('"
                          ++ userPackageEnvironmentFile ++ "')."
@@ -684,7 +686,7 @@ reinstallAddSourceDeps verbosity configFlags' configExFlags
                   ,comp, platform, progdb
                   ,UseSandbox sandboxDir, Just sandboxPkgInfo
                   ,globalFlags, configFlags, configExFlags, installFlags
-                  ,haddockFlags)
+                  ,haddockFlags, emptyTestFlags, emptyBenchmarkFlags)
 
         -- This can actually be replaced by a call to 'install', but we use a
         -- lower-level API because of layer separation reasons. Additionally, we

@@ -1,3 +1,4 @@
+{-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveGeneric #-}
 module Distribution.Types.ExposedModule where
 
@@ -6,13 +7,11 @@ import Prelude ()
 
 import Distribution.Backpack
 import Distribution.ModuleName
-import Distribution.Parsec.Class
-import Distribution.ParseUtils   (parseModuleNameQ)
+import Distribution.Parsec
 import Distribution.Pretty
-import Distribution.Text
+import Distribution.FieldGrammar.Described
 
 import qualified Distribution.Compat.CharParsing as P
-import qualified Distribution.Compat.ReadP       as Parse
 import qualified Text.PrettyPrint                as Disp
 
 data ExposedModule
@@ -20,13 +19,13 @@ data ExposedModule
        exposedName      :: ModuleName,
        exposedReexport  :: Maybe OpenModule
      }
-  deriving (Eq, Generic, Read, Show)
+  deriving (Eq, Generic, Read, Show, Typeable)
 
 instance Pretty ExposedModule where
     pretty (ExposedModule m reexport) =
         Disp.hsep [ pretty m
                   , case reexport of
-                     Just m' -> Disp.hsep [Disp.text "from", disp m']
+                     Just m' -> Disp.hsep [Disp.text "from", pretty m']
                      Nothing -> Disp.empty
                   ]
 
@@ -42,16 +41,9 @@ instance Parsec ExposedModule where
 
         return (ExposedModule m reexport)
 
-instance Text ExposedModule where
-    parse = do
-        m <- parseModuleNameQ
-        Parse.skipSpaces
-        reexport <- Parse.option Nothing $ do
-            _ <- Parse.string "from"
-            Parse.skipSpaces
-            fmap Just parse
-        return (ExposedModule m reexport)
+instance Described ExposedModule where
+    describe _ = RETodo
 
 instance Binary ExposedModule
-
+instance Structured ExposedModule
 instance NFData ExposedModule where rnf = genericRnf
